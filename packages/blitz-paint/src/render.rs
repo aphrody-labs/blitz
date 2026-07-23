@@ -190,41 +190,53 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         let bg_width = (self.width as f32).max(root_element.final_layout().size.width);
         let bg_height = (self.height as f32).max(root_element.final_layout().size.height);
 
-        let background_color = {
-            let html_color = root_element
-                .primary_styles()
-                .map(|s| s.clone_background_color())
-                .unwrap_or(GenericColor::TRANSPARENT_BLACK);
-            if html_color == GenericColor::TRANSPARENT_BLACK {
-                root_element
-                    .children
-                    .iter()
-                    .find_map(|id| {
-                        self.dom
-                            .as_ref()
-                            .get_node(*id)
-                            .filter(|node| node.data.is_element_with_tag_name(&local_name!("body")))
-                    })
-                    .and_then(|body| body.primary_styles())
-                    .map(|style| {
-                        let current_color = style.clone_color();
-                        style
-                            .clone_background_color()
-                            .resolve_to_absolute(&current_color)
-                    })
+        // CSS Backgrounds 3 section 2.11.1 canvas-background propagation. Pick
+        // the element whose complete background paints over the canvas, then
+        // use the normal background pipeline so images and gradients propagate
+        // together with the color.
+        let propagation_source = {
+            let root_has_bg = root_element.primary_styles().is_some_and(|style| {
+                style.clone_background_color() != GenericColor::TRANSPARENT_BLACK
+                    || style
+                        .get_background()
+                        .background_image
+                        .0
+                        .iter()
+                        .any(|image| {
+                            !matches!(image, style::values::generics::image::GenericImage::None)
+                        })
+            });
+            if root_has_bg {
+                Some(root_element)
             } else {
-                let current_color = root_element.primary_styles().unwrap().clone_color();
-                Some(html_color.resolve_to_absolute(&current_color))
+                root_element.children.iter().find_map(|id| {
+                    self.dom
+                        .as_ref()
+                        .get_node(*id)
+                        .filter(|node| node.data.is_element_with_tag_name(&local_name!("body")))
+                })
             }
         };
 
-        if let Some(bg_color) = background_color {
-            let bg_color = bg_color.as_srgb_color();
-            let rect = Rect::from_origin_size(
-                (self.initial_x, self.initial_y),
-                (bg_width as f64, bg_height as f64),
+        if let Some(source) = propagation_source {
+            let canvas_layout = taffy::Layout {
+                location: taffy::Point { x: 0.0, y: 0.0 },
+                size: taffy::Size {
+                    width: bg_width,
+                    height: bg_height,
+                },
+                ..*root_element.final_layout()
+            };
+            let canvas_cx = self.element_cx(
+                source,
+                canvas_layout,
+                Affine::translate(Vec2 {
+                    x: self.initial_x,
+                    y: self.initial_y,
+                }),
+                None,
             );
-            scene.fill(Fill::NonZero, Affine::IDENTITY, bg_color, None, &rect);
+            canvas_cx.draw_background(scene);
         }
 
         // The root clip rectangle is the viewport (in screen coordinates, with the
@@ -863,14 +875,11 @@ impl ElementCx<'_, '_> {
             let transform =
                 self.transform * Affine::translate((pos.x * self.scale, pos.y * self.scale));
 
-            // Render inline element backgrounds (e.g. `<span style="background: ...">`)
-            // behind the text and selection highlight.
-            crate::text::draw_inline_backgrounds(
+            crate::text_box_decorations::paint_span_fragment_backgrounds(
                 scene,
-                text_layout.layout.lines(),
+                &text_layout.layout,
                 self.context.dom,
                 transform,
-                self.node.id,
             );
 
             // Render text selection highlight (if any) using cached selection ranges
@@ -894,6 +903,14 @@ impl ElementCx<'_, '_> {
                 self.scale,
                 self.node.id,
                 &mut draw_text_context,
+                1.0,
+            );
+
+            crate::text_box_decorations::paint_span_fragment_borders(
+                scene,
+                &text_layout.layout,
+                self.context.dom,
+                transform,
             );
         }
     }
@@ -950,7 +967,11 @@ impl ElementCx<'_, '_> {
                 };
             }
 
-            // Render text
+            let alpha = if input_data.is_showing_placeholder {
+                0.4
+            } else {
+                1.0
+            };
             let mut draw_text_context = self.context.draw_text_context.borrow_mut();
             crate::text::stroke_text(
                 scene,
@@ -960,6 +981,7 @@ impl ElementCx<'_, '_> {
                 self.scale,
                 self.node.id,
                 &mut draw_text_context,
+                alpha,
             );
         }
     }
@@ -1015,6 +1037,7 @@ impl ElementCx<'_, '_> {
                 self.scale,
                 self.node.id,
                 &mut draw_text_context,
+                1.0,
             );
         }
     }

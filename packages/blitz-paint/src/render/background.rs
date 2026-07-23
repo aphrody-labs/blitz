@@ -445,14 +445,46 @@ impl ElementCx<'_, '_> {
             frame_h - bg_size.height as f32,
         );
 
-        let transform = base_transform
-            * kurbo::Affine::translate((
-                origin_rect.x0 + bg_pos.x * self.scale,
-                origin_rect.y0 + bg_pos.y * self.scale,
-            ))
-            * viewport;
+        let bg_pos = (bg_pos.to_vec2() * self.scale).to_point();
+        let bg_size = bg_size * self.scale;
+        let clip_rect = self.box_rect(layer.clip);
+        let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
+        let x = gradient_axis_tiling(
+            *repeat_x,
+            origin_rect.x0,
+            origin_rect.width(),
+            clip_rect.x0,
+            clip_rect.width(),
+            bg_pos.x,
+            bg_size.width,
+        );
+        let y = gradient_axis_tiling(
+            *repeat_y,
+            origin_rect.y0,
+            origin_rect.height(),
+            clip_rect.y0,
+            clip_rect.height(),
+            bg_pos.y,
+            bg_size.height,
+        );
 
-        anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+        if x.count as u64 * y.count as u64 > 4096 {
+            return;
+        }
+
+        let transform = (base_transform * viewport).then_translate(Vec2 {
+            x: x.translate,
+            y: y.translate,
+        });
+        for row in 0..y.count {
+            for column in 0..x.count {
+                let transform = transform.then_translate(Vec2 {
+                    x: column as f64 * x.stride,
+                    y: row as f64 * y.stride,
+                });
+                anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+            }
+        }
     }
 
     fn draw_raster_image_layer(&self, scene: &mut impl PaintScene, layer: &ImageLayerStyles) {
