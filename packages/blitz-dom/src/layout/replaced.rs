@@ -35,6 +35,9 @@ pub struct ReplacedContext {
     /// used to fill in dimensions the intrinsic sizes leave unresolved. 300x150
     /// for most replaced elements; zero for an image with no loaded resource.
     pub default_object_size: taffy::Size<f32>,
+    /// A canvas's natural size is its bitmap size, which the author sets; unlike an
+    /// image's, it must overflow a narrower container rather than shrink into it.
+    pub natural_size_is_authored: bool,
 }
 
 /// Whether a height/width value is violating it's min- and max- constraints
@@ -250,9 +253,34 @@ pub fn compute_replaced_layout(
         .min_size()
         .maybe_resolve(parent_size, &resolve_calc_value)
         .maybe_sub(box_sizing_adjustment);
+    // Fold available space into max-size on the inline axis only: the
+    // both-axes form collapsed padding-bottom aspect-ratio hacks to 0x0.
+
+    // And only for natural-size-only content: explicit sizing (style or
+    // width/height attr) must overflow a too-narrow container, CSS2
+    // §10.3.4 has no implicit max-width:100%. The shrink-into-container
+    // leniency is pristine-blitz behavior photo-heavy layouts depend on.
+
+    // An explicit height counts too when a ratio can derive the width from
+    // it: that width is just as author-specified as a literal one.
+    // Width/height attributes are already presentational hints in style_size.
+    let explicit_height = style_size.height.is_some();
+    let explicit_width = style_size.width.is_some()
+        || (explicit_height && aspect_ratio.is_some())
+        || context.natural_size_is_authored;
+    let avail_max = Size {
+        width: if explicit_width {
+            None
+        } else {
+            available_space.into_options().width
+        },
+        height: None,
+    };
     let max_size = style
         .max_size()
         .maybe_resolve(basis_for_max_and_preferred, &resolve_calc_value)
+        .or(avail_max)
+        .maybe_min(avail_max)
         .maybe_max(min_size)
         .maybe_sub(box_sizing_adjustment);
 

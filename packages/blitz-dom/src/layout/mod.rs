@@ -490,6 +490,8 @@ impl LayoutPassState<'_> {
                     let replaced_context = ReplacedContext {
                         intrinsic_sizes,
                         default_object_size,
+                        natural_size_is_authored: *element_data.name.local
+                            == local_name!("canvas"),
                     };
 
                     let mut style = node.layout_style();
