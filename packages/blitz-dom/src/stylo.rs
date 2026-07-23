@@ -467,7 +467,54 @@ impl selectors::Element for BlitzNode<'_> {
             NonTSPseudoClass::AnyLink => self
                 .element_state()
                 .intersects(ElementState::VISITED_OR_UNVISITED),
-            NonTSPseudoClass::Checked => self.element_state().contains(ElementState::CHECKED),
+            NonTSPseudoClass::Checked => {
+                // Two-tier: layout-tracked state first (covers the
+                // .checked IDL property mutation path that real
+                // pages use), fall back to the content attribute
+                // (covers detached/Fragment elements where layout
+                // never ran: the WPT
+                // ParentNode-querySelector-All "matching checked
+                // radio buttons and checkboxes" pattern).
+                //
+                // Per HTML §dom-checked-pseudo:
+                //   - input[type=checkbox|radio] is :checked when
+                //     the *checkedness* is true. Checkedness starts
+                //     from the `checked` content attribute and is
+                //     then mutated by .checked = ... / user input.
+                //   - option is :checked when the `selected` IDL
+                //     state is true.
+                //
+                // SpecialElementData::CheckboxInput tracks live
+                // checkedness once the element enters layout, so
+                // it's authoritative for rendered inputs. Detached
+                // / Fragment-rooted elements never get that data
+                // populated, so we fall back to the content attr.
+                let elem = self.data.downcast_element();
+                if let Some(elem) = elem {
+                    if elem.name.local == local_name!("input") {
+                        let type_attr = elem
+                            .attr(local_name!("type"))
+                            .unwrap_or("text");
+                        let is_checkable = type_attr.eq_ignore_ascii_case("checkbox")
+                            || type_attr.eq_ignore_ascii_case("radio");
+                        if !is_checkable {
+                            false
+                        } else if let Some(state) = elem.checkbox_input_checked() {
+                            // Live layout-tracked state. Real pages.
+                            state
+                        } else {
+                            // Detached / unrendered. WPT pattern.
+                            elem.attr(local_name!("checked")).is_some()
+                        }
+                    } else if elem.name.local == local_name!("option") {
+                        elem.attr(local_name!("selected")).is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            },
             NonTSPseudoClass::Valid => false,
             NonTSPseudoClass::Invalid => false,
             NonTSPseudoClass::Defined => false,
@@ -479,7 +526,34 @@ impl selectors::Element for BlitzNode<'_> {
             NonTSPseudoClass::Fullscreen => false,
             NonTSPseudoClass::Hover => self.element_state().contains(ElementState::HOVER),
             NonTSPseudoClass::Indeterminate => false,
-            NonTSPseudoClass::Lang(_) => false,
+            NonTSPseudoClass::Lang(ref lang_arg) => {
+                // Walk self + ancestors looking for the nearest `lang`
+                // attribute. BCP-47 prefix-match (case-insensitive).
+                let arg = lang_arg.as_ref();
+                if arg.is_empty() {
+                    false
+                } else {
+                    let mut cur = Some(*self);
+                    let effective_lang = loop {
+                        let Some(node) = cur else { break None };
+                        if let Some(value) = node.data.attr(local_name!("lang")) {
+                            break Some(value);
+                        }
+                        cur = node.parent_node();
+                    };
+                    match effective_lang {
+                        None => false,
+                        Some(lang) => {
+                            let lang_b = lang.as_bytes();
+                            let arg_b = arg.as_bytes();
+                            lang_b.eq_ignore_ascii_case(arg_b)
+                                || (lang_b.len() > arg_b.len()
+                                    && lang_b[arg_b.len()] == b'-'
+                                    && lang_b[..arg_b.len()].eq_ignore_ascii_case(arg_b))
+                        }
+                    }
+                }
+            },
             NonTSPseudoClass::CustomState(_) => false,
             NonTSPseudoClass::Link => self.element_state().contains(ElementState::UNVISITED),
             NonTSPseudoClass::PlaceholderShown => false,
@@ -595,13 +669,20 @@ impl selectors::Element for BlitzNode<'_> {
     }
 
     fn is_empty(&self) -> bool {
-        self.dom_children().next().is_none()
+        // Per CSS Selectors Level 4 + WPT (matching Chrome/Firefox):
+        // comments do not count as content for `:empty`.
+        self.dom_children()
+            .all(|c| matches!(c.data, NodeData::Comment { .. }))
     }
 
     fn is_root(&self) -> bool {
-        self.parent_node()
-            .and_then(|parent| parent.parent_node())
-            .is_none()
+        // Per CSS Selectors Level 4 `:root` matches the root element;
+        // the element whose parent is a Document node. Detached
+        // elements and children of detached subtrees must not match.
+        match self.parent_node() {
+            Some(parent) => matches!(parent.data, NodeData::Document(_)),
+            None => false,
+        }
     }
 
     fn has_custom_state(

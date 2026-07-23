@@ -459,7 +459,33 @@ fn collect_layout_children_with_wrap(
 
         #[cfg(feature = "svg")]
         if matches!(tag_name, "svg") {
-            let outer_html = doc.get_node(container_node_id).unwrap().svg_source();
+            let mut outer_html = doc.get_node(container_node_id).unwrap().svg_source();
+
+            // Stamp the element's computed `color` on the serialized
+            // root so usvg resolves any surviving `currentColor` by inheritance.
+            // write_outer_html substitutes currentColor per node from its
+            // primary_styles, but an unstyled child (styles not yet resolved at
+            // construct time) leaves currentColor verbatim, and usvg then
+            // defaults it to black. A root color attr is usvg's inheritance
+            // fallback.
+            use style_traits::values::ToCss as _;
+            let root_color = doc
+                .get_node(container_node_id)
+                .and_then(|n| n.primary_styles())
+                .map(|s| s.clone_color())
+                .map(|c| c.to_css_string());
+            // Scope the "already has color" check to the opening <svg ...> tag;
+            // a descendant color="..." must not suppress the root stamp.
+            let root_tag_has_color = outer_html
+                .split_once('>')
+                .map(|(open_tag, _)| open_tag.contains(" color=\""))
+                .unwrap_or(false);
+            if let Some(color) = root_color {
+                if !root_tag_has_color {
+                    outer_html =
+                        outer_html.replacen("<svg", &format!("<svg color=\"{color}\""), 1);
+                }
+            }
 
             // Remove contruction damage from subtree
             doc.iter_subtree_mut(container_node_id, |id: NodeId, doc: &mut BaseDocument| {
@@ -874,11 +900,53 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         node.attr(local_name!("value")).unwrap_or("").to_string()
     };
     let element = &mut node.data.downcast_element_mut().unwrap();
+    // Decide what text the editor should display. The HTML spec
+    // says <input> shows its `value` attribute (or the empty
+    // string if absent), and shows the `placeholder` attribute
+    // (with placeholder styling: typically grey / lighter color)
+    // only when the value is empty and the field is unfocused.
+    //
+    // This synthesizes the placeholder text into the editor with a
+    // lighter brush so the user sees something instead of a
+    // blank box. Once the user types into the field, value
+    // becomes non-empty, refresh_layout runs again here, and
+    // the placeholder fallback stops firing.
+    //
+    // This is a simplified `:placeholder-shown` polyfill; a
+    // proper implementation would pseudo-element-style the
+    // placeholder (color, font-style: italic, etc.) and
+    // render it without putting it through the editor's
+    // selection/caret machinery. This version shows
+    // the user the prompt text, doesn't count as the field's
+    // actual value (caret behaviour, form submission, etc.
+    // all read `value` not editor text).
+    // (Upstream: a <textarea>'s value is its child text, an <input>'s its
+    // value attribute; `initial_text` already picked the right one.)
+    let value_attr = Some(initial_text.as_str());
+    let placeholder_attr = element.attr(local_name!("placeholder"));
+    let (display_text, is_placeholder) = match (value_attr, placeholder_attr) {
+        (Some(v), _) if !v.is_empty() => (v.to_string(), false),
+        (_, Some(p)) if !p.is_empty() => (p.to_string(), true),
+        _ => (" ".to_string(), false),
+    };
+
     if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
         let mut text_input_data = TextInputData::new(is_multiline);
         let editor = &mut text_input_data.editor;
-        editor.set_text(&initial_text);
+        editor.set_text(&display_text);
+        text_input_data.is_showing_placeholder = is_placeholder;
         element.special_data = SpecialElementData::TextInput(text_input_data);
+    } else if let SpecialElementData::TextInput(data) = &mut element.special_data {
+        // Update the editor's text on subsequent layouts so an
+        // empty input switches between placeholder and real
+        // value as the user types. This guard keeps the
+        // is_showing_placeholder flag in sync with what the
+        // editor actually contains.
+        let editor = &mut data.editor;
+        if editor.text() != display_text.as_str() {
+            editor.set_text(&display_text);
+        }
+        data.is_showing_placeholder = is_placeholder;
     }
 
     let SpecialElementData::TextInput(text_input_data) = &mut element.special_data else {
@@ -908,6 +976,10 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         parley_style.white_space_collapse,
     ));
     styles.insert(StyleProperty::Brush(parley_style.brush));
+    // Italic-by-default placeholder mirrors most user agents.
+    if is_placeholder {
+        styles.insert(StyleProperty::FontStyle(parley::FontStyle::Italic));
+    }
     editor.set_alignment(alignment);
     editor.set_base_direction(base_direction);
 

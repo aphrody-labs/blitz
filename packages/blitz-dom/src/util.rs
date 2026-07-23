@@ -155,7 +155,7 @@ pub fn walk_tree(indent: usize, node: &Node) {
 
 /// Parse an SVG image.
 #[cfg(feature = "svg")]
-pub(crate) fn parse_svg_image(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
+pub fn parse_svg_image(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
     let options = usvg::Options {
         fontdb: Arc::clone(&*FONT_DB),
         ..Default::default()

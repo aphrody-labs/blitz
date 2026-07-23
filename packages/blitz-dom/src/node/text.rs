@@ -72,6 +72,11 @@ pub struct TextInputData {
     /// vertical offset. It is kept up to date so that the caret remains visible within the
     /// input's content box.
     pub scroll_offset: f32,
+    /// True when the editor currently holds the
+    /// element's `placeholder` attribute text (because `value`
+    /// was empty). The paint layer reads this to dim the text
+    /// at 0.4 alpha, mimicking `:placeholder-shown`.
+    pub is_showing_placeholder: bool,
 }
 
 // FIXME: Implement Clone for PlainEditor
@@ -88,6 +93,7 @@ impl TextInputData {
             editor,
             is_multiline,
             scroll_offset: 0.0,
+            is_showing_placeholder: false,
         }
     }
 

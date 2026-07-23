@@ -275,7 +275,13 @@ impl BaseDocument {
         };
 
         let children = self.nodes[node_id].layout_children.borrow_mut().take();
-        if let Some(children) = children {
+        if let Some(mut children) = children {
+            // Anonymous blocks and pseudo-elements can be removed from the
+            // slab between resolve and this paint-tree pass; drop stale ids
+            // upfront so the indexed accesses below can't panic with
+            // "invalid key".
+            children.retain(|&id| self.nodes.contains_key(id));
+
             let is_flex_or_grid =
                 matches!(display.inside(), DisplayInside::Flex | DisplayInside::Grid);
 
@@ -454,9 +460,18 @@ fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> (i32, i32) {
             Position::Absolute | Position::Fixed => (2, 0),
         }
     } else {
-        (
-            position_to_order(position) + float_to_order(style.clone_float()),
-            0,
-        )
+        // Float only contributes when the element is otherwise
+        // in the static layer; positioned elements skip the float-bump
+        // because their painting layer is dictated by position (CSS 2.1
+        // §9.7 / Appendix E layer 6). Without this, a `position:relative;
+        // float:right` element (2+1=3) sorted above an abs-pos sibling
+        // (2), flipping hit-test order in the todomvc footer. See
+        // examples/todomvc-react-demo.mjs step 6.
+        let float_layer = if position == Position::Static {
+            float_to_order(style.clone_float())
+        } else {
+            0
+        };
+        (position_to_order(position) + float_layer, 0)
     }
 }

@@ -72,6 +72,12 @@ impl NodeTree {
         self.geometry_generation.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let mut tree = Self::new();
+        tree.map = SlotMap::with_capacity_and_key(capacity);
+        tree
+    }
+
     /// The number of live nodes in the map.
     pub fn len(&self) -> usize {
         self.map.len()

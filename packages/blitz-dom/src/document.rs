@@ -268,7 +268,9 @@ pub struct BaseDocument {
 
     // Stylo
     /// The Stylo engine
-    pub(crate) stylist: Stylist,
+    // `pub` so the embedder can walk the stylist's PageRuleMap to
+    // extract @page descriptors (size and margins) for PDF page sizing.
+    pub stylist: Stylist,
     pub(crate) animations: DocumentAnimationSet,
     /// Stylo shared lock
     pub(crate) guard: SharedRwLock,
@@ -339,6 +341,16 @@ pub struct BaseDocument {
     /// added, replaced or removed), so that CSSOM wrappers can detect that
     /// their cached rule data is stale.
     pub(crate) stylesheet_generation: u64,
+    /// Cache of author-origin stylesheets keyed by FxHash of the CSS
+    /// source text. Real pages (and Astro/Vite/SSR-driven fixtures)
+    /// frequently inline the same companion stylesheet 3+ times when
+    /// the same code-block / island appears multiple times. Without
+    /// this cache, stylo re-parses identical CSS bytes from scratch
+    /// for every <style> node. The cache reuses the already-parsed
+    /// ServoArc<StylesheetContents> via DocumentStyleSheet::clone
+    /// (an Arc bump), while each <style> node still registers
+    /// individually with the stylist (so cascade order is unchanged).
+    pub(crate) author_sheet_cache: HashMap<u64, DocumentStyleSheet>,
     /// Map from form control node ID's to their associated forms node ID's
     pub(crate) controls_to_form: HashMap<NodeId, NodeId>,
     /// Nodes that contain sub documents
@@ -443,7 +455,13 @@ impl BaseDocument {
         let device = make_device(&viewport, media_type.clone(), font_ctx.clone());
         let stylist = Stylist::new(device, QuirksMode::NoQuirks);
         let snapshots = SnapshotMap::new();
-        let nodes = Box::new(NodeTree::new());
+        // Reserve the node slab up front when the embedder supplies a
+        // capacity hint (estimated from the source HTML), avoiding
+        // the doubling overshoot on large documents. with_capacity(0)
+        // is equivalent to Slab::new(), so the default path is unchanged.
+        let nodes = Box::new(NodeTree::with_capacity(
+            config.node_capacity_hint.unwrap_or(0),
+        ));
         let guard = SharedRwLock::new();
         let nodes_to_id = HashMap::new();
 
@@ -487,6 +505,7 @@ impl BaseDocument {
             subdocument_depth: config.subdocument_depth,
             devtool_settings: DevtoolSettings::default(),
             url: base_url,
+            author_sheet_cache: HashMap::new(),
             nodes_to_stylesheet: BTreeMap::new(),
             stylesheet_generation: 0,
             font_ctx,
@@ -1147,8 +1166,29 @@ impl BaseDocument {
 
     pub fn process_style_element(&mut self, target_id: NodeId) {
         let css = self.nodes[target_id].text_content();
-        let css = html_escape::decode_html_entities(&css);
-        let sheet = self.make_stylesheet(&css, Origin::Author);
+        // Hash on the pre-decode bytes via inline FNV-1a (~2-3 GB/s,
+        // vs SipHash's ~1 GB/s). For typical CSS (no HTML entities)
+        // pre-decode and post-decode are byte-identical, so caching
+        // by pre-decode hash hits the same entries while skipping the
+        // entity-decode scan entirely on hit. On miss we decode +
+        // parse as before. Worst case (CSS with real `&amp;`-style
+        // entities) we get one extra cache entry per distinct raw
+        // byte form: still correct, just slightly less dedup.
+        let bytes = css.as_bytes();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let cache_key = h;
+        let sheet = if let Some(cached) = self.author_sheet_cache.get(&cache_key) {
+            cached.clone()
+        } else {
+            let decoded = html_escape::decode_html_entities(&css);
+            let s = self.make_stylesheet(&decoded, Origin::Author);
+            self.author_sheet_cache.insert(cache_key, s.clone());
+            s
+        };
         self.add_stylesheet_for_node(sheet, target_id);
     }
 
@@ -1279,6 +1319,60 @@ impl BaseDocument {
     /// Whether the Document has pending requests for "critical" resources (that should block rendering)
     pub fn has_pending_critical_resources(&self) -> bool {
         !self.pending_critical_resources.is_empty()
+    }
+
+    // Drop stale element snapshots after a cascade panic.
+    // resolve_stylist only clears them on a successful traversal.
+    //
+    // Without this, a panic mid-invalidation leaves the snapshot that
+    // triggered it queued, and every retry re-panics (livelock).
+    pub fn clear_style_snapshots(&mut self) {
+        for opaque in self.snapshots.keys() {
+            let id = NodeId::from_u64(opaque.id() as u64);
+            if let Some(node) = self.nodes.get_mut(id) {
+                node.set_has_snapshot(false);
+            }
+        }
+        self.snapshots.clear();
+    }
+
+    /// Count of bg-image / image fetches that have been
+    /// issued but whose response hasn't been applied yet. Lets the
+    /// renderer loop ensure_layout an extra time if there are
+    /// in-flight image fetches that the next resolve's
+    /// handle_messages will drain.
+    pub fn pending_images_count(&self) -> usize {
+        self.pending_images.len()
+    }
+
+    /// Node ids of `<img>` elements (ImageType::Image
+    /// entries only; background-image / mask-image layers are
+    /// excluded) currently waiting on `url`. The JS side snapshots
+    /// this right before deliverResource / deliverResourceError
+    /// (delivery drains the entry via apply_loaded_image) so it can
+    /// fire per-element `load` / `error` events after the bytes are
+    /// applied. See the dom-shim's `notifyImageResults`.
+    /// Whether `url` is already in the document's image
+    /// cache. A src/srcset mutation pointing at a cached URL applies
+    /// synchronously at the next mutator flush without a network
+    /// fetch, so the JS side must not mark the <img> as
+    /// pending-reload (HTMLImageElement.complete would stick false:
+    /// no delivery notification ever fires for cache hits).
+    pub fn image_cache_has(&self, url: &str) -> bool {
+        self.image_cache.contains_key(url)
+    }
+
+    pub fn pending_image_nodes(&self, url: &str) -> Vec<NodeId> {
+        self.pending_images
+            .get(url)
+            .map(|waiting| {
+                waiting
+                    .iter()
+                    .filter(|(_, ty)| matches!(ty, ImageType::Image))
+                    .map(|(node_id, _)| *node_id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn load_resource(&mut self, res: ResourceLoadResponse) {

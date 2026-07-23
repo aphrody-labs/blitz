@@ -6,7 +6,7 @@ use style::values::{
     generics::text::GenericTextIndent,
 };
 use taffy::{
-    AvailableSpace, AxisStaticPosition, BlockContainerStyle, BlockContext, BlockFormattingContext,
+    AvailableSpace, AxisStaticEdge, AxisStaticPosition, BlockContainerStyle, BlockContext, BlockFormattingContext,
     BoxSizing, CollapsibleMarginSet, CompactLength, CoreStyle as _, Direction, LayoutInput,
     LayoutOutput, LayoutPartialTree as _, MaybeMath as _, MaybeResolve as _, OofCandidate,
     OofCandidates, OofItemStyle, OofPositioningArea, Overflow, Point, RequestedAxis,
@@ -1093,6 +1093,67 @@ impl LayoutPassState<'_> {
                     }
                 }
             }
+        }
+
+        // Post-pass for abs-pos children parley left
+        // unprocessed. When the IFC root has no in-flow content
+        // (only `position: absolute` descendants), parley's line
+        // breaker produces zero lines, so the per-line iteration
+        // above sees nothing and the abs-pos children are never
+        // offered to the out-of-flow pass. Worse, when the IFC root
+        // has `height: 0` styling (a common responsive-image
+        // placeholder pattern, e.g. BBC's `.ssrcss-9ozhtx`: `height: 0;
+        // padding-top: 56.25%`), parley's `build_inline_layout_into`
+        // may not even populate `inline_boxes()` for the abs-pos
+        // descendant, so iterating parley's list isn't reliable.
+        //
+        // We iterate the IFC root's `layout_children` instead.
+        // That list is populated by `find_inline_layout_embedded_boxes`
+        // during construct and contains the flattened atomic-inline
+        // descendants (img/svg/input/etc.) regardless of whether
+        // parley managed to lay them out. Any out-of-flow child that
+        // did not get a candidate above is offered to the out-of-flow
+        // pass with its static position at the start of the content box.
+        let missing_oof: Vec<NodeId> = {
+            let lc = self.nodes[node_id].layout_children.borrow();
+            lc.as_deref()
+                .map(|children| {
+                    children
+                        .iter()
+                        .copied()
+                        .filter(|&cid| {
+                            self.nodes[cid].taffy_position().is_out_of_flow()
+                                && !oof_candidates
+                                    .iter()
+                                    .any(|c| c.node == crate::taffy_node_id(cid))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for cid in missing_oof {
+            let inline_start = if container_direction.is_rtl() {
+                final_size.width - container_pb.right
+            } else {
+                container_pb.left
+            };
+            oof_candidates.push(OofCandidate {
+                node: crate::taffy_node_id(cid),
+                order: ibox_order,
+                position: self.nodes[cid].taffy_position(),
+                static_position: taffy::Point {
+                    x: AxisStaticPosition::from_edge(
+                        inline_start,
+                        if container_direction.is_rtl() {
+                            AxisStaticEdge::End
+                        } else {
+                            AxisStaticEdge::Start
+                        },
+                    ),
+                    y: AxisStaticPosition::from_edge(line_box_top, AxisStaticEdge::Start),
+                },
+            });
+            ibox_order += 1;
         }
 
         // println!("INLINE LAYOUT FOR {:?}. max_advance: {:?}", node_id, max_advance);

@@ -370,6 +370,26 @@ impl DocumentMutator<'_> {
             return;
         }
 
+        // Image loads fire for detached <img> elements too:
+        // per HTML §update-the-image-data, a relevant mutation starts
+        // the image request regardless of connectedness. The
+        // `new Image(); img.src = ...` preload pattern and the WPT
+        // img.complete async subtests depend on it (the load/error
+        // event must fire on the detached element). Deliberately
+        // above the is_in_document() early-return below.
+        if (tag, attr) == tag_and_attr!("img", "src")
+            || (tag, attr) == tag_and_attr!("img", "srcset")
+        {
+            // srcset edits re-run candidate selection. The src
+            // attribute may not change, but the URL we actually
+            // fetch can; without re-firing here, pages that hydrate
+            // srcset post-mount (BBC, NYT, anything with a
+            // responsive-image React component) never load the
+            // higher-resolution variant.
+            self.load_image(node_id);
+            return;
+        }
+
         // If node if not in the document, then don't apply any special behaviours
         // and simply set the attribute value
         if !node.flags.is_in_document() {
@@ -384,8 +404,15 @@ impl DocumentMutator<'_> {
 
         if (tag, attr) == tag_and_attr!("input", "checked") {
             set_input_checked_state(element, value.to_string());
-        } else if (tag, attr) == tag_and_attr!("img", "src") {
-            self.load_image(node_id);
+        } else if tag == &local_name!("source") && attr == &local_name!("srcset") {
+            // A <source> srcset mutation inside a
+            // <picture> needs to re-fire the sibling <img>'s
+            // load_image, since the source's srcset takes
+            // priority over the img's own src/srcset. Walk to the
+            // <picture> parent, then find its <img> descendant.
+            if let Some(img_id) = self.find_picture_img_sibling(node_id) {
+                self.load_image(img_id);
+            }
         } else if (tag, attr) == tag_and_attr!("canvas", "src") {
             self.load_custom_paint_src(node_id);
         } else if (tag, attr) == tag_and_attr!("link", "href")
@@ -753,6 +780,24 @@ impl DocumentMutator<'_> {
     }
 
     pub fn replace_node_with(&mut self, anchor_node_id: NodeId, new_node_ids: &[NodeId]) {
+        // Self-replace short-circuit.
+        // `replaceChild(x, x)` (same node on both sides) should
+        // leave the tree unchanged (per DOM §4.2.3 "replace"
+        // semantics; the JS shim emits the MutationObserver
+        // records before reaching wasm, so we don't need to
+        // simulate the work here).
+        //
+        // Without this guard, the post-detach refactor below would
+        // call `index_of_child(anchor)` after `anchor` had been
+        // detached, returning None and panicking on unwrap. The
+        // original (pre-detach) code also corrupted the tree on
+        // self-replace: splice inserted a duplicate, then
+        // `retain` removed every occurrence including the
+        // anchor, then `remove_node(anchor)` no-op'd because the
+        // anchor was already gone.
+        if new_node_ids.len() == 1 && new_node_ids[0] == anchor_node_id {
+            return;
+        }
         self.insert_nodes_before(anchor_node_id, new_node_ids);
         self.remove_node(anchor_node_id);
     }
@@ -891,8 +936,47 @@ impl<'doc> DocumentMutator<'doc> {
             self.doc.process_style_element(id);
         }
 
-        for id in self.form_nodes.drain() {
+        // Snapshot form_nodes so we can both reset_form_owner
+        // and sync_select_label without double-draining the set.
+        let form_ids: Vec<NodeId> = self.form_nodes.drain().collect();
+        for &id in &form_ids {
             self.doc.reset_form_owner(id);
+        }
+        // Closed `<select>` paints the selected
+        // option's text. Blitz has no native form-control
+        // rendering, so without this every <select> renders as
+        // an empty inline-block (just the bootstrap chrome /
+        // chevron from author CSS).
+        //
+        // We run at flush() rather than from process_button_input
+        // because flush() runs once per mutate session (Drop of
+        // DocumentMutator): after the HTML parser has finished
+        // attaching all children of all <select>s. Running per-
+        // element from process_button_input would either fire
+        // before options exist (parser appends them one at a
+        // time after the select open tag is processed) or fire
+        // multiple times against intermediate states with extra
+        // bookkeeping for idempotency. flush()-time gives one
+        // clean pass against the final parsed tree.
+        //
+        // Selection rule: first `<option>` with the `selected`
+        // content attribute wins; otherwise the first `<option>`
+        // in document order. Matches HTML §form-controls
+        // initial selectedness for a single-select. Multi-
+        // selects (`<select multiple>`) and explicit `size`
+        // listboxes aren't special-cased: they render their
+        // first selected option's text as a one-line label,
+        // which is wrong for the listbox shape but no worse
+        // than the all-empty baseline.
+        //
+        // Caveat: this runs at parse time only. Later JS
+        // mutations (`select.value = ...`, `option.selected =
+        // true`, `select.add(...)`) won't refresh the label.
+        // Acceptable for the static-screenshot path; an
+        // interactive sync hook would belong in the dom-shim's
+        // HTMLSelectElement setters.
+        for id in form_ids {
+            self.sync_select_label_from_attrs(id);
         }
 
         #[cfg(feature = "autofocus")]
@@ -1126,11 +1210,15 @@ impl<'doc> DocumentMutator<'doc> {
                 .insert(handler.request_id());
         }
 
-        self.doc.net_provider.fetch(
-            self.doc.id(),
-            self.doc.build_request(url),
-            Box::new(handler),
-        );
+        // Tag the Request with `content_type = "text/css"`
+        // so embedders (KitesurfNetProvider) can distinguish stylesheet
+        // loads from generic resource loads without having to peek at
+        // the NetHandler trait object. Blitz's NetProvider trait
+        // doesn't expose the handler type, and Request has no
+        // `kind` field, so content_type is the cleanest signal.
+        let mut req = self.doc.build_request(url);
+        req.content_type = Some("text/css".to_string());
+        self.doc.net_provider.fetch(self.doc.id(), req, Box::new(handler));
     }
 
     fn unload_stylesheet(&mut self, node_id: NodeId) {
@@ -1152,11 +1240,144 @@ impl<'doc> DocumentMutator<'doc> {
         self.doc.stylesheet_generation += 1;
     }
 
-    fn load_image(&mut self, target_id: NodeId) {
+    /// Walk from a `<source>` node up to its enclosing
+    /// `<picture>` parent, then return the first `<img>` child of
+    /// that picture. Used by the attribute-mutation handler to
+    /// re-fire `load_image` when a `<source>`'s srcset changes
+    /// post-mount.
+    fn find_picture_img_sibling(&self, source_id: NodeId) -> Option<NodeId> {
+        let parent_id = self.doc.nodes[source_id].parent?;
+        let parent = &self.doc.nodes[parent_id];
+        if !parent.data.is_element_with_tag_name(&local_name!("picture")) {
+            return None;
+        }
+        for &child_id in &parent.children {
+            if self.doc.nodes[child_id]
+                .data
+                .is_element_with_tag_name(&local_name!("img"))
+            {
+                return Some(child_id);
+            }
+        }
+        None
+    }
+
+    /// Pick the URL to actually fetch for an `<img>`.
+    ///
+    /// Precedence (matches WHATWG HTML §4.8.4.3 "Updating the
+    /// image data", trimmed to what real pages depend on):
+    ///
+    /// 1. If the `<img>` is inside a `<picture>`, walk the
+    ///    `<source>` siblings in document order. For each, if its
+    ///    `type` attribute names an image MIME we can render
+    ///    (and isn't explicitly unsupported, e.g. `image/avif`,
+    ///    which the image crate is built without), parse its `srcset` and pick a
+    ///    candidate.
+    /// 2. Otherwise, parse the `<img>`'s own `srcset` and pick a
+    ///    candidate.
+    /// 3. Otherwise, fall back to the `<img>`'s `src` attribute.
+    ///
+    /// We don't yet honour `<source media="...">` (viewport
+    /// queries) or the `sizes` attribute: we always pick the
+    /// largest descriptor in the srcset, which is the right
+    /// answer for headless rendering where we're sizing for
+    /// screenshots, not for a real viewport-aware browser.
+    fn select_image_url(&self, target_id: NodeId) -> Option<String> {
         let node = &self.doc.nodes[target_id];
-        if let Some(raw_src) = node.attr(local_name!("src")) {
+
+        // Step 1: <picture><source> walk.
+        if let Some(parent_id) = node.parent {
+            let parent = &self.doc.nodes[parent_id];
+            if parent.data.is_element_with_tag_name(&local_name!("picture")) {
+                for &sibling_id in &parent.children {
+                    if sibling_id == target_id {
+                        // <source> elements only count if they
+                        // precede the <img> in tree order.
+                        break;
+                    }
+                    let sibling = &self.doc.nodes[sibling_id];
+                    if !sibling
+                        .data
+                        .is_element_with_tag_name(&local_name!("source"))
+                    {
+                        continue;
+                    }
+                    // Skip MIME types we can't render. The image
+                    // crate compiled into the wasm build doesn't
+                    // include the avif feature; selecting an
+                    // AVIF source would produce an unrenderable
+                    // image. PNG/JPEG/WebP/GIF are all fine.
+                    if let Some(ty) = sibling.attr(local_name!("type")) {
+                        let ty_trim = ty.trim().to_ascii_lowercase();
+                        if ty_trim == "image/avif" {
+                            continue;
+                        }
+                    }
+                    if let Some(srcset) = sibling.attr(local_name!("srcset"))
+                        && let Some(candidate) = pick_srcset_candidate(srcset)
+                    {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+
+        // Step 2: <img srcset>.
+        if let Some(srcset) = node.attr(local_name!("srcset"))
+            && let Some(candidate) = pick_srcset_candidate(srcset)
+        {
+            return Some(candidate);
+        }
+
+        // Step 3: <img src> fallback.
+        node.attr(local_name!("src"))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    /// Read the `<img width|height>` attrs and return
+    /// the larger of the two as a u32 hint for ImageHandler's
+    /// rgba8 cap. Returns `None` if neither attr is set or
+    /// neither parses to a useful integer; ImageHandler falls
+    /// back to `DEFAULT_DECODE_MAX_DIM` in that case.
+    ///
+    /// We deliberately ignore CSS-driven sizing here (`<img
+    /// style="width:240px">`). Reading style requires a cascade
+    /// to have run, which it hasn't at LoadImage queue time; the
+    /// attr-only path covers the dominant real-world case: most
+    /// large sites set explicit width/height attrs for layout
+    /// stability.
+    fn read_img_display_dim(&self, node_id: NodeId) -> Option<u32> {
+        let node = &self.doc.nodes[node_id];
+        let w = node
+            .attr(local_name!("width"))
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let h = node
+            .attr(local_name!("height"))
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        match (w, h) {
+            (Some(w), Some(h)) => Some(w.max(h)),
+            (Some(w), None) => Some(w),
+            (None, Some(h)) => Some(h),
+            (None, None) => None,
+        }
+    }
+
+    fn load_image(&mut self, target_id: NodeId) {
+        if let Some(raw_src) = self.select_image_url(target_id) {
             if !raw_src.is_empty() {
-                let src = self.doc.resolve_url(raw_src);
+                // Fallible resolve. `img.src = "http://"`
+                // (or any unresolvable string) must put the element
+                // in the broken state, not panic the wasm isolate:
+                // resolve_url()'s unwrap fired a real panic here (WPT
+                // img.complete.html "invalid URL" subtest). The JS
+                // shim detects unresolvable srcs on the attribute
+                // hook and fires the error event; wasm-side we just
+                // skip the fetch.
+                let Some(src) = self.doc.url.resolve_relative(&raw_src) else {
+                    return;
+                };
+                let display_dim = self.read_img_display_dim(target_id);
                 let src_string = src.as_str();
 
                 // Check cache first
@@ -1186,15 +1407,29 @@ impl<'doc> DocumentMutator<'doc> {
                     .pending_images
                     .insert(src_string.to_string(), vec![(target_id, ImageType::Image)]);
 
+                // Tag with content_type = "image/*" so the
+                // outbound gateway routes through the Image
+                // cross-origin bypass even for URLs without a useful
+                // file extension.
+                let mut req = self.doc.build_request(src);
+                req.content_type = Some("image/*".to_string());
+                // Pass the display-size hint to
+                // ImageHandler so it can downscale before
+                // materialising rgba8. Critical for image-heavy
+                // pages; see ImageHandler::decode_max_dim doc.
+                let handler = match display_dim {
+                    Some(d) => ImageHandler::with_max_dim(ImageType::Image, d),
+                    None => ImageHandler::new(ImageType::Image),
+                };
                 self.doc.net_provider.fetch(
                     self.doc.id(),
-                    self.doc.build_request(src),
+                    req,
                     ResourceHandler::boxed(
                         self.doc.tx.clone(),
                         self.doc.id(),
                         None, // Don't pass node_id, we'll handle it via pending_images
                         self.doc.shell_provider.clone(),
-                        ImageHandler::new(ImageType::Image),
+                        handler,
                     ),
                 );
             }
@@ -1250,6 +1485,111 @@ impl<'doc> DocumentMutator<'doc> {
         }
     }
 
+    /// Append/update/remove the synthetic Text child
+    /// that paints as the closed-`<select>` label. No-op for non-
+    /// `<select>` ids (form_nodes also tracks button/input/etc.).
+    ///
+    /// `text = None` means "no label" (empty select, or no option
+    /// has a non-empty visible text); the prior label is dropped
+    /// if present. `text = Some(s)` updates an existing label in
+    /// place (last Text child of the select) via set_node_text,
+    /// or appends a fresh one. Idempotent: re-runs converge on
+    /// the right state.
+    ///
+    /// Used by two callers:
+    /// - The parse-time pass in `flush()` walks form_nodes,
+    ///   resolves the initially-selected option from the wasm
+    ///   `selected` content attribute, and calls this with the
+    ///   resolved text.
+    /// - The runtime resync path called from the dom-shim (which
+    ///   tracks IDL-level selectedness in a JS Map, not in the
+    ///   `selected` content attribute per spec). The JS side
+    ///   resolves the label itself and hands the resolved text
+    ///   to the wasm; we can't re-derive it here because the
+    ///   wasm-visible attribute would lie about the live state.
+    pub fn set_select_label(&mut self, target_id: NodeId, text: Option<&str>) {
+        let Some(node) = self.doc.get_node(target_id) else {
+            return;
+        };
+        let Some(data) = node.element_data() else {
+            return;
+        };
+        if &*data.name.local != "select" {
+            return;
+        }
+
+        // Last child being a Text node is the marker for a
+        // previously-injected label. <select>'s content model is
+        // option / optgroup / script / template only, so any
+        // Text child can only be ours (or parser-emitted
+        // whitespace, which is invisible either way).
+        let existing_label = node.children.last().copied().and_then(|id| {
+            if self.doc.nodes[id].is_text_node() {
+                Some(id)
+            } else {
+                None
+            }
+        });
+
+        let normalized = text.filter(|s| !s.is_empty());
+
+        match (existing_label, normalized) {
+            (Some(text_id), Some(s)) => self.set_node_text(text_id, s),
+            (Some(text_id), None) => {
+                self.remove_and_drop_node(text_id);
+            }
+            (None, Some(s)) => {
+                let text_id = self.create_text_node(s);
+                self.append_children(target_id, &[text_id]);
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Parse-time helper that scans `<select>`'s
+    /// children for the initially-selected option (first
+    /// `<option>` with the `selected` content attribute; else
+    /// first `<option>` in document order) and applies its
+    /// text_content via `set_select_label`. Called from flush()
+    /// for every entry in form_nodes: non-selects early-return
+    /// inside set_select_label.
+    pub fn sync_select_label_from_attrs(&mut self, target_id: NodeId) {
+        let Some(node) = self.doc.get_node(target_id) else {
+            return;
+        };
+        let Some(data) = node.element_data() else {
+            return;
+        };
+        if &*data.name.local != "select" {
+            return;
+        }
+
+        let mut chosen: Option<NodeId> = None;
+        let mut first_option: Option<NodeId> = None;
+        for child_id in node.children.iter().copied() {
+            let child_node = &self.doc.nodes[child_id];
+            let Some(child_data) = child_node.element_data() else {
+                continue;
+            };
+            if &*child_data.name.local != "option" {
+                continue;
+            }
+            if first_option.is_none() {
+                first_option = Some(child_id);
+            }
+            if chosen.is_none()
+                && child_data.attr(local_name!("selected")).is_some()
+            {
+                chosen = Some(child_id);
+            }
+        }
+
+        let text = chosen
+            .or(first_option)
+            .map(|opt_id| self.doc.nodes[opt_id].text_content());
+        self.set_select_label(target_id, text.as_deref());
+    }
+
     fn process_button_input(&mut self, target_id: NodeId) {
         let node = &self.doc.nodes[target_id];
         let Some(data) = node.element_data() else {
@@ -1270,6 +1610,16 @@ impl<'doc> DocumentMutator<'doc> {
             self.append_children(target_id, &[id]);
             return;
         }
+
+        // <select> label injection is deliberately
+        // not handled here. The HTML parser calls
+        // process_added_subtree (which queues this fn) before
+        // children are attached, so we'd see an empty option
+        // list every time. Instead, sync_select_labels() runs
+        // from `flush()` at end-of-parse against the
+        // accumulated `form_nodes` set: by then the option
+        // children are fully populated. See the comment at
+        // sync_select_label below for the design rationale.
         #[cfg(feature = "file-input")]
         if let ("input", Some("file")) = (tagname, type_attr) {
             let button_id = self.create_element(
@@ -1352,6 +1702,121 @@ impl Drop for ViewportMut<'_> {
     }
 }
 
+/// Pick a URL from an HTML `srcset` attribute.
+///
+/// `srcset` is a comma-separated list of candidates, each of
+/// which is a URL optionally followed by a width descriptor
+/// (`NNNw`) or pixel-density descriptor (`Nx`). Examples:
+///
+/// ```text
+///   "foo.jpg 480w, bar.jpg 960w"
+///   "foo-1x.png, bar-2x.png 2x"
+///   "single.jpg"
+/// ```
+///
+/// We don't implement the full WHATWG candidate selection
+/// algorithm (which depends on viewport width + DPR + `sizes`).
+/// Instead we pick the candidate with the largest descriptor:
+/// for `Nw` that's the largest pixel-width source available, and
+/// for `Nx` that's the highest-density. In headless rendering
+/// for screenshots, "always the largest" is the right call:
+/// we'd rather pay bytes for a crisp result than save bandwidth
+/// on a thumbnail. Missing descriptors default to `1x`.
+///
+/// Returns `None` if the srcset is empty or every entry fails to
+/// parse a URL.
+fn pick_srcset_candidate(srcset: &str) -> Option<String> {
+    // Best candidate so far: (url, descriptor_value, is_width).
+    // We prefer width-descriptors over density-descriptors when
+    // both appear in the same srcset (it's invalid per spec, but
+    // real pages do it; widths give us the higher-res answer).
+    let mut best: Option<(String, f64, bool)> = None;
+
+    // Whitespace-anchored scan, not a `,`-split; `data:` URLs
+    // contain literal commas (between `image/png;base64` and the
+    // payload) and would shred on a naive split. WHATWG §srcset
+    // parsing is character-by-character: skip leading whitespace,
+    // read a URL (non-whitespace run), read an optional descriptor
+    // run, then consume the comma separator. Commas at the end of
+    // a URL token (i.e. directly attached, no whitespace) are
+    // stripped per spec and act as separators in that one case.
+    let bytes = srcset.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip whitespace and commas between entries.
+        while i < bytes.len()
+            && (bytes[i].is_ascii_whitespace() || bytes[i] == b',')
+        {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // Read URL: run of non-whitespace.
+        let url_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut url_end = i;
+        // A trailing comma at the end of a URL acts as the entry
+        // separator (per spec). Strip it off the URL token.
+        let mut had_trailing_comma = false;
+        if url_end > url_start && bytes[url_end - 1] == b',' {
+            url_end -= 1;
+            had_trailing_comma = true;
+        }
+        if url_end == url_start {
+            continue;
+        }
+        let url = &srcset[url_start..url_end];
+
+        // Read descriptor: skip whitespace, then read up to the
+        // next comma (or end). Skip if we already consumed the
+        // separator via a trailing comma on the URL.
+        let descriptor = if had_trailing_comma {
+            ""
+        } else {
+            while i < bytes.len()
+                && bytes[i].is_ascii_whitespace()
+                && bytes[i] != b'\n'
+            {
+                i += 1;
+            }
+            let desc_start = i;
+            while i < bytes.len() && bytes[i] != b',' {
+                i += 1;
+            }
+            srcset[desc_start..i].trim()
+        };
+        // Consume the comma separator if present; the top-of-loop
+        // skip will eat any trailing whitespace.
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+        }
+
+        let (value, is_width) = if let Some(num) = descriptor.strip_suffix('w') {
+            num.trim().parse::<f64>().map(|v| (v, true)).unwrap_or((1.0, false))
+        } else if let Some(num) = descriptor.strip_suffix('x') {
+            num.trim().parse::<f64>().map(|v| (v, false)).unwrap_or((1.0, false))
+        } else {
+            // No descriptor: treat as 1x density.
+            (1.0, false)
+        };
+
+        let take = match &best {
+            None => true,
+            Some((_, _, prev_is_width)) if is_width && !*prev_is_width => true,
+            Some((_, _, prev_is_width)) if !is_width && *prev_is_width => false,
+            Some((_, prev_value, _)) => value > *prev_value,
+        };
+        if take {
+            best = Some((url.to_string(), value, is_width));
+        }
+    }
+
+    best.map(|(url, _, _)| url)
+}
+
 #[cfg(test)]
 mod test {
     use style::media_queries::MediaType;
@@ -1366,6 +1831,74 @@ mod test {
     use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 
     use crate::{Attribute, BaseDocument, DocumentConfig, ElementData, NodeData, qual_name};
+
+    #[test]
+    fn srcset_single_url_no_descriptor() {
+        assert_eq!(
+            super::pick_srcset_candidate("foo.jpg").as_deref(),
+            Some("foo.jpg")
+        );
+    }
+
+    #[test]
+    fn srcset_picks_largest_width() {
+        assert_eq!(
+            super::pick_srcset_candidate("a.jpg 480w, b.jpg 960w, c.jpg 240w").as_deref(),
+            Some("b.jpg")
+        );
+    }
+
+    #[test]
+    fn srcset_picks_largest_density() {
+        assert_eq!(
+            super::pick_srcset_candidate("a.png 1x, b.png 2x, c.png 3x").as_deref(),
+            Some("c.png")
+        );
+    }
+
+    #[test]
+    fn srcset_width_beats_density_when_mixed() {
+        // Spec-invalid but seen in the wild. Widths win because
+        // they give us higher-res source bytes.
+        assert_eq!(
+            super::pick_srcset_candidate("small.jpg 2x, big.jpg 800w").as_deref(),
+            Some("big.jpg")
+        );
+    }
+
+    #[test]
+    fn srcset_skips_empty_entries() {
+        assert_eq!(
+            super::pick_srcset_candidate(" , foo.jpg 100w , ").as_deref(),
+            Some("foo.jpg")
+        );
+    }
+
+    #[test]
+    fn srcset_empty_returns_none() {
+        assert!(super::pick_srcset_candidate("").is_none());
+        assert!(super::pick_srcset_candidate("  ,  ,  ").is_none());
+    }
+
+    #[test]
+    fn srcset_data_url_with_commas() {
+        // data: URLs contain a comma between the mime-prefix and
+        // the payload. A naive `,`-split would shred the URL into
+        // pieces; the whitespace-anchored scanner has to keep it
+        // intact.
+        let s = "data:image/png;base64,iVBORw0KGgo= 100w, https://x/big.png 400w";
+        assert_eq!(
+            super::pick_srcset_candidate(s).as_deref(),
+            Some("https://x/big.png")
+        );
+    }
+
+    #[test]
+    fn srcset_data_url_only_no_descriptor() {
+        let s = "data:image/png;base64,iVBORw0KGgo=";
+        assert_eq!(super::pick_srcset_candidate(s).as_deref(), Some(s));
+    }
+
 
     #[test]
     fn media_type_defaults_to_screen() {

@@ -279,7 +279,17 @@ impl BaseDocument {
 
                 // Recurse into newly collected layout children
                 for child_id in layout_children.iter().copied() {
+                    // Anonymous blocks and pseudo-elements can be removed
+                    // from the slab between render passes (or by the
+                    // recursive call itself collapsing siblings); skip
+                    // stale IDs. Mirrors the else-branch guard below.
+                    if !doc.nodes.contains_key(child_id) {
+                        continue;
+                    }
                     resolve_layout_children_recursive(doc, child_id);
+                    if !doc.nodes.contains_key(child_id) {
+                        continue;
+                    }
                     doc.nodes[child_id].layout_parent.set(Some(node_id));
                     if let Some(mut data) = doc.nodes[child_id]
                         .try_stylo_element_data_mut()

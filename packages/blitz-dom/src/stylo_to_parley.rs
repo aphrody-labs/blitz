@@ -396,6 +396,158 @@ pub(crate) fn vertical_align(style: &stylo::ComputedValues) -> parley::VerticalA
     parley::VerticalAlign::new(alignment, shift)
 }
 
+/// Extract CSS box decorations (padding, border, background,
+/// border-radius) from a stylo `ComputedValues` into a
+/// `BoxDecorations` ready to attach to a parley `TextStyle`.
+///
+/// Conventions:
+/// - The block-/inline-axis mapping assumes horizontal-tb LTR
+///   (the only writing mode parley currently lays out): block-
+///   start = top, block-end = bottom, inline-start = left,
+///   inline-end = right.
+/// - Padding values that resolve to a percentage at computed-
+///   value time would normally need the inline fragment's
+///   container width to be resolved. We don't have that at
+///   style-extraction time, so percentage-padding falls back to
+///   `0.0`. Pure-length padding (the common case) works.
+/// - Border widths are always pure lengths (CSS spec) so they
+///   convert cleanly via `to_f64_px`.
+/// - Border-radius percentages also need fragment dimensions;
+///   they fall back to `0.0`.
+/// - Brushes (background_brush, border_*_brush) are not
+///   populated; the painter looks up colors directly from the
+///   styled node via `TextBrush::id`. The fields are reserved
+///   for a future change that decouples the painter from the
+///   live DOM at render time (e.g. for off-thread painting).
+fn extract_box_decorations(
+    style: &stylo::ComputedValues,
+) -> parley::BoxDecorations<TextBrush> {
+    use ::style::values::computed::Au;
+    use ::style::values::specified::BorderStyle;
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+
+    // Inline-span box decorations are only applicable to elements
+    // that are themselves laid out inline AS part OF the parent's
+    // inline-formatting-context; i.e., `display: inline` proper
+    // (outside=Inline, inside=Flow). Atomic inline boxes
+    // (inline-block, inline-flex, inline-grid, inline-table) also
+    // satisfy outside=Inline, but they get their own independent
+    // taffy layout pass with their own block-level draw_border
+    // call: extracting decorations for them paints the border
+    // twice: once at the block-level border-box and once again
+    // by the inline-span pass around the inner text fragment.
+    //
+    // Symptom when this gate was too loose: every
+    // display:inline-block `<a>` or button rendered
+    // with four horizontal dark strokes (top-outer, top-inner,
+    // bottom-inner, bottom-outer) instead of two. The inner
+    // strokes were the inline-span pass painting over the inner
+    // text fragment's rect; the outer strokes were the regular
+    // block-level paint. See
+    // packages/core/src/paint/tests/inline_block_border.rs for the
+    // pixel-level pin.
+    //
+    // For block / list-item / flex / table containers, taffy
+    // already applies the element's padding + border when
+    // computing the block's content rect: double-applying here
+    // would also push inline content twice as far (e.g. todomvc's
+    // <label class=label-with-toggle> has 60px padding-left to
+    // leave room for an absolutely-positioned checkbox; if we
+    // extract that padding into the inline-span BoxDecorations,
+    // the line breaker pushes the first cluster by another 60px
+    // and "milk" lands at x≈120 instead of x=60).
+    //
+    // The display here is the computed display, which already
+    // reflects blockification rules (e.g. position:absolute makes
+    // a display:inline element compute to display:block).
+    let display = style.clone_display();
+    if !matches!(display.outside(), DisplayOutside::Inline) {
+        return parley::BoxDecorations::default();
+    }
+    if !matches!(display.inside(), DisplayInside::Flow) {
+        return parley::BoxDecorations::default();
+    }
+
+    let padding = style.get_padding();
+    let border = style.get_border();
+
+    let resolve_px = |lp: &::style::values::computed::LengthPercentage| -> f32 {
+        // `maybe_to_used_value(None)` returns `Some(Au)` when the
+        // length-percentage is purely a length (no percentage
+        // component); falls back to 0.0 for any percentage we
+        // can't resolve without a containing-block size.
+        lp.maybe_to_used_value(None)
+            .map(Au::to_f32_px)
+            .unwrap_or(0.0)
+    };
+
+    // Per-edge border style → "is this border actually visible".
+    // CSS spec: when border-style is `none` or `hidden`, the
+    // computed border-width is 0 and nothing is painted. Stylo
+    // preserves the specified width even when style is None
+    // (e.g. UA default `medium` on every element); without this
+    // filter we'd charge ~3px of advance and paint a stripe for
+    // every inline element on the page. Match the existing
+    // blitz-paint behavior in render.rs:913 (which checks
+    // `border_*_style != BorderStyle::Hidden` before drawing).
+    let visible = |s: BorderStyle, w: ::style::values::computed::Au| -> f32 {
+        match s {
+            BorderStyle::None | BorderStyle::Hidden => 0.0,
+            _ => w.to_f32_px(),
+        }
+    };
+    let border_block_start_width =
+        visible(border.border_top_style, border.border_top_width.0);
+    let border_block_end_width =
+        visible(border.border_bottom_style, border.border_bottom_width.0);
+    let border_inline_start_width =
+        visible(border.border_left_style, border.border_left_width.0);
+    let border_inline_end_width =
+        visible(border.border_right_style, border.border_right_width.0);
+
+    // Padding.
+    let padding_block_start = resolve_px(&padding.padding_top.0);
+    let padding_block_end = resolve_px(&padding.padding_bottom.0);
+    let padding_inline_start = resolve_px(&padding.padding_left.0);
+    let padding_inline_end = resolve_px(&padding.padding_right.0);
+
+    // Border radius (per-corner X/Y). Percentages resolve to 0.0.
+    let resolve_radius = |corner: &::style::values::computed::BorderCornerRadius| -> (f32, f32) {
+        (resolve_px(&corner.0.width.0), resolve_px(&corner.0.height.0))
+    };
+    let (top_left_x, top_left_y) = resolve_radius(&border.border_top_left_radius);
+    let (top_right_x, top_right_y) = resolve_radius(&border.border_top_right_radius);
+    let (bottom_right_x, bottom_right_y) =
+        resolve_radius(&border.border_bottom_right_radius);
+    let (bottom_left_x, bottom_left_y) = resolve_radius(&border.border_bottom_left_radius);
+
+    parley::BoxDecorations {
+        padding_inline_start,
+        padding_inline_end,
+        padding_block_start,
+        padding_block_end,
+        border_inline_start_width,
+        border_inline_end_width,
+        border_block_start_width,
+        border_block_end_width,
+        border_inline_start_brush: None,
+        border_inline_end_brush: None,
+        border_block_start_brush: None,
+        border_block_end_brush: None,
+        background_brush: None,
+        border_radius: parley::BorderRadius {
+            top_left_x,
+            top_left_y,
+            top_right_x,
+            top_right_y,
+            bottom_right_x,
+            bottom_right_y,
+            bottom_left_x,
+            bottom_left_y,
+        },
+    }
+}
+
 pub(crate) fn style(
     span_id: NodeId,
     style: &stylo::ComputedValues,
@@ -519,6 +671,15 @@ pub(crate) fn style(
         strikethrough_offset: Default::default(),
         strikethrough_size: Default::default(),
         strikethrough_brush: Default::default(),
+
+        // CSS box decorations (padding, border, background,
+        // border-radius) extracted from stylo's computed values
+        // for this span's element. The painter (blitz-paint's
+        // text_box_decorations module) consumes this data via
+        // parley's per-line span_fragments() to draw filled
+        // backgrounds, edge borders, and rounded corners on
+        // styled inline elements like <a class="pill">.
+        box_decorations: extract_box_decorations(style),
     }
 }
 
