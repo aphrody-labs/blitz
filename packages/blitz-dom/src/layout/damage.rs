@@ -86,6 +86,11 @@ impl BaseDocument {
         if let Some(after_id) = self.nodes[node_id].after() {
             damage_from_children |= self.propagate_damage_flags(after_id);
         }
+        // Shadow trees live outside `children`; without this hop a
+        // shadow mutation never bubbles CONSTRUCT damage to the host.
+        if let Some(shadow_root_id) = self.nodes[node_id].attached_shadow_root_id() {
+            damage_from_children |= self.propagate_damage_flags(shadow_root_id);
+        }
 
         // A child's `order` changed: this container re-collects (and so re-sorts)
         // its layout children. Only the direct parent consumes the flag, and the

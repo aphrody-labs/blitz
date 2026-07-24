@@ -1066,6 +1066,15 @@ impl Node {
         self.element_data().and_then(|el| el.shadow_root)
     }
 
+    /// Flat-tree children for layout/paint: hosts render their shadow
+    /// root's children; everything else renders its DOM children.
+    pub fn flat_children(&self) -> &[NodeId] {
+        match self.attached_shadow_root_id() {
+            Some(shadow_root_id) => &self.with(shadow_root_id).children,
+            None => &self.children,
+        }
+    }
+
     pub fn is_text_node(&self) -> bool {
         matches!(self.data, NodeData::Text { .. })
     }

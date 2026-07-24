@@ -28,7 +28,7 @@ use crate::{
         TextBrush, TextInputData, TextLayout,
     },
     qual_name, stylo_to_parley,
-    traversal::{iter_children, iter_children_and_pseudos},
+    traversal::{iter_flat_children, iter_flat_children_and_pseudos},
 };
 
 use super::{
@@ -188,7 +188,7 @@ fn push_children_and_pseudos(layout_children: &mut ThinVec<NodeId>, node: &Node)
     if let Some(before) = node.before() {
         layout_children.push(before);
     }
-    layout_children.extend(node.children.iter().copied().filter(|child_id| {
+    layout_children.extend(node.flat_children().iter().copied().filter(|child_id| {
         let child_node = node.with(*child_id);
         child_node.data.kind() != NodeKind::Comment
     }));
@@ -261,8 +261,12 @@ fn push_hoisted_children_and_pseudos(
     if let Some(before) = doc.nodes[container_node_id].before() {
         push_hoisted_child(doc, before, out, wrap);
     }
-    // Take children array from node to avoid borrow checker issues.
-    let children = std::mem::take(&mut doc.nodes[container_node_id].children);
+    // Take children array from node to avoid borrow checker issues
+    // (flat source: hosts hoist their shadow root's children).
+    let flat_src = doc.nodes[container_node_id]
+        .attached_shadow_root_id()
+        .unwrap_or(container_node_id);
+    let children = std::mem::take(&mut doc.nodes[flat_src].children);
     for child_id in children.iter().copied() {
         let child = &doc.nodes[child_id];
         if child.data.kind() == NodeKind::Comment || child.is_collapsible_whitespace_node() {
@@ -270,7 +274,7 @@ fn push_hoisted_children_and_pseudos(
         }
         push_hoisted_child(doc, child_id, out, wrap);
     }
-    doc.nodes[container_node_id].children = children;
+    doc.nodes[flat_src].children = children;
     if let Some(after) = doc.nodes[container_node_id].after() {
         push_hoisted_child(doc, after, out, wrap);
     }
@@ -280,7 +284,7 @@ fn push_non_whitespace_children_and_pseudos(layout_children: &mut ThinVec<NodeId
     if let Some(before) = node.before() {
         layout_children.push(before);
     }
-    layout_children.extend(node.children.iter().copied().filter(|child_id| {
+    layout_children.extend(node.flat_children().iter().copied().filter(|child_id| {
         let child_node = node.with(*child_id);
         !child_node.is_whitespace_node() && child_node.data.kind() != NodeKind::Comment
     }));
@@ -334,7 +338,7 @@ fn classify_flow_children(
                 .unwrap_or(Display::inline());
             matches!(display.inside(), DisplayInside::Contents)
         });
-    let child_ids = node.children.iter().copied().chain(pseudo_ids);
+    let child_ids = node.flat_children().iter().copied().chain(pseudo_ids);
     for child_id in child_ids {
         let child = &doc.nodes[child_id];
 
@@ -533,7 +537,7 @@ fn collect_layout_children_with_wrap(
     // Skip further construction if the node has no children or psuedo-children
     {
         let node = &doc.nodes[container_node_id];
-        if node.children.is_empty() && node.before().is_none() && node.after().is_none() {
+        if node.flat_children().is_empty() && node.before().is_none() && node.after().is_none() {
             return;
         }
     }
@@ -560,7 +564,7 @@ fn collect_layout_children_with_wrap(
             // display:contents hoists its text content into the container.
             let container = &doc.nodes[container_node_id];
             let has_text_node_or_contents = container
-                .children
+                .flat_children()
                 .iter()
                 .copied()
                 .chain(container.before())
@@ -829,7 +833,7 @@ fn collect_complex_layout_children(
     hide_whitespace: bool,
     needs_wrap: fn(NodeKind, DisplayOutside) -> bool,
 ) {
-    doc.iter_children_and_pseudos_mut(container_node_id, |child_id, doc| {
+    doc.iter_flat_children_and_pseudos_mut(container_node_id, |child_id, doc| {
         // Get node kind (text, element, comment, etc)
         let child_node_kind = doc.nodes[child_id].data.kind();
 
@@ -1007,7 +1011,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
 ) {
     flush_inline_pseudos_recursive(doc, inline_context_root_node_id);
 
-    iter_children_and_pseudos!(doc.nodes[inline_context_root_node_id], |child_id| {
+    iter_flat_children_and_pseudos!(doc.nodes, inline_context_root_node_id, |child_id| {
         find_inline_layout_embedded_boxes_recursive(
             &mut doc.nodes,
             inline_context_root_node_id,
@@ -1017,7 +1021,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     });
 
     fn flush_inline_pseudos_recursive(doc: &mut BaseDocument, node_id: NodeId) {
-        doc.iter_children_mut(node_id, |child_id, doc| {
+        doc.iter_flat_children_mut(node_id, |child_id, doc| {
             flush_pseudo_elements(doc, child_id);
             let display = doc.nodes[node_id]
                 .display_style()
@@ -1061,7 +1065,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
                     }
                     (DisplayOutside::None, DisplayInside::Contents) => {
                         node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                        iter_children!(nodes[node_id], |child_id| {
+                        iter_flat_children!(nodes, node_id, |child_id| {
                             find_inline_layout_embedded_boxes_recursive(
                                 nodes,
                                 parent_id,
@@ -1079,7 +1083,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
                             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                         } else {
                             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                            iter_children_and_pseudos!(nodes[node_id], |child_id| {
+                            iter_flat_children_and_pseudos!(nodes, node_id, |child_id| {
                                 find_inline_layout_embedded_boxes_recursive(
                                     nodes,
                                     node_id,
@@ -1180,7 +1184,7 @@ pub(crate) fn build_inline_layout_into(
             &text_transform,
         );
     }
-    for child_id in root_node.children.iter().copied() {
+    for child_id in root_node.flat_children().iter().copied() {
         build_inline_layout_recursive(
             &mut builder,
             &mut text_transformer,
@@ -1262,7 +1266,7 @@ pub(crate) fn build_inline_layout_into(
                                 .as_ref()
                                 .map_or(&[][..], |styles| styles.as_slice()),
                         );
-                        for child_id in node.children.iter().copied() {
+                        for child_id in node.flat_children().iter().copied() {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             build_inline_layout_recursive(
                                 builder,
@@ -1328,7 +1332,7 @@ pub(crate) fn build_inline_layout_into(
                                 );
                             }
 
-                            for child_id in node.children.iter().copied() {
+                            for child_id in node.flat_children().iter().copied() {
                                 build_inline_layout_recursive(
                                     builder,
                                     text_transformer,
