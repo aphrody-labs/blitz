@@ -361,6 +361,14 @@ pub struct BaseDocument {
     /// Shadow roots whose scoped author styles changed since the last
     /// resolve; drained (and flushed into CascadeData) by the stylist.
     pub(crate) dirty_shadow_style_roots: Vec<NodeId>,
+
+    /// All live shadow-root node ids; drives per-resolve slot
+    /// assignment (and any other whole-tree shadow bookkeeping).
+    pub(crate) shadow_roots: HashSet<NodeId>,
+
+    /// Set by any mutation that can reshape slot assignment; lets
+    /// flush_slot_assignments no-op between changes (starts true).
+    pub(crate) slot_assignments_dirty: bool,
     /// Map from form control node ID's to their associated forms node ID's
     pub(crate) controls_to_form: HashMap<NodeId, NodeId>,
     /// Nodes that contain sub documents
@@ -517,6 +525,8 @@ impl BaseDocument {
             url: base_url,
             author_sheet_cache: HashMap::new(),
             dirty_shadow_style_roots: Vec::new(),
+            shadow_roots: HashSet::new(),
+            slot_assignments_dirty: true,
             nodes_to_stylesheet: BTreeMap::new(),
             stylesheet_generation: 0,
             font_ctx,
@@ -937,7 +947,103 @@ impl BaseDocument {
             .expect("shadow host must be an element")
             .shadow_root = Some(shadow_root_id);
 
+        self.shadow_roots.insert(shadow_root_id);
+        self.slot_assignments_dirty = true;
+
         shadow_root_id
+    }
+
+    /// Recompute slot assignment for every live shadow tree. Runs each
+    /// resolve, before styling (::slotted needs assigned_slot fresh).
+    pub fn flush_slot_assignments(&mut self) {
+        if self.shadow_roots.is_empty() || !self.slot_assignments_dirty {
+            return;
+        }
+        self.slot_assignments_dirty = false;
+        let roots: Vec<NodeId> = self.shadow_roots.iter().copied().collect();
+        for root_id in roots {
+            let Some(root) = self.nodes.get(root_id) else {
+                continue;
+            };
+            let Some(data) = root.shadow_root_data() else {
+                continue;
+            };
+            let host_id = data.host;
+
+            // Slots of this tree, pre-order: walk light children only
+            // (nested hosts' shadow trees own their own slots).
+            let mut slots: Vec<NodeId> = Vec::new();
+            let mut stack: Vec<NodeId> = root.children.iter().rev().copied().collect();
+            while let Some(id) = stack.pop() {
+                let Some(node) = self.nodes.get(id) else {
+                    continue;
+                };
+                if node.is_slot_element() {
+                    slots.push(id);
+                }
+                stack.extend(node.children.iter().rev().copied());
+            }
+
+            // Name -> slot, first-in-tree-order wins; "" is the default
+            // slot (both missing and empty `name` normalize to it).
+            let mut by_name: HashMap<String, NodeId> = HashMap::new();
+            for &slot_id in &slots {
+                let name = self.nodes[slot_id]
+                    .attr(local_name!("name"))
+                    .unwrap_or("")
+                    .to_string();
+                by_name.entry(name).or_insert(slot_id);
+            }
+            let previous: Vec<(NodeId, Option<ThinVec<NodeId>>)> = slots
+                .iter()
+                .map(|&slot_id| {
+                    let old = self.nodes[slot_id].assigned_nodes.replace(ThinVec::new());
+                    (slot_id, old)
+                })
+                .collect();
+
+            let host_children: Vec<NodeId> = self
+                .nodes
+                .get(host_id)
+                .map(|host| host.children.to_vec())
+                .unwrap_or_default();
+            for child_id in host_children {
+                let Some(child) = self.nodes.get(child_id) else {
+                    continue;
+                };
+                // Slottables: element children route by their `slot`
+                // attr; text children go to the default slot only.
+                let slot_name: Option<String> = if child.is_element() {
+                    Some(child.attr(local_name!("slot")).unwrap_or("").to_string())
+                } else if child.is_text_node() {
+                    Some(String::new())
+                } else {
+                    None
+                };
+                let assigned = slot_name
+                    .as_ref()
+                    .and_then(|name| by_name.get(name))
+                    .copied();
+                self.nodes[child_id].assigned_slot = assigned;
+                if let Some(slot_id) = assigned {
+                    self.nodes[slot_id]
+                        .assigned_nodes
+                        .as_mut()
+                        .expect("reset above")
+                        .push(child_id);
+                }
+            }
+
+            // A slot's box parent hoists its assigned nodes but gets no damage from
+            // the host's children, so its cached layout children go stale otherwise.
+            for (slot_id, old) in previous {
+                let old = old.as_deref().unwrap_or(&[]);
+                let new = self.nodes[slot_id].assigned_nodes.as_deref().unwrap_or(&[]);
+                if old != new {
+                    self.nodes[slot_id].insert_damage(CONSTRUCT_BOX);
+                }
+            }
+        }
     }
 
     /// Remove a node from the node tree, clearing any interaction state
@@ -1064,6 +1170,10 @@ impl BaseDocument {
             // children, so drop them explicitly or their slots leak.
             if let Some(shadow_root_id) = node.attached_shadow_root_id() {
                 self.drop_node_ignoring_parent(shadow_root_id);
+            }
+
+            if node.is_shadow_root() {
+                self.shadow_roots.remove(&node_id);
             }
         }
         node
@@ -1407,7 +1517,15 @@ impl BaseDocument {
         else {
             return;
         };
-        let host = &mut self.nodes[host_id];
+        self.damage_host_subtree(host_id);
+    }
+
+    /// Wholesale damage + restyle marking for a shadow host, used when
+    /// its composed tree changes shape (styles, slot reassignment).
+    pub(crate) fn damage_host_subtree(&mut self, host_id: NodeId) {
+        let Some(host) = self.nodes.get_mut(host_id) else {
+            return;
+        };
         host.insert_damage(ALL_DAMAGE);
         if let Some(mut data) = host
             .try_stylo_element_data_mut()

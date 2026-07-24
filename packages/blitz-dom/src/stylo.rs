@@ -351,9 +351,12 @@ impl<'a> TNode for BlitzNode<'a> {
         true
     }
 
-    // Flat-tree parent: the shadow-root node is transparent, so its
-    // children inherit (and traverse) from the HOST element.
+    // Flat-tree parent: assigned nodes hang off their slot, shadow
+    // top-levels off the host (the shadow-root node is transparent).
     fn traversal_parent(&self) -> Option<Self::ConcreteElement> {
+        if let Some(slot_id) = self.assigned_slot {
+            return Some(self.with(slot_id));
+        }
         let parent = self.parent_node()?;
         match &parent.data {
             NodeData::ShadowRoot(data) => Some(parent.with(data.host)),
@@ -416,6 +419,14 @@ impl selectors::Element for BlitzNode<'_> {
     fn parent_node_is_shadow_root(&self) -> bool {
         self.parent
             .is_some_and(|id| self.with(id).is_shadow_root())
+    }
+
+    // ::slotted() matching walks this edge (selectors crate default
+    // is None, which disables slotted rules entirely).
+    fn assigned_slot(&self) -> Option<Self> {
+        // Field access (no parens) reads Node's stored assignment,
+        // dodging the method-name collision with this override.
+        self.assigned_slot.map(|id| self.with(id))
     }
 
     fn containing_shadow_host(&self) -> Option<Self> {
@@ -660,8 +671,10 @@ impl selectors::Element for BlitzNode<'_> {
         self.data.is_element_with_tag_name(&local_name!("a"))
     }
 
+    // The selectors crate asserts assigned_slot() targets satisfy
+    // this; ::slotted() matching debug-panics without it.
     fn is_html_slot_element(&self) -> bool {
-        false
+        self.is_slot_element()
     }
 
     fn has_id(
@@ -756,16 +769,12 @@ impl<'a> TElement for BlitzNode<'a> {
         None
     }
 
-    // Flat tree: a shadow host's traversal children are its shadow
-    // root's children; unslotted light children vanish (slots later).
+    // Flat tree: the Traverser reads flat_children(), so hosts yield
+    // shadow children, slots their assigned nodes, others DOM children.
     fn traversal_children(&self) -> style::dom::LayoutIterator<Self::TraversalChildrenIterator> {
-        let parent = match self.attached_shadow_root_id() {
-            Some(shadow_root_id) => self.with(shadow_root_id),
-            None => self,
-        };
         LayoutIterator(Traverser {
             // dom: self.tree(),
-            parent,
+            parent: self,
             child_index: 0,
         })
     }
@@ -1417,7 +1426,7 @@ impl<'a> Iterator for Traverser<'a> {
     type Item = BlitzNode<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let node_id = self.parent.children.get(self.child_index)?;
+        let node_id = self.parent.flat_children().get(self.child_index)?;
         let node = self.parent.with(*node_id);
 
         self.child_index += 1;

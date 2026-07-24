@@ -94,6 +94,14 @@ pub struct Node {
     pub parent: Option<NodeId>,
     // What are our children?
     pub children: ThinVec<NodeId>,
+
+    /// Slot this node is assigned to in its host's shadow tree (flat
+    /// tree edge). Recomputed by flush_slot_assignments each resolve.
+    pub assigned_slot: Option<NodeId>,
+
+    /// For <slot> elements: the slottables assigned to this slot.
+    /// None = not a slot; Some(empty) = computed, render fallback.
+    pub assigned_nodes: Option<ThinVec<NodeId>>,
     /// Our parent in the layout hierachy: a separate list that includes anonymous collections of inline elements
     pub layout_parent: Cell<Option<NodeId>>,
     /// A separate child list that includes anonymous collections of inline elements
@@ -409,6 +417,8 @@ impl Node {
             id,
             parent: None,
             children: ThinVec::new(),
+            assigned_slot: None,
+            assigned_nodes: None,
             layout_parent: Cell::new(None),
             oof_containing_block: Cell::new(None),
             layout_children: RefCell::new(None),
@@ -1111,12 +1121,22 @@ impl Node {
     }
 
     /// Flat-tree children for layout/paint: hosts render their shadow
-    /// root's children; everything else renders its DOM children.
+    /// root's children; slots their assigned nodes (children=fallback).
     pub fn flat_children(&self) -> &[NodeId] {
-        match self.attached_shadow_root_id() {
-            Some(shadow_root_id) => &self.with(shadow_root_id).children,
-            None => &self.children,
+        if let Some(shadow_root_id) = self.attached_shadow_root_id() {
+            return &self.with(shadow_root_id).children;
         }
+        if let Some(assigned) = &self.assigned_nodes {
+            if !assigned.is_empty() {
+                return assigned;
+            }
+        }
+        &self.children
+    }
+
+    /// True for HTML <slot> elements (flat-tree projection points).
+    pub fn is_slot_element(&self) -> bool {
+        self.data.is_element_with_tag_name(&local_name!("slot"))
     }
 
     pub fn is_text_node(&self) -> bool {

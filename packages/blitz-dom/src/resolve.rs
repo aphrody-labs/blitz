@@ -78,6 +78,9 @@ impl BaseDocument {
         // Apply any device changes (viewport resize, zoom, color-scheme, etc)
         // accumulated since the last resolve as a single device rebuild.
         self.flush_pending_device_changes();
+        // Slot assignment shapes the flat tree that styling and box
+        // construction both consume; recompute before either runs.
+        self.flush_slot_assignments();
 
         // we need to resolve stylist first since it will need to drive our layout bits
         self.resolve_stylist(current_time_for_animations);

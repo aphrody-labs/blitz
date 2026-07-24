@@ -6,17 +6,29 @@ use style::dom::TNode as _;
 use crate::{BaseDocument, Node};
 
 // Flat-tree take-based iteration: children come from the attached
-// shadow root when the node is a host (borrowck-safe like the above).
+// shadow root for hosts, assigned nodes for slots (borrowck-safe).
 macro_rules! iter_flat_children {
     ($nodes:expr, $node_id:expr, $cb:expr) => {{
         let src = $nodes[$node_id]
             .attached_shadow_root_id()
             .unwrap_or($node_id);
-        let children = core::mem::take(&mut $nodes[src].children);
-        for child_id in children.iter().copied() {
-            $cb(child_id)
+        let use_assigned = $nodes[src]
+            .assigned_nodes
+            .as_ref()
+            .is_some_and(|a| !a.is_empty());
+        if use_assigned {
+            let assigned = $nodes[src].assigned_nodes.take().unwrap();
+            for child_id in assigned.iter().copied() {
+                $cb(child_id)
+            }
+            $nodes[src].assigned_nodes = Some(assigned);
+        } else {
+            let children = core::mem::take(&mut $nodes[src].children);
+            for child_id in children.iter().copied() {
+                $cb(child_id)
+            }
+            $nodes[src].children = children;
         }
-        $nodes[src].children = children;
     }};
 }
 pub(crate) use iter_flat_children;
@@ -27,22 +39,13 @@ macro_rules! iter_flat_children_and_pseudos {
     ($nodes:expr, $node_id:expr, $cb:expr) => {{
         let before = $nodes[$node_id].before();
         let after = $nodes[$node_id].after();
-        let src = $nodes[$node_id]
-            .attached_shadow_root_id()
-            .unwrap_or($node_id);
-        let children = core::mem::take(&mut $nodes[src].children);
-
         if let Some(before) = before {
             $cb(before)
         }
-        for child_id in children.iter().copied() {
-            $cb(child_id)
-        }
+        crate::traversal::iter_flat_children!($nodes, $node_id, $cb);
         if let Some(after) = after {
             $cb(after)
         }
-
-        $nodes[src].children = children;
     }};
 }
 pub(crate) use iter_flat_children_and_pseudos;
@@ -204,7 +207,7 @@ impl BaseDocument {
     }
 
     /// Flat variant for layout construction: children read through an
-    /// attached shadow root when `node_id` is a host.
+    /// attached shadow root (hosts) or assigned nodes (slots).
     pub fn iter_flat_children_mut(
         &mut self,
         node_id: NodeId,
@@ -213,11 +216,23 @@ impl BaseDocument {
         let src = self.nodes[node_id]
             .attached_shadow_root_id()
             .unwrap_or(node_id);
-        let children = std::mem::take(&mut self.nodes[src].children);
-        for child_id in children.iter().cloned() {
-            cb(child_id, self);
+        let use_assigned = self.nodes[src]
+            .assigned_nodes
+            .as_ref()
+            .is_some_and(|a| !a.is_empty());
+        if use_assigned {
+            let assigned = self.nodes[src].assigned_nodes.take().unwrap();
+            for child_id in assigned.iter().cloned() {
+                cb(child_id, self);
+            }
+            self.nodes[src].assigned_nodes = Some(assigned);
+        } else {
+            let children = std::mem::take(&mut self.nodes[src].children);
+            for child_id in children.iter().cloned() {
+                cb(child_id, self);
+            }
+            self.nodes[src].children = children;
         }
-        self.nodes[src].children = children;
     }
 
     /// Flat variant with pseudos: ::before/::after still belong to the

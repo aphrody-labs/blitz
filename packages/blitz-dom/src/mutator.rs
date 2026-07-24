@@ -9,7 +9,8 @@ use crate::node::{CanvasData, NodeFlags, ShadowRootMode, SpecialElementData};
 use crate::stylo_device::DeviceChanges;
 use crate::util::ImageType;
 use crate::{
-    Attribute, BaseDocument, Document, ElementData, Node, NodeData, QualName, local_name, qual_name,
+    Attribute, BaseDocument, Document, ElementData, LocalName, Node, NodeData, QualName,
+    local_name, qual_name,
 };
 use blitz_traits::shell::Viewport;
 use style::Atom;
@@ -445,6 +446,31 @@ impl DocumentMutator<'_> {
         {
             self.load_iframe(node_id);
         }
+
+        self.note_possible_slot_reassignment(node_id, &name.local);
+    }
+
+    /// `slot` on a host's light child or `name` on a <slot> re-shape
+    /// the flat tree; damage the affected host so the next resolve
+    /// re-runs assignment, restyle, and box construction there.
+    fn note_possible_slot_reassignment(&mut self, node_id: NodeId, attr: &LocalName) {
+        if *attr == local_name!("slot") || *attr == local_name!("name") {
+            self.doc.slot_assignments_dirty = true;
+        }
+        if *attr == local_name!("slot") {
+            if let Some(parent_id) = self.doc.nodes[node_id].parent {
+                if self.doc.nodes[parent_id].attached_shadow_root_id().is_some() {
+                    self.doc.damage_host_subtree(parent_id);
+                }
+            }
+        } else if *attr == local_name!("name") && self.doc.nodes[node_id].is_slot_element() {
+            if let Some(root_id) = self.doc.nodes[node_id].containing_shadow_root_id() {
+                let host = self.doc.nodes[root_id].shadow_root_data().map(|d| d.host);
+                if let Some(host_id) = host {
+                    self.doc.damage_host_subtree(host_id);
+                }
+            }
+        }
     }
 
     pub fn clear_attribute(&mut self, node_id: NodeId, name: QualName) {
@@ -545,6 +571,8 @@ impl DocumentMutator<'_> {
             // Fall back to loading from the `src` attribute (if any)
             self.load_iframe(node_id);
         }
+
+        self.note_possible_slot_reassignment(node_id, &name.local);
     }
 
     pub fn set_style_property(&mut self, node_id: NodeId, name: &str, value: &str) {
@@ -588,6 +616,7 @@ impl DocumentMutator<'_> {
     /// Remove the node from it's parent but don't drop it
     pub fn remove_node(&mut self, node_id: NodeId) {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
+        self.doc.slot_assignments_dirty = true;
         // Process the subtree *before* severing the parent link so that
         // interaction state referencing removed nodes can retarget to the
         // nearest surviving ancestor.
@@ -619,6 +648,7 @@ impl DocumentMutator<'_> {
         on_drop: &mut dyn FnMut(NodeId),
     ) -> Option<Node> {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
+        self.doc.slot_assignments_dirty = true;
         self.process_removed_subtree(node_id);
 
         let node = self.doc.drop_node_ignoring_parent_with(node_id, on_drop);
@@ -650,6 +680,7 @@ impl DocumentMutator<'_> {
     }
 
     pub fn remove_and_drop_all_children(&mut self, node_id: NodeId) {
+        self.doc.slot_assignments_dirty = true;
         let parent = &mut self.doc.nodes[node_id];
         let parent_is_in_doc = parent.flags.is_in_document();
 
@@ -716,6 +747,9 @@ impl DocumentMutator<'_> {
         child_ids: &[NodeId],
         insert_children_fn: &dyn Fn(&mut Node, &[NodeId]),
     ) {
+        // Any child-list mutation can reshape slot assignment (host
+        // children, slot fallback, or slot discovery in a shadow tree).
+        self.doc.slot_assignments_dirty = true;
         let new_parent_is_in_document = self.doc.nodes[parent_id].flags.is_in_document();
         self.mutations_occurred |= new_parent_is_in_document && !child_ids.is_empty();
         // Detach the children from their old parents *before* inserting them into
@@ -728,6 +762,9 @@ impl DocumentMutator<'_> {
             let child = &mut self.doc.nodes[child_id];
             let child_was_in_doc = child.flags.is_in_document();
             self.mutations_occurred |= child_was_in_doc;
+            // Reparenting invalidates any slot assignment; the next
+            // resolve's flush_slot_assignments re-establishes it.
+            child.assigned_slot = None;
             let Some(old_parent_id) = child.parent.take() else {
                 continue;
             };
@@ -1136,6 +1173,9 @@ impl<'doc> DocumentMutator<'doc> {
             doc.clear_interaction_state_for_removed_node(node_id);
 
             let node = &mut doc.nodes[node_id];
+            // Stale flat-tree edges must not outlive removal: slab ids
+            // recycle, so a dangling slot pointer would mislead.
+            node.assigned_slot = None;
 
             // Clear the text selection if one of its endpoints references this node.
             // This prevents stale selection endpoint references.

@@ -261,12 +261,20 @@ fn push_hoisted_children_and_pseudos(
     if let Some(before) = doc.nodes[container_node_id].before() {
         push_hoisted_child(doc, before, out, wrap);
     }
-    // Take children array from node to avoid borrow checker issues
-    // (flat source: hosts hoist their shadow root's children).
+    // Take the flat child list to avoid borrow checker issues: hosts
+    // hoist their shadow root's children, slots their assigned nodes.
     let flat_src = doc.nodes[container_node_id]
         .attached_shadow_root_id()
         .unwrap_or(container_node_id);
-    let children = std::mem::take(&mut doc.nodes[flat_src].children);
+    let use_assigned = doc.nodes[flat_src]
+        .assigned_nodes
+        .as_ref()
+        .is_some_and(|a| !a.is_empty());
+    let children = if use_assigned {
+        doc.nodes[flat_src].assigned_nodes.take().unwrap()
+    } else {
+        std::mem::take(&mut doc.nodes[flat_src].children)
+    };
     for child_id in children.iter().copied() {
         let child = &doc.nodes[child_id];
         if child.data.kind() == NodeKind::Comment || child.is_collapsible_whitespace_node() {
@@ -274,7 +282,11 @@ fn push_hoisted_children_and_pseudos(
         }
         push_hoisted_child(doc, child_id, out, wrap);
     }
-    doc.nodes[flat_src].children = children;
+    if use_assigned {
+        doc.nodes[flat_src].assigned_nodes = Some(children);
+    } else {
+        doc.nodes[flat_src].children = children;
+    }
     if let Some(after) = doc.nodes[container_node_id].after() {
         push_hoisted_child(doc, after, out, wrap);
     }
