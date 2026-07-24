@@ -1277,13 +1277,26 @@ impl<'doc> DocumentMutator<'doc> {
             unreachable!();
         };
 
-        let guard = self.doc.guard.read();
-        self.doc.stylist.remove_stylesheet(stylesheet, &guard);
-        self.doc
-            .stylist
-            .force_stylesheet_origins_dirty(OriginSet::all());
-
-        self.doc.nodes_to_stylesheet.remove(&node_id);
+        // Unregister from wherever the sheet was recorded as living
+        // (the node may already be detached when the unload op runs).
+        let recorded_scope = self
+            .doc
+            .nodes_to_stylesheet
+            .remove(&node_id)
+            .and_then(|(_, scope)| scope);
+        match recorded_scope {
+            Some(shadow_root_id) => {
+                self.doc.remove_shadow_stylesheet(shadow_root_id, stylesheet);
+            }
+            None => {
+                let guard = self.doc.guard.read();
+                self.doc.stylist.remove_stylesheet(stylesheet, &guard);
+                drop(guard);
+                self.doc
+                    .stylist
+                    .force_stylesheet_origins_dirty(OriginSet::all());
+            }
+        }
         self.doc.stylesheet_generation += 1;
     }
 

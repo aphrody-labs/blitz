@@ -310,7 +310,7 @@ impl BaseDocument {
     pub fn stylesheet_disabled(&self, node_id: NodeId) -> bool {
         self.nodes_to_stylesheet
             .get(&node_id)
-            .is_some_and(|sheet| sheet.0.disabled())
+            .is_some_and(|(sheet, _)| sheet.0.disabled())
     }
 
     /// Set the disabled flag of the stylesheet owned by `node_id`. A disabled
@@ -319,7 +319,7 @@ impl BaseDocument {
     ///
     /// Returns `false` if the node owns no stylesheet.
     pub fn set_stylesheet_disabled(&mut self, node_id: NodeId, disabled: bool) -> bool {
-        let Some(sheet) = self.nodes_to_stylesheet.get(&node_id) else {
+        let Some((sheet, _)) = self.nodes_to_stylesheet.get(&node_id) else {
             return false;
         };
         if sheet.0.set_disabled(disabled) {
@@ -396,7 +396,7 @@ impl BaseDocument {
 
     /// The number of rules in the rule list at `path` (`CSSRuleList.length`)
     pub fn stylesheet_rule_count(&self, node_id: NodeId, path: &[usize]) -> Option<usize> {
-        let sheet = self.nodes_to_stylesheet.get(&node_id)?;
+        let (sheet, _) = self.nodes_to_stylesheet.get(&node_id)?;
         let guard = self.guard.read();
         let list = Self::resolve_rule_list(sheet, &guard, path, |_| {})?;
         Some(match list {
@@ -407,7 +407,7 @@ impl BaseDocument {
 
     /// The CSSOM-visible attributes of the rule at `path`
     pub fn stylesheet_rule_info(&self, node_id: NodeId, path: &[usize]) -> Option<CssRuleInfo> {
-        let sheet = self.nodes_to_stylesheet.get(&node_id)?;
+        let (sheet, _) = self.nodes_to_stylesheet.get(&node_id)?;
         let guard = self.guard.read();
         let handle = Self::resolve_rule(sheet, &guard, path, |_| {})?;
         let mut css_text = CssStringWriter::new();
@@ -453,6 +453,7 @@ impl BaseDocument {
             .nodes_to_stylesheet
             .get(&node_id)
             .ok_or(CssomError::NotFound)?
+            .0
             .clone();
         let loader = self.stylesheet_loader();
         let lock = &self.guard;
@@ -551,6 +552,7 @@ impl BaseDocument {
             .nodes_to_stylesheet
             .get(&node_id)
             .ok_or(CssomError::NotFound)?
+            .0
             .clone();
         let lock = &self.guard;
 
@@ -597,7 +599,7 @@ impl BaseDocument {
         path: &[usize],
         guard: &SharedRwLockReadGuard,
     ) -> Option<DeclarationTarget> {
-        let sheet = self.nodes_to_stylesheet.get(&node_id)?;
+        let (sheet, _) = self.nodes_to_stylesheet.get(&node_id)?;
         let handle = Self::resolve_rule(sheet, guard, path, |_| {})?;
         declaration_target(&handle, guard)
     }
@@ -610,7 +612,7 @@ impl BaseDocument {
         node_id: NodeId,
         path: &[usize],
     ) -> Option<(DocumentStyleSheet, Vec<CssRule>, CssRule, DeclarationTarget)> {
-        let sheet = self.nodes_to_stylesheet.get(&node_id)?.clone();
+        let sheet = self.nodes_to_stylesheet.get(&node_id)?.0.clone();
         let guard = self.guard.read();
         let mut ancestors = Vec::with_capacity(path.len());
         let handle = Self::resolve_rule(&sheet, &guard, path, |rule| ancestors.push(rule.clone()))?;
@@ -868,6 +870,7 @@ impl BaseDocument {
             .nodes_to_stylesheet
             .get(&node_id)
             .ok_or(CssomError::NotFound)?
+            .0
             .clone();
         let lock = &self.guard;
 

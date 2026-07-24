@@ -27,7 +27,8 @@ use style::properties::generated::longhands::position::computed_value::T as Posi
 use style::selector_parser::RestyleDamage;
 use style::servo_arc::Arc as ServoArc;
 use style::shared_lock::SharedRwLock;
-use style::stylesheets::UrlExtraData;
+use style::author_styles::AuthorStyles;
+use style::stylesheets::{DocumentStyleSheet, UrlExtraData};
 use style::values::computed::CSSPixelLength;
 use style::values::computed::Display as StyloDisplay;
 use style::values::computed::Rotate;
@@ -855,10 +856,39 @@ pub enum ShadowRootMode {
 
 /// Root of a shadow tree; the host element links here via
 /// ElementData::shadow_root and `host` points back at it.
-#[derive(Debug, Clone)]
 pub struct ShadowRootData {
     pub host: NodeId,
     pub mode: ShadowRootMode,
+    /// Scoped author stylesheets: rules from this shadow tree's own
+    /// <style> elements, consulted via TShadowRoot::style_data.
+    pub author_styles: AuthorStyles<DocumentStyleSheet>,
+}
+
+impl ShadowRootData {
+    pub fn new(host: NodeId, mode: ShadowRootMode) -> Self {
+        Self {
+            host,
+            mode,
+            author_styles: AuthorStyles::new(),
+        }
+    }
+}
+
+// Manual impls: AuthorStyles is neither Clone nor Debug. A cloned
+// shadow root starts with empty styles (its <style> nodes re-register).
+impl Clone for ShadowRootData {
+    fn clone(&self) -> Self {
+        Self::new(self.host, self.mode)
+    }
+}
+
+impl std::fmt::Debug for ShadowRootData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShadowRootData")
+            .field("host", &self.host)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The different kinds of nodes in the DOM.
@@ -1064,6 +1094,20 @@ impl Node {
     /// None for non-elements and hosts without an attached root.
     pub fn attached_shadow_root_id(&self) -> Option<NodeId> {
         self.element_data().and_then(|el| el.shadow_root)
+    }
+
+    /// Nearest enclosing shadow root's node id, walking light parents.
+    /// None for nodes in the document tree proper.
+    pub fn containing_shadow_root_id(&self) -> Option<NodeId> {
+        let mut current = self.parent;
+        while let Some(id) = current {
+            let node = self.with(id);
+            if node.is_shadow_root() {
+                return Some(id);
+            }
+            current = node.parent;
+        }
+        None
     }
 
     /// Flat-tree children for layout/paint: hosts render their shadow

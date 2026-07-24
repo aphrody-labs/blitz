@@ -339,7 +339,10 @@ pub struct BaseDocument {
     /// returns the first in tree order.
     pub(crate) nodes_to_id: HashMap<String, SmallVec<[NodeId; 1]>>,
     /// Map of `<style>` and `<link>` node IDs to their associated stylesheet
-    pub(crate) nodes_to_stylesheet: BTreeMap<NodeId, DocumentStyleSheet>,
+    // Value carries the registration scope (None = document stylist,
+    // Some(id) = that shadow root) so removal targets the right set:
+    // a <style> can be processed detached first and scoped later.
+    pub(crate) nodes_to_stylesheet: BTreeMap<NodeId, (DocumentStyleSheet, Option<NodeId>)>,
     /// Incremented whenever `nodes_to_stylesheet` changes (a stylesheet is
     /// added, replaced or removed), so that CSSOM wrappers can detect that
     /// their cached rule data is stale.
@@ -354,6 +357,10 @@ pub struct BaseDocument {
     /// (an Arc bump), while each <style> node still registers
     /// individually with the stylist (so cascade order is unchanged).
     pub(crate) author_sheet_cache: HashMap<u64, DocumentStyleSheet>,
+
+    /// Shadow roots whose scoped author styles changed since the last
+    /// resolve; drained (and flushed into CascadeData) by the stylist.
+    pub(crate) dirty_shadow_style_roots: Vec<NodeId>,
     /// Map from form control node ID's to their associated forms node ID's
     pub(crate) controls_to_form: HashMap<NodeId, NodeId>,
     /// Nodes that contain sub documents
@@ -509,6 +516,7 @@ impl BaseDocument {
             devtool_settings: DevtoolSettings::default(),
             url: base_url,
             author_sheet_cache: HashMap::new(),
+            dirty_shadow_style_roots: Vec::new(),
             nodes_to_stylesheet: BTreeMap::new(),
             stylesheet_generation: 0,
             font_ctx,
@@ -912,10 +920,8 @@ impl BaseDocument {
             return existing;
         }
 
-        let shadow_root_id = self.create_node(NodeData::ShadowRoot(ShadowRootData {
-            host: host_id,
-            mode,
-        }));
+        let shadow_root_id =
+            self.create_node(NodeData::ShadowRoot(ShadowRootData::new(host_id, mode)));
 
         // parent = host (while staying OUT of host.children) keeps
         // mark_ancestors_dirty working across the shadow boundary.
@@ -1249,7 +1255,7 @@ impl BaseDocument {
     /// Iterate over the author stylesheets (from `<style>` and `<link>` nodes)
     /// currently associated with this document
     pub fn author_stylesheets(&self) -> impl Iterator<Item = &DocumentStyleSheet> {
-        self.nodes_to_stylesheet.values()
+        self.nodes_to_stylesheet.values().map(|(sheet, _)| sheet)
     }
 
     /// Iterate over the user-agent stylesheets currently associated with this document
@@ -1296,11 +1302,23 @@ impl BaseDocument {
     }
 
     pub fn add_stylesheet_for_node(&mut self, stylesheet: DocumentStyleSheet, node_id: NodeId) {
-        let old = self.nodes_to_stylesheet.insert(node_id, stylesheet.clone());
+        // Style elements inside a shadow tree register with that
+        // root's scoped AuthorStyles instead of the document stylist.
+        let shadow_scope = self.nodes[node_id].containing_shadow_root_id();
+
+        let old = self
+            .nodes_to_stylesheet
+            .insert(node_id, (stylesheet.clone(), shadow_scope));
         self.stylesheet_generation += 1;
 
-        if let Some(old) = old {
-            self.stylist.remove_stylesheet(old, &self.guard.read())
+        // Remove the old sheet from wherever it was registered, which
+        // can differ from the node's current scope (detached-then-
+        // scoped <style> elements get processed in both states).
+        if let Some((old_sheet, old_scope)) = old {
+            match old_scope {
+                Some(shadow_root_id) => self.remove_shadow_stylesheet(shadow_root_id, old_sheet),
+                None => self.stylist.remove_stylesheet(old_sheet, &self.guard.read()),
+            }
         }
 
         // Fetch @font-face fonts
@@ -1319,12 +1337,29 @@ impl BaseDocument {
         let element = &mut self.nodes[node_id].element_data_mut().unwrap();
         element.special_data = SpecialElementData::Stylesheet(stylesheet.clone());
 
+        if let Some(shadow_root_id) = shadow_scope {
+            // Appends arrive in tree order (process_added_subtree is a
+            // pre-order walk), which preserves document order per root.
+            if let NodeData::ShadowRoot(ref mut data) = self.nodes[shadow_root_id].data {
+                data.author_styles.stylesheets.append_stylesheet(
+                    None,
+                    &Default::default(),
+                    stylesheet,
+                    &self.guard.read(),
+                );
+            }
+            self.note_shadow_style_change(shadow_root_id);
+            return;
+        }
+
         // TODO: Nodes could potentially get reused so ordering by node_id might be wrong.
+        // Only document-scoped entries exist in the stylist, so only
+        // they are valid insert-before anchors.
         let insertion_point = self
             .nodes_to_stylesheet
             .range((Bound::Excluded(node_id), Bound::Unbounded))
-            .next()
-            .map(|(_, sheet)| sheet);
+            .find(|(_, (_, scope))| scope.is_none())
+            .map(|(_, (sheet, _))| sheet);
 
         if let Some(insertion_point) = insertion_point {
             self.stylist.insert_stylesheet_before(
@@ -1336,6 +1371,51 @@ impl BaseDocument {
             self.stylist
                 .append_stylesheet(stylesheet, &self.guard.read())
         }
+    }
+
+    /// Remove a sheet from a shadow root's scoped set (no-op when the
+    /// sheet was never registered there).
+    pub(crate) fn remove_shadow_stylesheet(
+        &mut self,
+        shadow_root_id: NodeId,
+        stylesheet: DocumentStyleSheet,
+    ) {
+        let guard = self.guard.clone();
+        if let Some(node) = self.nodes.get_mut(shadow_root_id) {
+            if let NodeData::ShadowRoot(ref mut data) = node.data {
+                data.author_styles.stylesheets.remove_stylesheet(
+                    None,
+                    &Default::default(),
+                    stylesheet,
+                    &guard.read(),
+                );
+            }
+        }
+        self.note_shadow_style_change(shadow_root_id);
+    }
+
+    /// Queue a scoped-styles rebuild and restyle the host subtree; we
+    /// invalidate wholesale instead of via StylesheetInvalidationSet.
+    pub(crate) fn note_shadow_style_change(&mut self, shadow_root_id: NodeId) {
+        self.dirty_shadow_style_roots.push(shadow_root_id);
+
+        let Some(host_id) = self
+            .nodes
+            .get(shadow_root_id)
+            .and_then(|n| n.shadow_root_data())
+            .map(|d| d.host)
+        else {
+            return;
+        };
+        let host = &mut self.nodes[host_id];
+        host.insert_damage(ALL_DAMAGE);
+        if let Some(mut data) = host
+            .try_stylo_element_data_mut()
+            .and_then(|data| data.get_mut())
+        {
+            data.hint |= style::invalidation::element::restyle_hints::RestyleHint::restyle_subtree();
+        }
+        host.mark_ancestors_dirty();
     }
 
     pub fn handle_messages(&mut self) {

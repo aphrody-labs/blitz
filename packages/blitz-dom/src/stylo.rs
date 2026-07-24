@@ -63,6 +63,27 @@ impl crate::document::BaseDocument {
     pub fn resolve_stylist(&mut self, now: f64) {
         style::thread_state::enter(ThreadState::LAYOUT);
 
+        // Rebuild scoped CascadeData for shadow roots whose <style>
+        // set changed; invalidation was done wholesale at mutation.
+        let dirty_roots = std::mem::take(&mut self.dirty_shadow_style_roots);
+        for shadow_root_id in dirty_roots {
+            let Some(node) = self.nodes.get_mut(shadow_root_id) else {
+                continue;
+            };
+            let NodeData::ShadowRoot(ref mut data) = node.data else {
+                continue;
+            };
+            // Steal the styles so stylist + styles can borrow disjointly.
+            let mut styles = std::mem::replace(
+                &mut data.author_styles,
+                style::author_styles::AuthorStyles::new(),
+            );
+            let _ = styles.flush(&mut self.stylist, &self.guard.read());
+            if let NodeData::ShadowRoot(ref mut data) = self.nodes[shadow_root_id].data {
+                data.author_styles = styles;
+            }
+        }
+
         let guard = &self.guard;
         let guards = StylesheetGuards {
             author: &guard.read(),
@@ -284,9 +305,10 @@ impl<'a> TShadowRoot for BlitzNode<'a> {
     where
         Self: 'b,
     {
-        // Topology-only for now: scoped stylesheet collection lands
-        // with the author-styles patch; None styles like an empty root.
-        None
+        // Self: 'b bounds 'a: 'b, so handing out the node's cascade
+        // data at 'b is sound (it lives in the slab entry itself).
+        let node: &'b Node = self;
+        node.shadow_root_data().map(|d| &*d.author_styles.data)
     }
 }
 
@@ -726,11 +748,12 @@ impl<'a> TElement for BlitzNode<'a> {
         _opaque_host: OpaqueElement,
         _sheet_index: usize,
     ) -> Option<ImplicitScopeRoot> {
-        // We cannot currently implement this as we are using the NodeId as the OpaqueElement,
-        // and need a reference to the Slab to convert it back into an Element
-        //
-        // Luckily it is only needed for shadow dom.
-        todo!();
+        // Unimplementable while OpaqueElement is a bare NodeId (no slab
+        // to rehydrate through): see the comment on `opaque()` above.
+
+        // None = no implicit @scope root; only misdirects @scope rules
+        // inside shadow sheets, vastly better than a todo!() panic.
+        None
     }
 
     // Flat tree: a shadow host's traversal children are its shadow
