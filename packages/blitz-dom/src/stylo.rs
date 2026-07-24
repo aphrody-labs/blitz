@@ -273,14 +273,20 @@ impl<'a> TShadowRoot for BlitzNode<'a> {
     }
 
     fn host(&self) -> <Self::ConcreteNode as TNode>::ConcreteElement {
-        todo!("Shadow roots not implemented")
+        let host_id = self
+            .shadow_root_data()
+            .expect("host() called on a non-shadow-root node")
+            .host;
+        self.with(host_id)
     }
 
     fn style_data<'b>(&self) -> Option<&'b style::stylist::CascadeData>
     where
         Self: 'b,
     {
-        todo!("Shadow roots not implemented")
+        // Topology-only for now: scoped stylesheet collection lands
+        // with the author-styles patch; None styles like an empty root.
+        None
     }
 }
 
@@ -323,12 +329,14 @@ impl<'a> TNode for BlitzNode<'a> {
         true
     }
 
-    // I think this is the same as parent_node only in the cases when the direct parent is not a real element, forcing us
-    // to travel upwards
-    //
-    // For the sake of this demo, we're just going to return the parent node ann
+    // Flat-tree parent: the shadow-root node is transparent, so its
+    // children inherit (and traverse) from the HOST element.
     fn traversal_parent(&self) -> Option<Self::ConcreteElement> {
-        self.parent_node().and_then(|node| node.as_element())
+        let parent = self.parent_node()?;
+        match &parent.data {
+            NodeData::ShadowRoot(data) => Some(parent.with(data.host)),
+            _ => parent.as_element(),
+        }
     }
 
     fn opaque(&self) -> OpaqueNode {
@@ -354,8 +362,10 @@ impl<'a> TNode for BlitzNode<'a> {
     }
 
     fn as_shadow_root(&self) -> Option<Self::ConcreteShadowRoot> {
-        // TODO: implement shadow DOM
-        None
+        match self.data {
+            NodeData::ShadowRoot { .. } => Some(self),
+            _ => None,
+        }
     }
 }
 
@@ -375,16 +385,19 @@ impl selectors::Element for BlitzNode<'_> {
         OpaqueElement::from_non_null_ptr(non_null)
     }
 
+    // Selector matching stays inside the current tree: shadow-tree
+    // top-levels have a null parentElement (traversal_parent crosses).
     fn parent_element(&self) -> Option<Self> {
-        TElement::traversal_parent(self)
+        self.parent_node().and_then(|node| node.as_element())
     }
 
     fn parent_node_is_shadow_root(&self) -> bool {
-        false
+        self.parent
+            .is_some_and(|id| self.with(id).is_shadow_root())
     }
 
     fn containing_shadow_host(&self) -> Option<Self> {
-        None
+        TElement::containing_shadow(self).map(|root| TShadowRoot::host(&root))
     }
 
     fn is_pseudo_element(&self) -> bool {
@@ -611,7 +624,9 @@ impl selectors::Element for BlitzNode<'_> {
         // Handle flags that apply to the parent.
         let parent_flags = flags.for_parent();
         if !parent_flags.is_empty() {
-            if let Some(parent) = self.parent_node() {
+            // Shadow roots hold no selector flags, and nothing here reads parent
+            // flags: mutations under a root restyle through the host's subtree hint.
+            if let Some(parent) = self.parent_node().filter(|p| !p.is_shadow_root()) {
                 parent
                     .selector_flags()
                     .set(parent.selector_flags().get() | parent_flags);
@@ -718,10 +733,16 @@ impl<'a> TElement for BlitzNode<'a> {
         todo!();
     }
 
+    // Flat tree: a shadow host's traversal children are its shadow
+    // root's children; unslotted light children vanish (slots later).
     fn traversal_children(&self) -> style::dom::LayoutIterator<Self::TraversalChildrenIterator> {
+        let parent = match self.attached_shadow_root_id() {
+            Some(shadow_root_id) => self.with(shadow_root_id),
+            None => self,
+        };
         LayoutIterator(Traverser {
             // dom: self.tree(),
-            parent: self,
+            parent,
             child_index: 0,
         })
     }
@@ -738,6 +759,12 @@ impl<'a> TElement for BlitzNode<'a> {
     // need to check the namespace
     fn is_svg_element(&self) -> bool {
         false
+    }
+
+    // Style inheritance follows the flat tree (parent_element stops
+    // at the shadow root by design; inheritance must cross to host).
+    fn inheritance_parent(&self) -> Option<Self> {
+        TElement::traversal_parent(self)
     }
 
     fn style_attribute(&self) -> Option<ArcBorrow<'_, Locked<PropertyDeclarationBlock>>> {
@@ -904,10 +931,19 @@ impl<'a> TElement for BlitzNode<'a> {
     }
 
     fn shadow_root(&self) -> Option<<Self::ConcreteNode as TNode>::ConcreteShadowRoot> {
-        None
+        self.attached_shadow_root_id().map(|id| self.with(id))
     }
 
+    // Walking Node::parent terminates: a shadow subtree's chain hits
+    // its shadow-root node before ever reaching the host's ancestors.
     fn containing_shadow(&self) -> Option<<Self::ConcreteNode as TNode>::ConcreteShadowRoot> {
+        let mut current = self.parent_node();
+        while let Some(node) = current {
+            if node.is_shadow_root() {
+                return Some(node);
+            }
+            current = node.parent_node();
+        }
         None
     }
 

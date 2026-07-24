@@ -161,6 +161,13 @@ impl BaseDocument {
             node_id: NodeId,
             cb: &mut impl FnMut(NodeId, &mut BaseDocument),
         ) {
+            // Recurse into attached shadow trees so document-membership
+            // bookkeeping (flags, id map, special ops) follows the host.
+            if let Some(shadow_root_id) = doc.nodes[node_id].attached_shadow_root_id() {
+                cb(shadow_root_id, doc);
+                iter_subtree_mut_inner(doc, shadow_root_id, cb);
+            }
+
             let children = std::mem::take(&mut doc.nodes[node_id].children);
             for child_id in children.iter().cloned() {
                 cb(child_id, doc);

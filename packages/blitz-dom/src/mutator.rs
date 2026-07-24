@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::layout::damage::ALL_DAMAGE;
 use crate::net::{ImageHandler, ResourceHandler, StylesheetHandler};
-use crate::node::{CanvasData, NodeFlags, SpecialElementData};
+use crate::node::{CanvasData, NodeFlags, ShadowRootMode, SpecialElementData};
 use crate::stylo_device::DeviceChanges;
 use crate::util::ImageType;
 use crate::{
@@ -191,6 +191,27 @@ impl DocumentMutator<'_> {
             .get_node(template_id)
             .and_then(|node| node.element_data())
             .and_then(|element| element.template_contents)
+    }
+
+    /// Attach (or fetch) a shadow root on `host_id` and mark the host
+    /// for restyle so the next paint reflects the new composed tree.
+    pub fn attach_shadow(&mut self, host_id: NodeId, mode: ShadowRootMode) -> NodeId {
+        let shadow_root_id = self.doc.attach_shadow(host_id, mode);
+
+        let host = &mut self.doc.nodes[host_id];
+        host.insert_damage(ALL_DAMAGE);
+        if host.flags.is_in_document() {
+            if let Some(mut data) = host
+                .try_stylo_element_data_mut()
+                .and_then(|data| data.get_mut())
+            {
+                data.hint |= RestyleHint::restyle_subtree();
+            }
+            host.mark_ancestors_dirty();
+        }
+        self.maybe_record_node(host_id);
+
+        shadow_root_id
     }
 
     // Node mutation methods
@@ -989,6 +1010,30 @@ impl<'doc> DocumentMutator<'doc> {
 
     pub fn set_inner_html(&mut self, node_id: NodeId, html: &str) {
         self.remove_and_drop_all_children(node_id);
+
+        // html5ever's fragment parser needs an element context (its
+        // elem_name callback panics otherwise). Shadow roots parse
+        // under a temp element named like the host, then adopt.
+        let shadow_host = self.doc.nodes[node_id]
+            .shadow_root_data()
+            .map(|data| data.host);
+        if let Some(host_id) = shadow_host {
+            let host_name = self.doc.nodes[host_id]
+                .element_data()
+                .expect("shadow host must be an element")
+                .name
+                .clone();
+            let tmp_id = self.create_element(host_name, Vec::new());
+            self.doc
+                .html_parser_provider
+                .clone()
+                .parse_inner_html(self, tmp_id, html);
+            let child_ids = self.child_ids(tmp_id);
+            self.append_children(node_id, &child_ids);
+            self.remove_and_drop_node(tmp_id);
+            return;
+        }
+
         self.doc
             .html_parser_provider
             .clone()
@@ -1023,7 +1068,9 @@ impl<'doc> DocumentMutator<'doc> {
 
             // If the node has an "id" attribute, store it in the ID map.
             if let Some(id_attr) = node.attr(local_name!("id")).map(ToString::to_string) {
-                doc.add_to_id_map(&id_attr, node_id);
+                if node.containing_shadow_root_id().is_none() {
+                    doc.add_to_id_map(&id_attr, node_id);
+                }
             }
 
             let node = &mut doc.nodes[node_id];

@@ -78,6 +78,10 @@ pub struct ElementData {
 
     /// The element's template contents (\<template\> elements only)
     pub template_contents: Option<NodeId>,
+
+    /// Node id of this element's attached shadow root, when it is a
+    /// shadow host. The shadow tree hangs off that node, not children.
+    pub shadow_root: Option<NodeId>,
     // /// Whether the node is a [HTML integration point] (https://html.spec.whatwg.org/multipage/#html-integration-point)
     // pub mathml_annotation_xml_integration_point: bool,
 
@@ -309,6 +313,7 @@ impl Clone for ElementData {
             inline_layout_data: self.inline_layout_data.clone(),
             list_item_data: self.list_item_data.clone(),
             template_contents: self.template_contents,
+            shadow_root: None,
 
             // Runtime state: reset to defaults.
             stylo_element_data: Default::default(),
@@ -415,6 +420,7 @@ impl ElementData {
             list_item_data: None,
             special_data: SpecialElementData::None,
             template_contents: None,
+            shadow_root: None,
             background_images: ThinVec::new(),
             mask_images: ThinVec::new(),
 

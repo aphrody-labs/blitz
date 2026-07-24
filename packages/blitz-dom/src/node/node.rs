@@ -839,6 +839,26 @@ pub enum NodeKind {
     AnonymousBlock,
     Text,
     Comment,
+    ShadowRoot,
+}
+
+/// Encapsulation mode of a shadow root, mirroring the
+/// DOM spec's ShadowRootMode (open/closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowRootMode {
+    Open,
+    Closed,
+}
+
+// Shadow roots live in the slab OUT of the host's child list (the
+// ElementData::template_contents pattern), so light walks skip them.
+
+/// Root of a shadow tree; the host element links here via
+/// ElementData::shadow_root and `host` points back at it.
+#[derive(Debug, Clone)]
+pub struct ShadowRootData {
+    pub host: NodeId,
+    pub mode: ShadowRootMode,
 }
 
 /// The different kinds of nodes in the DOM.
@@ -861,6 +881,9 @@ pub enum NodeData {
         /// The textual content of the comment
         contents: String,
     },
+
+    /// The root of a shadow tree attached to a host element.
+    ShadowRoot(ShadowRootData),
     // /// A `DOCTYPE` with name, public id, and system id. See
     // /// [document type declaration on wikipedia][https://en.wikipedia.org/wiki/Document_type_declaration]
     // Doctype { name: String, public_id: String, system_id: String },
@@ -913,6 +936,14 @@ impl NodeData {
             NodeData::AnonymousBlock(_) => NodeKind::AnonymousBlock,
             NodeData::Text(_) => NodeKind::Text,
             NodeData::Comment { .. } => NodeKind::Comment,
+            NodeData::ShadowRoot(_) => NodeKind::ShadowRoot,
+        }
+    }
+
+    pub fn shadow_root_data(&self) -> Option<&ShadowRootData> {
+        match self {
+            Self::ShadowRoot(data) => Some(data),
+            _ => None,
         }
     }
 }
@@ -1021,6 +1052,20 @@ impl Node {
         matches!(self.data, NodeData::AnonymousBlock { .. })
     }
 
+    pub fn is_shadow_root(&self) -> bool {
+        matches!(self.data, NodeData::ShadowRoot(_))
+    }
+
+    pub fn shadow_root_data(&self) -> Option<&ShadowRootData> {
+        self.data.shadow_root_data()
+    }
+
+    /// Shadow-root node id when this node is a shadow host.
+    /// None for non-elements and hosts without an attached root.
+    pub fn attached_shadow_root_id(&self) -> Option<NodeId> {
+        self.element_data().and_then(|el| el.shadow_root)
+    }
+
     pub fn is_text_node(&self) -> bool {
         matches!(self.data, NodeData::Text { .. })
     }
@@ -1072,6 +1117,7 @@ impl Node {
             }
             NodeData::Comment { .. } => write!(s, "COMMENT"),
             NodeData::AnonymousBlock(_) => write!(s, "AnonymousBlock"),
+            NodeData::ShadowRoot(data) => write!(s, "#shadow-root ({:?})", data.mode),
             NodeData::Element(data) => {
                 let name = &data.name;
                 let class = self.attr(local_name!("class")).unwrap_or("");

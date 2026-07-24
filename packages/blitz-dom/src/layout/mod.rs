@@ -918,6 +918,7 @@ impl PrintTree for TaffyDebugTree<'_> {
             NodeData::Text { .. } => node.node_debug_str().leak(),
             NodeData::Comment { .. } => "COMMENT",
             NodeData::AnonymousBlock(_) => "ANONYMOUS BLOCK",
+            NodeData::ShadowRoot(_) => "#shadow-root",
             NodeData::Element(_) => {
                 let style = node.layout_style();
                 let display = match node.taffy_display() {

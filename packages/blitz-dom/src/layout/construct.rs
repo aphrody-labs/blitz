@@ -1098,6 +1098,9 @@ pub(crate) fn find_inline_layout_embedded_boxes(
             NodeData::Comment { .. } | NodeData::Text(_) => {
                 node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             }
+            // Shadow roots never sit in a child list; tolerate one
+            // showing up here rather than killing the whole paint.
+            NodeData::ShadowRoot(_) => {}
             NodeData::Document(_) => unreachable!(),
         }
     }
@@ -1380,6 +1383,9 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Comment { .. } => {
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             }
+            // Shadow roots never sit in a child list; tolerate one
+            // showing up here rather than killing the whole paint.
+            NodeData::ShadowRoot(_) => {}
             NodeData::Document(_) => unreachable!(),
         }
     }

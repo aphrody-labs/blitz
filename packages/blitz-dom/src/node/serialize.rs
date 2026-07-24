@@ -128,6 +128,7 @@ impl Node {
             NodeData::Document(_) => {}
             NodeData::Comment { .. } => {}
             NodeData::AnonymousBlock(_) => {}
+            NodeData::ShadowRoot(_) => {}
             // NodeData::Doctype { name, .. } => write!(s, "DOCTYPE {name}"),
             NodeData::Text(data) => {
                 if matches!(style, OutputStyle::Pretty) {

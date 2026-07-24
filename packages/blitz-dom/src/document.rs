@@ -6,7 +6,10 @@ use crate::mutator::ViewportMut;
 use crate::net::{
     Resource, ResourceHandler, ResourceLoadResponse, StylesheetHandler, StylesheetLoader,
 };
-use crate::node::{ImageData, NodeFlags, RasterImageData, SpecialElementData, Status, TextBrush};
+use crate::node::{
+    ImageData, NodeFlags, RasterImageData, ShadowRootData, ShadowRootMode, SpecialElementData,
+    Status, TextBrush,
+};
 use crate::scrolling::ScrollAnimationState;
 use crate::selection::TextSelection;
 use crate::stylo_device::{DeviceChanges, make_device};
@@ -902,6 +905,35 @@ impl BaseDocument {
         id
     }
 
+    /// Attach a shadow root to `host_id` (idempotent: an existing root
+    /// is returned as-is; the JS layer owns spec throwing semantics).
+    pub fn attach_shadow(&mut self, host_id: NodeId, mode: ShadowRootMode) -> NodeId {
+        if let Some(existing) = self.nodes[host_id].attached_shadow_root_id() {
+            return existing;
+        }
+
+        let shadow_root_id = self.create_node(NodeData::ShadowRoot(ShadowRootData {
+            host: host_id,
+            mode,
+        }));
+
+        // parent = host (while staying OUT of host.children) keeps
+        // mark_ancestors_dirty working across the shadow boundary.
+        self.nodes[shadow_root_id].parent = Some(host_id);
+        if self.nodes[host_id].flags.is_in_document() {
+            self.nodes[shadow_root_id]
+                .flags
+                .insert(NodeFlags::IS_IN_DOCUMENT);
+        }
+
+        self.nodes[host_id]
+            .element_data_mut()
+            .expect("shadow host must be an element")
+            .shadow_root = Some(shadow_root_id);
+
+        shadow_root_id
+    }
+
     /// Remove a node from the node tree, clearing any interaction state
     /// (hover/active/focus/mousedown/selection/drag/scrollbar) that references
     /// it so that stale NodeIds are never dereferenced after the slot is freed.
@@ -1021,6 +1053,12 @@ impl BaseDocument {
             for &anon_id in &node.anonymous_blocks {
                 self.deallocate_anonymous_block(anon_id);
             }
+
+            // Shadow trees hang off ElementData::shadow_root rather than
+            // children, so drop them explicitly or their slots leak.
+            if let Some(shadow_root_id) = node.attached_shadow_root_id() {
+                self.drop_node_ignoring_parent(shadow_root_id);
+            }
         }
         node
     }
@@ -1061,6 +1099,10 @@ impl BaseDocument {
 
         match &mut data {
             NodeData::Element(elem) | NodeData::AnonymousBlock(elem) => {
+                // Per spec, cloning never copies shadow roots, and a raw
+                // copy would alias the original's tree by node id.
+                elem.shadow_root = None;
+
                 if let Some(arc) = elem.style_attribute.as_mut() {
                     let read_guard = self.guard().read();
                     let block = arc.read_with(&read_guard);
