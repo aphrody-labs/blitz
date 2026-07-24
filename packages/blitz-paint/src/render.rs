@@ -627,6 +627,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             NodeData::Document(_) => {}
             // NodeData::Doctype => {}
             NodeData::Comment { .. } => {} // NodeData::ProcessingInstruction { .. } => {}
+            // Shadow roots are containers; their flattened children paint via the host.
+            NodeData::ShadowRoot(_) => {}
         }
     }
 
