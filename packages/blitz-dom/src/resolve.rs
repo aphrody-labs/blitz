@@ -86,6 +86,11 @@ impl BaseDocument {
         self.resolve_stylist(current_time_for_animations);
         timer.record_time("style");
 
+        // Computed styles are fresh: fetch any pending
+        // @font-face whose family just became used (lazy web-font
+        // loading; see flush_needed_font_faces).
+        self.flush_needed_font_faces();
+
         // Non-incremental mode is "every node is damaged every frame": mark the
         // whole tree and let the same damage pipeline reconstruct and relayout
         // everything.

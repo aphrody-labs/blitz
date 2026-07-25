@@ -247,7 +247,6 @@ impl ServoStylesheetLoader for StylesheetLoader {
                     lock: lock.clone(),
                     media,
                     import_rule: import.clone(),
-                    net_provider: self.net_provider.clone(),
                 },
             ),
         );
@@ -262,7 +261,6 @@ struct NestedStylesheetHandler {
     url: ServoArc<Url>,
     media: ServoArc<Locked<MediaList>>,
     import_rule: ServoArc<Locked<ImportRule>>,
-    net_provider: Arc<dyn NetProvider>,
 }
 
 impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
@@ -286,17 +284,13 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
             AllowImportRules::Yes,
         ));
 
-        // Fetch @font-face fonts
-        fetch_font_face(
-            self.tx.clone(),
-            self.doc_id,
-            self.node_id,
-            &sheet,
-            &self.data.net_provider,
-            &self.shell_provider,
-            &self.data.lock.read(),
-            self.data.loader.abort_signal.as_ref(),
-        );
+        // Queue @font-face faces (fetched lazily on first use;
+        // see PendingFontFace). This handler runs outside any
+        // document borrow, so route through the event channel.
+        let faces = collect_font_faces(self.node_id, &sheet, &self.data.lock.read());
+        if !faces.is_empty() {
+            let _ = self.tx.send(DocumentEvent::PendingFontFaces(faces));
+        }
 
         let import_rule = self.data.import_rule.clone();
         self.respond(resolved_url, Ok(Resource::ImportedCss(import_rule, sheet)))
@@ -384,42 +378,47 @@ impl FontFaceHandler {
     }
 }
 
-/// Fetch the fonts of all `@font-face` rules in `sheet`
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fetch_font_face(
-    tx: Sender<DocumentEvent>,
-    doc_id: usize,
+/// A parsed-but-not-fetched `@font-face` source. Fonts
+/// download lazily: only once some element's computed style
+/// actually references the family (Chrome behavior). Eager
+/// fetching multiplied network + resident decompressed-font cost
+/// by declared/used on font-heavy pages (icon fonts, per-script
+/// subsets, unused weights).
+#[derive(Clone)]
+pub struct PendingFontFace {
+    /// Lowercased `font-family` descriptor for case-insensitive
+    /// matching against computed styles.
+    pub family_lc: String,
+    pub url: Url,
+    pub format: FontFaceSourceFormatKeyword,
+    pub overrides: FontFaceOverrides,
+    pub node_id: Option<NodeId>,
+}
+
+/// Parse a stylesheet's `@font-face` rules into pending faces.
+/// Pure descriptor/source-list parsing: no network. The caller
+/// queues the result on the document (directly or via a
+/// DocumentEvent) and `flush_needed_font_faces` fetches on first
+/// use.
+pub(crate) fn collect_font_faces(
     node_id: Option<NodeId>,
     sheet: &Stylesheet,
-    network_provider: &Arc<dyn NetProvider>,
-    shell_provider: &Arc<dyn ShellProvider>,
     read_guard: &SharedRwLockReadGuard,
-    abort_signal: Option<&AbortSignal>,
-) {
-    fetch_font_face_rules(
+) -> Vec<PendingFontFace> {
+    collect_font_face_rules(
         sheet.contents(read_guard).rules(read_guard).iter(),
-        tx,
-        doc_id,
         node_id,
-        network_provider,
-        shell_provider,
         read_guard,
-        abort_signal,
     )
 }
 
-/// Fetch the fonts of the `@font-face` rules among `rules`
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fetch_font_face_rules<'a>(
+/// Parse the `@font-face` rules among `rules` into pending faces (see
+/// [`collect_font_faces`]).
+pub(crate) fn collect_font_face_rules<'a>(
     rules: impl Iterator<Item = &'a CssRule>,
-    tx: Sender<DocumentEvent>,
-    doc_id: usize,
     node_id: Option<NodeId>,
-    network_provider: &Arc<dyn NetProvider>,
-    shell_provider: &Arc<dyn ShellProvider>,
     read_guard: &SharedRwLockReadGuard,
-    abort_signal: Option<&AbortSignal>,
-) {
+) -> Vec<PendingFontFace> {
     rules
         .filter_map(|rule| match rule {
             CssRule::FontFace(font_face) => {
@@ -443,11 +442,12 @@ pub(crate) fn fetch_font_face_rules<'a>(
                     }),
                     style: descriptor.font_style.as_ref().map(stylo_to_fontique_style),
                 };
-                Some((src, overrides))
+                let family_lc = family.name.to_string().to_lowercase();
+                Some((family_lc, src, overrides))
             }
             _ => None,
         })
-        .for_each(|(source_list, overrides)| {
+        .filter_map(|(family_lc, source_list, overrides)| {
             // Find the first font source in the source list that specifies a font of a type
             // that we support.
             let preferred_source = source_list
@@ -516,31 +516,49 @@ pub(crate) fn fetch_font_face_rules<'a>(
                     Some((url, format))
                 });
 
-            if let Some((url, format)) = preferred_source {
-                // Tag with content_type = "font/*" so the
-                // outbound gateway routes through the Font cross-
-                // origin bypass (matching the opaque-resource path
-                // real browsers take for @font-face). Without this
-                // tag, KitesurfNetProvider falls back to URL-
-                // extension inference, which fails for
-                // content-negotiating CDNs (e.g. fonts.gstatic.com
-                // serves /<hash>.woff2 with no extension hint to
-                // the JS fetch bridge).
-                let mut req = stamped_request(url, abort_signal);
-                req.content_type = Some("font/*".to_string());
-                network_provider.fetch(
-                    doc_id,
-                    req,
-                    ResourceHandler::boxed(
-                        tx.clone(),
-                        doc_id,
-                        node_id,
-                        shell_provider.clone(),
-                        FontFaceHandler { format, overrides },
-                    ),
-                );
-            }
+            preferred_source.map(|(url, format)| PendingFontFace {
+                family_lc,
+                url,
+                format,
+                overrides,
+                node_id,
+            })
         })
+        .collect()
+}
+
+/// Perform the network fetch for a pending face whose
+/// family became used. The tail of the old eager fetch_font_face.
+pub(crate) fn fetch_pending_font_face(
+    tx: Sender<DocumentEvent>,
+    doc_id: usize,
+    network_provider: &Arc<dyn NetProvider>,
+    shell_provider: &Arc<dyn ShellProvider>,
+    abort_signal: Option<&AbortSignal>,
+    face: PendingFontFace,
+) {
+    // Tag with content_type = "font/*" so the
+    // outbound gateway routes through the Font cross-
+    // origin bypass (matching the opaque-resource path
+    // real browsers take for @font-face). Without this
+    // tag, KitesurfNetProvider falls back to URL-
+    // extension inference, which fails for
+    // content-negotiating CDNs (a font CDN may serve
+    // /<hash>.woff2 with no extension hint to
+    // the JS fetch bridge).
+    let mut req = stamped_request(face.url, abort_signal);
+    req.content_type = Some("font/*".to_string());
+    network_provider.fetch(
+        doc_id,
+        req,
+        ResourceHandler::boxed(
+            tx,
+            doc_id,
+            face.node_id,
+            shell_provider.clone(),
+            FontFaceHandler { format: face.format, overrides: face.overrides },
+        ),
+    );
 }
 
 /// Translate stylo's `@font-face` `font-style` descriptor into the fontique

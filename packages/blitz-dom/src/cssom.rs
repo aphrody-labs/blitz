@@ -514,16 +514,14 @@ impl BaseDocument {
 
         let guard = lock.read();
         if let CssRule::FontFace(_) = &new_rule {
-            crate::net::fetch_font_face_rules(
+            // Queued, fetched lazily on first use (see
+            // `flush_needed_font_faces`).
+            let faces = crate::net::collect_font_face_rules(
                 std::iter::once(&new_rule),
-                self.tx.clone(),
-                self.id(),
                 Some(node_id),
-                &self.net_provider,
-                &self.shell_provider,
                 &guard,
-                self.abort_signal.as_ref(),
             );
+            self.pending_font_faces.extend(faces);
         }
         let (change_kind, ancestors) = match &list {
             RuleList::Css(_) => (RuleChangeKind::Insertion, ancestors.as_slice()),

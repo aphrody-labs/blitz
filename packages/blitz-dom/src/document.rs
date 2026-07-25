@@ -226,6 +226,10 @@ pub enum DocumentEvent {
         node_id: NodeId,
         url: Url,
     },
+    /// Parsed @font-face sources awaiting first use.
+    /// Sent by async stylesheet handlers (no document borrow);
+    /// resolve()'s flush fetches the ones whose family is used.
+    PendingFontFaces(Vec<crate::net::PendingFontFace>),
 }
 
 pub struct BaseDocument {
@@ -394,6 +398,13 @@ pub struct BaseDocument {
     /// Renderer-mode flag: image loads keep encoded
     /// bytes + dims only. See DocumentConfig::dims_only_images.
     pub dims_only_images: bool,
+    /// @font-face sources declared but not yet fetched.
+    /// Lazy web-font loading; see net::PendingFontFace.
+    pub(crate) pending_font_faces: Vec<crate::net::PendingFontFace>,
+    /// Lowercased families ever seen in computed styles.
+    /// Sticky, so newly-declared faces for known-used families
+    /// fetch on the next flush without a rescan hit.
+    pub(crate) used_font_families: std::collections::HashSet<String>,
 
     /// Tracks in-flight image requests. When an image is being fetched, additional
     /// requests for the same URL are queued here instead of starting new fetches.
@@ -559,6 +570,8 @@ impl BaseDocument {
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
             dims_only_images: config.dims_only_images,
+            pending_font_faces: Vec::new(),
+            used_font_families: std::collections::HashSet::new(),
             pending_images: HashMap::new(),
             pending_style_image_nodes: Vec::new(),
             pending_critical_resources: HashSet::new(),
@@ -1435,17 +1448,12 @@ impl BaseDocument {
             }
         }
 
-        // Fetch @font-face fonts
-        crate::net::fetch_font_face(
-            self.tx.clone(),
-            self.id,
-            Some(node_id),
-            &stylesheet.0,
-            &self.net_provider,
-            &self.shell_provider,
-            &self.guard.read(),
-            self.abort_signal.as_ref(),
-        );
+        // Queue @font-face faces; fetched lazily on first use by
+        // flush_needed_font_faces (Chrome downloads only faces the
+        // page's computed styles actually reference).
+        let faces =
+            crate::net::collect_font_faces(Some(node_id), &stylesheet.0, &self.guard.read());
+        self.pending_font_faces.extend(faces);
 
         // Store data on element
         let element = &mut self.nodes[node_id].element_data_mut().unwrap();
@@ -1540,6 +1548,50 @@ impl BaseDocument {
         host.mark_ancestors_dirty();
     }
 
+    /// Fetch pending @font-face sources whose family is
+    /// referenced by some element's computed font-family. Runs
+    /// after every style resolve; O(nodes) only while faces are
+    /// pending (most pages: one resolve, then the list empties or
+    /// stabilizes to never-used leftovers: those short-circuit
+    /// via the sticky used-set check first).
+    pub(crate) fn flush_needed_font_faces(&mut self) {
+        use style::values::computed::font::SingleFontFamily;
+        if self.pending_font_faces.is_empty() {
+            return;
+        }
+        // Fast path: known-used families (sticky set) need no scan.
+        let mut ready: Vec<crate::net::PendingFontFace> = Vec::new();
+        let used = &self.used_font_families;
+        self.pending_font_faces
+            .retain(|f| !used.contains(&f.family_lc) || { ready.push(f.clone()); false });
+        if !self.pending_font_faces.is_empty() {
+            let mut used = std::mem::take(&mut self.used_font_families);
+            for (_, node) in self.nodes.iter() {
+                let Some(styles) = node.primary_styles() else {
+                    continue;
+                };
+                for family in styles.get_font().font_family.families.iter() {
+                    if let SingleFontFamily::FamilyName(name) = family {
+                        used.insert(name.name.to_string().to_lowercase());
+                    }
+                }
+            }
+            self.pending_font_faces
+                .retain(|f| !used.contains(&f.family_lc) || { ready.push(f.clone()); false });
+            self.used_font_families = used;
+        }
+        for face in ready {
+            crate::net::fetch_pending_font_face(
+                self.tx.clone(),
+                self.id,
+                &self.net_provider,
+                &self.shell_provider,
+                self.abort_signal.as_ref(),
+                face,
+            );
+        }
+    }
+
     pub fn handle_messages(&mut self) {
         // Remove event Reciever from the Document so that we can process events
         // without holding a borrow to the Document
@@ -1557,6 +1609,9 @@ impl BaseDocument {
         match msg {
             DocumentEvent::ResourceLoad(resource) => self.load_resource(resource),
             DocumentEvent::NavigateIframe { node_id, url } => self.navigate_iframe(node_id, url),
+            DocumentEvent::PendingFontFaces(faces) => {
+                self.pending_font_faces.extend(faces);
+            }
         }
     }
 
