@@ -1084,7 +1084,15 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     fn flush_inline_pseudos_recursive(doc: &mut BaseDocument, node_id: NodeId) {
         doc.iter_flat_children_mut(node_id, |child_id, doc| {
             flush_pseudo_elements(doc, child_id);
-            let display = doc.nodes[node_id]
+            // Recurse based on the child's display, not the
+            // parent's. Reading doc.nodes[node_id] (the node being
+            // iterated) would make do_recurse false for a block
+            // inline-context root (p, div), so ::before/::after on
+            // inline elements nested deeper than one level
+            // (p > span > i.icon:before) would never be synthesized.
+            // The recursive walk below (build_inline_layout_recursive)
+            // handles nested pseudos once they exist.
+            let display = doc.nodes[child_id]
                 .display_style()
                 .unwrap_or(Display::inline());
             let do_recurse = match (display.outside(), display.inside()) {
