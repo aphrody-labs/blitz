@@ -391,6 +391,9 @@ pub struct BaseDocument {
     /// Cache of loaded images, keyed by URL. Allows reusing images across multiple
     /// elements without re-fetching from the network.
     pub(crate) image_cache: HashMap<String, ImageData>,
+    /// Renderer-mode flag: image loads keep encoded
+    /// bytes + dims only. See DocumentConfig::dims_only_images.
+    pub dims_only_images: bool,
 
     /// Tracks in-flight image requests. When an image is being fetched, additional
     /// requests for the same URL are queued here instead of starting new fetches.
@@ -555,6 +558,7 @@ impl BaseDocument {
             changed_nodes: HashSet::new(),
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
+            dims_only_images: config.dims_only_images,
             pending_images: HashMap::new(),
             pending_style_image_nodes: Vec::new(),
             pending_critical_resources: HashSet::new(),
@@ -1655,6 +1659,23 @@ impl BaseDocument {
                 self.stylist
                     .force_stylesheet_origins_dirty(style::stylesheets::OriginSet::all());
             }
+            Resource::EncodedImage(_kind, width, height, encoded_bytes, key) => {
+                // Dims-only load: cache dims + encoded
+                // bytes; paint happens out-of-isolate. The bytes are
+                // empty when the embedder kept the payload itself.
+                let image = ImageData::Raster(RasterImageData::new_encoded(
+                    width,
+                    height,
+                    encoded_bytes,
+                    key,
+                ));
+
+                let Some(url) = res.resolved_url.as_ref() else {
+                    return;
+                };
+
+                self.apply_loaded_image(url, image);
+            }
             Resource::Image(_kind, width, height, image_data) => {
                 // Create the ImageData and cache it
                 let image = ImageData::Raster(RasterImageData::new(width, height, image_data));
@@ -1725,6 +1746,48 @@ impl BaseDocument {
                 // Do nothing
             }
         }
+    }
+
+    /// Decode one encoded (dims-only) image in place:
+    /// RGBA-materialise a node's replaced image so local raster
+    /// paths (canvas drawImage, legacy screenshot/PDF fallback)
+    /// see real pixels. Returns true if anything changed.
+    ///
+    /// Chrome-style decode-at-need: the node's laid-out box size
+    /// is the decode hint; the decode picks the smallest power-of-
+    /// two mip of the header dims that still covers it (ceiling as
+    /// the extreme guard). Decoded dims can therefore differ from
+    /// header dims; damage + cache clears keep layout honest.
+    pub fn kitesurf_materialize_node_image(&mut self, node_id: NodeId, ceiling: u32) -> bool {
+        let Some(node) = self.get_node_mut(node_id) else {
+            return false;
+        };
+        // Laid-out content box in CSS px (device px at scale 1).
+        // A zero box (display:none / not laid out) means no hint;
+        // decode at header dims, ceiling-capped.
+        let hint = {
+            let size = node.final_layout().size;
+            let w = size.width.ceil() as u32;
+            let h = size.height.ceil() as u32;
+            if w > 0 && h > 0 { (w, h) } else { (0, 0) }
+        };
+        let Some(el) = node.element_data_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        if let SpecialElementData::Image(data) = &mut el.special_data {
+            changed |= kitesurf_materialize_image_data(data, hint, ceiling);
+        }
+        for layer in el.background_images.iter_mut().chain(el.mask_images.iter_mut()) {
+            if let Some(res) = layer {
+                changed |= kitesurf_materialize_image_data(&mut res.image, hint, ceiling);
+            }
+        }
+        if changed {
+            node.clear_layout_cache();
+            node.insert_damage(ALL_DAMAGE);
+        }
+        changed
     }
 
     /// Cache a loaded image and apply it to all nodes waiting on it
@@ -3842,4 +3905,60 @@ mod font_face_override_tests {
              not the font file's internal `name` table entry",
         );
     }
+}
+
+/// Decode an EncodedRaster-style ImageData (RGBA blob
+/// flagged `encoded`) in place. Shared by the materialize paths.
+/// hint = painted/laid-out size in device px ((0,0) = none);
+/// ceiling = extreme guard on either axis.
+fn kitesurf_materialize_image_data(
+    image: &mut ImageData,
+    hint: (u32, u32),
+    ceiling: u32,
+) -> bool {
+    let ImageData::Raster(raster) = image else {
+        return false;
+    };
+    if !raster.encoded {
+        return false;
+    }
+    let decoded = match crate::net::decode_image_bounded(raster.data.as_ref()) {
+        Ok(d) => d,
+        // Undecodable bytes: drop to None so paint skips it
+        // instead of feeding garbage to vello.
+        Err(_) => {
+            *image = ImageData::None;
+            return true;
+        }
+    };
+    let (tw, th) = kitesurf_mip_dims(decoded.width(), decoded.height(), hint.0, hint.1, ceiling);
+    let scaled = if decoded.width() > tw || decoded.height() > th {
+        use image::imageops::FilterType;
+        decoded.resize(tw, th, FilterType::Triangle)
+    } else {
+        decoded
+    };
+    let (fw, fh) = (scaled.width(), scaled.height());
+    let rgba = scaled.into_rgba8().into_raw();
+    *image = ImageData::Raster(RasterImageData::new(fw, fh, std::sync::Arc::new(rgba)));
+    true
+}
+
+/// Chrome-style mip selection: largest power-of-two
+/// downscale of the header dims still covering the hint, clamped
+/// to the ceiling. Mirrors scene_replay::mip_dims in kitesurf-core
+/// (kept in sync by the round-trip parity e2e).
+fn kitesurf_mip_dims(header_w: u32, header_h: u32, hint_w: u32, hint_h: u32, ceiling: u32) -> (u32, u32) {
+    let (mut w, mut h) = (header_w.max(1), header_h.max(1));
+    if hint_w > 0 && hint_h > 0 {
+        while w / 2 >= hint_w && h / 2 >= hint_h {
+            w /= 2;
+            h /= 2;
+        }
+    }
+    while w > ceiling || h > ceiling {
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+    }
+    (w, h)
 }

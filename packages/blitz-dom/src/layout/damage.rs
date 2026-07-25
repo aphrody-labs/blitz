@@ -616,7 +616,13 @@ impl BaseDocument {
                                 doc_id,
                                 None, // Don't pass node_id, we'll handle via pending_images
                                 self.shell_provider.clone(),
-                                ImageHandler::new(kind.image_type(idx)),
+                                // Dims-only in renderer
+                                // mode (see mutator.rs load_image).
+                                if self.dims_only_images {
+                                    ImageHandler::new_dims_only(kind.image_type(idx))
+                                } else {
+                                    ImageHandler::new(kind.image_type(idx))
+                                },
                             ),
                         );
 

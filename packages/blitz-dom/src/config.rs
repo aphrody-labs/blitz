@@ -30,6 +30,10 @@ pub enum StyleThreading {
 
 /// Options used when constructing a [`BaseDocument`](crate::BaseDocument)
 pub struct DocumentConfig {
+    /// When true, image loads sniff dimensions from the
+    /// container header and store the encoded bytes (renderer mode)
+    /// instead of decoding RGBA in this isolate.
+    pub dims_only_images: bool,
     /// The initial `Viewport`
     pub viewport: Option<Viewport>,
     /// The base url which relative URLs are resolved against
@@ -79,6 +83,7 @@ pub struct DocumentConfig {
 impl Default for DocumentConfig {
     fn default() -> Self {
         Self {
+            dims_only_images: false,
             viewport: None,
             base_url: None,
             ua_stylesheets: vec![UserAgentStylesheet::default_sheet()],

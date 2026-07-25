@@ -55,6 +55,7 @@ impl BaseDocument {
         abort_signal: AbortSignal,
     ) -> DocumentConfig {
         DocumentConfig {
+            dims_only_images: self.dims_only_images,
             viewport: None,
             base_url,
             ua_stylesheets: vec![UserAgentStylesheet::default_sheet()],

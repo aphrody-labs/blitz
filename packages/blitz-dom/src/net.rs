@@ -56,6 +56,15 @@ pub struct FontFaceOverrides {
 #[derive(Clone, Debug)]
 pub enum Resource {
     Image(ImageType, u32, u32, Arc<Vec<u8>>),
+    /// Dims-only image load: width/height sniffed from
+    /// the container header, payload = original encoded bytes.
+    /// Used in renderer mode where paint happens out-of-isolate,
+    /// so we never materialise decoded RGBA here.
+    ///
+    /// Trailing u64 is the embedder-supplied resource key (0 = none),
+    /// and the payload is empty when the embedder kept it: see
+    /// `kitesurf_set_pending_image`.
+    EncodedImage(ImageType, u32, u32, Arc<Vec<u8>>, u64),
     #[cfg(feature = "svg")]
     Svg(ImageType, crate::node::SvgImageData),
     Css(DocumentStyleSheet),
@@ -569,45 +578,34 @@ impl NetHandler for ResourceHandler<DocumentSrcHandler> {
 
 pub struct ImageHandler {
     kind: ImageType,
-    /// Cap on the longest decoded-RGBA8 dimension. When
-    /// `Some(n)` and the decoded image exceeds `n` on either axis,
-    /// we resize down (Lanczos3) before materialising the rgba8
-    /// buffer. Set by `load_image` from the `<img width|height>`
-    /// attrs.
-    ///
-    /// Why this exists: workerd's 128 MiB memory ceiling. Image-
-    /// heavy pages (bbc.co.uk: 121 images per render) blow past
-    /// it instantly when every decode allocates a full-res rgba8
-    /// (~2 MB per 960×540 webp). Capping at the display size
-    /// drops typical thumbnail footprint from ~2 MB to ~130 KB
-    /// without any visible quality regression: the canvas
-    /// rasteriser samples at display resolution anyway.
-    ///
-    /// `None` falls back to `DEFAULT_DECODE_MAX_DIM` (600 px on
-    /// the longest side): enough for any single hero image while
-    /// keeping the worst case bounded. Pages that need bigger
-    /// images can set explicit width/height attrs.
+    /// Maximum dimension of the returned raster. The source image is fully
+    /// decoded before resizing, so this does not limit peak decoder memory.
+    /// `None` uses `DEFAULT_DECODE_MAX_DIM`.
     decode_max_dim: Option<u32>,
+    /// When true, a readable header yields `Resource::EncodedImage` with the
+    /// original bytes and no pixel decode. An unreadable header falls back to
+    /// normal decoding; renderer mode decodes retained bytes in another isolate.
+    dims_only: bool,
 }
 
-/// Default cap on decoded-image longest dimension when
-/// the `<img>` element carries no `width` / `height` attrs.
-///
-/// Sized for the workerd 128 MiB ceiling: 600 × 600 × 4 = 1.4 MB
-/// rgba8 per image. BBC-class pages with ~120 images fit in
-/// ~170 MB worst case, comfortably handled by the layout cascade
-/// since pending images decode one-at-a-time through the fetch
-/// concurrency cap (6 in-flight per workerd 6-fetch limit).
+/// Default maximum dimension of the returned raster when the `<img>` has no
+/// `width` or `height` attribute. At 600 × 600 × 4 bytes, one image can retain
+/// up to 1,440,000 bytes of RGBA8 data; this is not a page-wide memory budget.
 const DEFAULT_DECODE_MAX_DIM: u32 = 600;
 
 impl ImageHandler {
     pub fn new(kind: ImageType) -> Self {
-        Self { kind, decode_max_dim: None }
+        Self { kind, decode_max_dim: None, dims_only: false }
     }
 
-    /// Build an ImageHandler with an explicit
-    /// decoded-RGBA8 longest-side cap. Called from `load_image`
-    /// when the `<img>` carries `width` / `height` attrs.
+    /// Dims-only handler for renderer mode. See the
+    /// `dims_only` field doc.
+    pub fn new_dims_only(kind: ImageType) -> Self {
+        Self { kind, decode_max_dim: None, dims_only: true }
+    }
+
+    /// Set the maximum dimension of the returned raster. The source is fully
+    /// decoded before this cap is applied.
     pub fn with_max_dim(kind: ImageType, max_dim: u32) -> Self {
         // Clamp to a sane floor (16 px): pages occasionally set
         // width="0" or width="1" placeholders to hide images, and
@@ -616,6 +614,7 @@ impl ImageHandler {
         Self {
             kind,
             decode_max_dim: Some(cap),
+            dims_only: false,
         }
     }
 }
@@ -627,23 +626,107 @@ impl NetHandler for ResourceHandler<ImageHandler> {
     }
 }
 
+thread_local! {
+    /// Resource key and, when the embedder sniffed them,
+    /// dimensions for the delivery currently being parsed. Set right
+    /// before handing bytes to a stashed handler; `parse` runs
+    /// synchronously inside that call, so a thread-local is enough and
+    /// no trait signature has to change.
+    static KITESURF_PENDING_IMAGE: std::cell::Cell<(u64, u32, u32)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Stage the key + dimensions the next dims-only image parse
+/// will adopt. A non-zero key means the embedder owns this resource's
+/// identity, which is what lets a consumer holding no bytes name it.
+/// Non-zero dimensions mean the payload is absent and these are
+/// authoritative: layout reads nothing else from an image.
+///
+/// Always clear it (0, 0, 0) after the delivery, so an unkeyed load
+/// cannot inherit a stale id or, worse, stale dimensions.
+pub fn kitesurf_set_pending_image(key: u64, width: u32, height: u32) {
+    KITESURF_PENDING_IMAGE.with(|k| k.set((key, width, height)));
+}
+
+fn kitesurf_take_pending_image() -> (u64, u32, u32) {
+    KITESURF_PENDING_IMAGE.with(|k| k.get())
+}
+
+const MAX_IMAGE_RGBA_BYTES: u64 = 128 * 1024 * 1024;
+// 16-bit RGBA sources need twice the RGBA8 policy budget during decode.
+const MAX_IMAGE_DECODE_BYTES: u64 = MAX_IMAGE_RGBA_BYTES * 2;
+
+pub(crate) fn decode_image_bounded(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
+    decode_image_with_limits(bytes, MAX_IMAGE_DECODE_BYTES, MAX_IMAGE_RGBA_BYTES)
+}
+
+fn rgba_fits((width, height): (u32, u32), max_rgba_bytes: u64) -> bool {
+    u128::from(width) * u128::from(height) * 4 <= u128::from(max_rgba_bytes)
+}
+
+fn decode_image_with_limits(
+    bytes: &[u8],
+    max_decode_bytes: u64,
+    max_rgba_bytes: u64,
+) -> image::ImageResult<image::DynamicImage> {
+    let dimensions = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(image::ImageError::IoError)?
+        .into_dimensions()?;
+    if !rgba_fits(dimensions, max_rgba_bytes) {
+        return Err(image::ImageError::Limits(
+            image::error::LimitError::from_kind(image::error::LimitErrorKind::InsufficientMemory),
+        ));
+    }
+
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(max_decode_bytes);
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(image::ImageError::IoError)?;
+    reader.limits(limits);
+    reader.decode()
+}
+
 impl ImageHandler {
     fn parse(&self, bytes: Bytes) -> Result<Resource, String> {
-        let image_err = match image::ImageReader::new(Cursor::new(&bytes))
-            .with_guessed_format()
-            .expect("IO errors impossible with Cursor")
-            .decode()
-        {
+        // Renderer-mode fast path: header-only dimension
+        // sniff, retain the encoded container bytes for the out-of-
+        // isolate rasterizer. Falls through to the normal decode
+        // (and the SVG fallback) when the header can't be read.
+        if self.dims_only {
+            // Embedder-supplied dimensions: the payload is absent by
+            // design, so there is nothing to sniff and nothing to keep.
+            let (staged_key, staged_w, staged_h) = kitesurf_take_pending_image();
+            if staged_w > 0 && staged_h > 0 {
+                return Ok(Resource::EncodedImage(
+                    self.kind,
+                    staged_w,
+                    staged_h,
+                    Arc::new(Vec::new()),
+                    staged_key,
+                ));
+            }
+            if let Ok((w, h)) = image::ImageReader::new(Cursor::new(&bytes))
+                .with_guessed_format()
+                .expect("IO errors impossible with Cursor")
+                .into_dimensions()
+            {
+                if w > 0 && h > 0 {
+                    return Ok(Resource::EncodedImage(
+                        self.kind,
+                        w,
+                        h,
+                        Arc::new(bytes.to_vec()),
+                        staged_key,
+                    ));
+                }
+            }
+        }
+        let image_err = match decode_image_bounded(&bytes) {
             Ok(image) => {
-                // Downscale before rgba8 materialisation if
-                // the decoded image exceeds the display-size cap. The
-                // `image` crate's `resize` preserves aspect ratio and
-                // we pick `FilterType::Triangle`; Lanczos3 produces
-                // ~10% sharper output but adds ~3× wall-clock on a
-                // 960×540 webp; on a 121-image page that's the
-                // difference between 200 ms and 600 ms of decode CPU.
-                // Triangle is fine for screenshots; we're not pixel-
-                // peeping.
+                // The source image is already decoded. Resize before RGBA conversion to limit
+                // the dimensions and storage of the raster returned to the document.
                 let cap = self.decode_max_dim.unwrap_or(DEFAULT_DECODE_MAX_DIM);
                 let (w, h) = (image.width(), image.height());
                 let scaled = if w > cap || h > cap {
@@ -686,8 +769,44 @@ impl ImageHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageEncoder;
     use parley::fontique::FontStyle as Fq;
     use style::values::specified::Angle;
+
+    fn rgba16_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&[0; 8], 1, 1, image::ExtendedColorType::Rgba16)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn bounded_image_decode_limits_decoder_and_rgba_allocations() {
+        let bytes = rgba16_png();
+        let decoded = decode_image_with_limits(&bytes, 1024, 4).unwrap();
+        assert_eq!(decoded.color(), image::ColorType::Rgba16);
+
+        assert!(matches!(
+            decode_image_with_limits(&bytes, 4, 4),
+            Err(image::ImageError::Limits(_))
+        ));
+        assert!(matches!(
+            decode_image_with_limits(&bytes, 1024, 3),
+            Err(image::ImageError::Limits(_))
+        ));
+    }
+
+    #[test]
+    fn bounded_image_decode_budget_covers_32_megapixel_rgba16_sources() {
+        let dimensions = (8192, 4096);
+        assert!(rgba_fits(dimensions, MAX_IMAGE_RGBA_BYTES));
+        assert!(
+            MAX_IMAGE_DECODE_BYTES >= u64::from(dimensions.0) * u64::from(dimensions.1) * 8
+        );
+        assert!(!rgba_fits((8192, 4097), MAX_IMAGE_RGBA_BYTES));
+        assert!(!rgba_fits((u32::MAX, u32::MAX), MAX_IMAGE_RGBA_BYTES));
+    }
 
     fn oblique(min_deg: f32, max_deg: f32) -> FontStyleRange {
         FontStyleRange::Oblique(Angle::from_degrees(min_deg), Angle::from_degrees(max_deg))

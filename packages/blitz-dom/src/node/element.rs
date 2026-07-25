@@ -845,6 +845,11 @@ pub struct RasterImageData {
     pub height: u32,
     /// The raw image data in RGBA8 format
     pub data: Blob<u8>,
+    /// When true, `data` holds the original encoded
+    /// container bytes (png/jpeg/gif/webp), not RGBA8: dims-only
+    /// renderer mode. Layout reads width/height only; paint-side
+    /// consumers must check this before touching pixels.
+    pub encoded: bool,
 }
 impl RasterImageData {
     pub fn new(width: u32, height: u32, data: Arc<Vec<u8>>) -> Self {
@@ -852,6 +857,27 @@ impl RasterImageData {
             width,
             height,
             data: Blob::new(data),
+            encoded: false,
+        }
+    }
+
+    /// Dims-only entry: see the `encoded` field doc.
+    ///
+    /// `key` is the embedder-supplied resource id. Non-zero means the
+    /// embedder owns identity for these bytes, so it rides in the Blob
+    /// id rather than being derived from a content hash: the point
+    /// being that a consumer holding no bytes can still name the
+    /// resource. Zero keeps `Blob::new`'s counter id.
+    pub fn new_encoded(width: u32, height: u32, data: Arc<Vec<u8>>, key: u64) -> Self {
+        Self {
+            width,
+            height,
+            data: if key != 0 {
+                Blob::from_raw_parts(data, key)
+            } else {
+                Blob::new(data)
+            },
+            encoded: true,
         }
     }
 }

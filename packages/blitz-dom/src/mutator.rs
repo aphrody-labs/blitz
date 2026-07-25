@@ -1435,18 +1435,9 @@ impl<'doc> DocumentMutator<'doc> {
             .map(|s| s.to_string())
     }
 
-    /// Read the `<img width|height>` attrs and return
-    /// the larger of the two as a u32 hint for ImageHandler's
-    /// rgba8 cap. Returns `None` if neither attr is set or
-    /// neither parses to a useful integer; ImageHandler falls
-    /// back to `DEFAULT_DECODE_MAX_DIM` in that case.
-    ///
-    /// We deliberately ignore CSS-driven sizing here (`<img
-    /// style="width:240px">`). Reading style requires a cascade
-    /// to have run, which it hasn't at LoadImage queue time; the
-    /// attr-only path covers the dominant real-world case: most
-    /// large sites set explicit width/height attrs for layout
-    /// stability.
+    /// Read the `<img width|height>` attrs as a hint for the returned raster's
+    /// size cap. CSS sizing is unavailable because image loading starts before
+    /// the cascade runs.
     fn read_img_display_dim(&self, node_id: NodeId) -> Option<u32> {
         let node = &self.doc.nodes[node_id];
         let w = node
@@ -1513,13 +1504,15 @@ impl<'doc> DocumentMutator<'doc> {
                 // file extension.
                 let mut req = self.doc.build_request(src);
                 req.content_type = Some("image/*".to_string());
-                // Pass the display-size hint to
-                // ImageHandler so it can downscale before
-                // materialising rgba8. Critical for image-heavy
-                // pages; see ImageHandler::decode_max_dim doc.
-                let handler = match display_dim {
-                    Some(d) => ImageHandler::with_max_dim(ImageType::Image, d),
-                    None => ImageHandler::new(ImageType::Image),
+                // Normal mode uses the attribute hint to size the returned raster.
+                // Renderer mode keeps encoded bytes when header sniffing succeeds.
+                let handler = if self.doc.dims_only_images {
+                    ImageHandler::new_dims_only(ImageType::Image)
+                } else {
+                    match display_dim {
+                        Some(d) => ImageHandler::with_max_dim(ImageType::Image, d),
+                        None => ImageHandler::new(ImageType::Image),
+                    }
                 };
                 self.doc.net_provider.fetch(
                     self.doc.id(),
