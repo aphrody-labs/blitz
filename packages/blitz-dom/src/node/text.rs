@@ -77,6 +77,13 @@ pub struct TextInputData {
     /// was empty). The paint layer reads this to dim the text
     /// at 0.4 alpha, mimicking `:placeholder-shown`.
     pub is_showing_placeholder: bool,
+    /// Authoritative IDL `.value` override. When Some,
+    /// layout construction displays this instead of the `value`
+    /// content attribute: HTML decouples the IDL value (live,
+    /// dirty) from the content attribute (defaultValue). Set by
+    /// DocumentMutator::set_text_input_value; None means the
+    /// attribute still drives the display (pre-dirty state).
+    pub value_override: Option<String>,
 }
 
 // FIXME: Implement Clone for PlainEditor
@@ -94,6 +101,7 @@ impl TextInputData {
             is_multiline,
             scroll_offset: 0.0,
             is_showing_placeholder: false,
+            value_override: None,
         }
     }
 

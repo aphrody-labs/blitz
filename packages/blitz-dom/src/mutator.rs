@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::layout::damage::ALL_DAMAGE;
 use crate::net::{ImageHandler, ResourceHandler, StylesheetHandler};
-use crate::node::{CanvasData, NodeFlags, ShadowRootMode, SpecialElementData};
+use crate::node::{CanvasData, NodeFlags, ShadowRootMode, SpecialElementData, TextInputData};
 use crate::stylo_device::DeviceChanges;
 use crate::util::ImageType;
 use crate::{
@@ -371,12 +371,18 @@ impl DocumentMutator<'_> {
 
         if *attr == local_name!("value") {
             if let Some(input_data) = element.text_input_data_mut() {
-                // Update text input value
-                input_data.set_text(
-                    &mut self.doc.font_ctx.lock().unwrap(),
-                    &mut self.doc.layout_ctx,
-                    value,
-                );
+                // Once JS has written the IDL value the
+                // editor is dirty: attribute writes then only
+                // change defaultValue and must not repaint (HTML
+                // value-attribute-vs-IDL decoupling).
+                if input_data.value_override.is_none() {
+                    // Update text input value
+                    input_data.set_text(
+                        &mut self.doc.font_ctx.lock().unwrap(),
+                        &mut self.doc.layout_ctx,
+                        value,
+                    );
+                }
             }
             return;
         }
@@ -542,11 +548,15 @@ impl DocumentMutator<'_> {
         // Update text input value
         if name.local == local_name!("value") {
             if let Some(input_data) = element.text_input_data_mut() {
-                input_data.set_text(
-                    &mut self.doc.font_ctx.lock().unwrap(),
-                    &mut self.doc.layout_ctx,
-                    "",
-                );
+                // Skip when the IDL value is dirty (see
+                // the matching guard in set_attribute above).
+                if input_data.value_override.is_none() {
+                    input_data.set_text(
+                        &mut self.doc.font_ctx.lock().unwrap(),
+                        &mut self.doc.layout_ctx,
+                        "",
+                    );
+                }
             }
         }
 
@@ -1691,6 +1701,126 @@ impl<'doc> DocumentMutator<'doc> {
             .or(first_option)
             .map(|opt_id| self.doc.nodes[opt_id].text_content());
         self.set_select_label(target_id, text.as_deref());
+    }
+
+    /// JS-side `input.value = ...` / `textarea.value = ...`
+    /// IDL setter. Updates the text input's live editor buffer
+    /// without writing the `value` content attribute: the IDL
+    /// value and the content attribute are decoupled per HTML (the
+    /// attribute reflects defaultValue, not the live state).
+    /// Mirroring the IDL set into setAttribute("value", ...) to
+    /// trigger the same input_data.set_text repaint would make
+    /// getAttribute("value") lie about the initial value. A
+    /// dedicated entry keeps them separate, mirroring the set_checkbox_checked precedent.
+    ///
+    /// Returns false when the node isn't a text-input-bearing
+    /// element (caller can fall back to the attribute mirror).
+    pub fn set_text_input_value(&mut self, target_id: NodeId, value: &str) -> bool {
+        // Snapshot + damage first, same as set_attribute's
+        // in-document path: the editor buffer feeds layout, and
+        // stylo's invalidator needs the snapshot to restyle.
+        let Some(node) = self.doc.get_node(target_id) else {
+            return false;
+        };
+        let node_is_in_document = node.flags.is_in_document();
+        if node_is_in_document {
+            self.doc.snapshot_node(target_id);
+            let node = &mut self.doc.nodes[target_id];
+            if let Some(mut data) = node
+                .try_stylo_element_data_mut()
+                .and_then(|stylo| stylo.get_mut())
+            {
+                data.hint |= RestyleHint::restyle_subtree();
+                data.damage.insert(ALL_DAMAGE);
+            }
+            self.doc.nodes[target_id].mark_ancestors_dirty();
+        }
+
+        let node = &mut self.doc.nodes[target_id];
+        let NodeData::Element(ref mut element) = node.data else {
+            return false;
+        };
+        // A .value write can land before the first layout
+        // pass has run create_text_editor (script during parse):
+        // there is no editor yet and the write would be dropped.
+        // Seed one so construct's update branch picks it up.
+        if element.text_input_data_mut().is_none() {
+            let tag: &str = &element.name.local;
+            let is_multiline = tag == "textarea";
+            let is_text_input = tag == "input"
+                && matches!(
+                    element.attr(local_name!("type")),
+                    None | Some(
+                        "text" | "password" | "email" | "number" | "search" | "tel" | "url"
+                    )
+                );
+            if !(is_multiline || is_text_input) {
+                return false;
+            }
+            element.special_data =
+                SpecialElementData::TextInput(TextInputData::new(is_multiline));
+        }
+        let Some(input_data) = element.text_input_data_mut() else {
+            return false;
+        };
+        // Record the override before set_text: layout construction
+        // re-derives the display text on every pass and would
+        // otherwise clobber the editor back to the attribute value.
+        input_data.value_override = Some(value.to_string());
+        input_data.set_text(
+            &mut self.doc.font_ctx.lock().unwrap(),
+            &mut self.doc.layout_ctx,
+            value,
+        );
+        true
+    }
+
+    /// JS-side text-selection sync. Maps the HTML
+    /// selectionStart/selectionEnd (UTF-16 code-unit offsets) onto
+    /// the parley editor's byte-offset selection so the paint layer
+    /// (which reads editor.selection_geometry / cursor_geometry for
+    /// focused nodes) renders the caret and highlight the shim's
+    /// Selection API state describes.
+    pub fn set_text_input_selection(
+        &mut self,
+        target_id: NodeId,
+        start_u16: usize,
+        end_u16: usize,
+    ) -> bool {
+        if self.doc.get_node(target_id).is_none() {
+            return false;
+        }
+        let node = &mut self.doc.nodes[target_id];
+        let NodeData::Element(ref mut element) = node.data else {
+            return false;
+        };
+        let Some(input_data) = element.text_input_data_mut() else {
+            return false;
+        };
+        // UTF-16 code units → byte offsets. Inputs are small; the
+        // copy dodges the editor borrow across the driver call.
+        let text: String = input_data.editor.raw_text().to_string();
+        let to_byte = |cu: usize| -> usize {
+            let mut count = 0usize;
+            for (byte_idx, ch) in text.char_indices() {
+                if count >= cu {
+                    return byte_idx;
+                }
+                count += ch.len_utf16();
+            }
+            text.len()
+        };
+        let (sb, eb) = (to_byte(start_u16), to_byte(end_u16));
+        let mut font_ctx = self.doc.font_ctx.lock().unwrap();
+        let mut driver = input_data
+            .editor
+            .driver(&mut font_ctx, &mut self.doc.layout_ctx);
+        if sb == eb {
+            driver.move_to_byte(sb);
+        } else {
+            driver.select_byte_range(sb, eb);
+        }
+        true
     }
 
     fn process_button_input(&mut self, target_id: NodeId) {

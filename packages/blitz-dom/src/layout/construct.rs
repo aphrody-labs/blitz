@@ -936,9 +936,21 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
     // the user the prompt text, doesn't count as the field's
     // actual value (caret behaviour, form submission, etc.
     // all read `value` not editor text).
+    // The IDL `.value` override (set by JS through
+    // DocumentMutator::set_text_input_value) wins over the content
+    // attribute: HTML keeps the live value and the attribute
+    // (defaultValue) decoupled, and this construct pass re-runs on
+    // every layout, so without the override precedence a JS value
+    // write would be clobbered right back to the attribute text.
+    let value_override = match &element.special_data {
+        SpecialElementData::TextInput(d) => d.value_override.clone(),
+        _ => None,
+    };
     // (Upstream: a <textarea>'s value is its child text, an <input>'s its
     // value attribute; `initial_text` already picked the right one.)
-    let value_attr = Some(initial_text.as_str());
+    let value_attr = value_override
+        .as_deref()
+        .or(Some(initial_text.as_str()));
     let placeholder_attr = element.attr(local_name!("placeholder"));
     let (display_text, is_placeholder) = match (value_attr, placeholder_attr) {
         (Some(v), _) if !v.is_empty() => (v.to_string(), false),
