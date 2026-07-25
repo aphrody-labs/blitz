@@ -42,6 +42,7 @@ pub mod node;
 mod config;
 /// CSSOM stylesheet access (`document.styleSheets`, `CSSStyleSheet`, `CSSRule`)
 mod cssom;
+mod css_compat;
 mod debug;
 mod events;
 mod font_metrics;

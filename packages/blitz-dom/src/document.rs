@@ -1400,8 +1400,13 @@ impl BaseDocument {
     }
 
     pub fn make_stylesheet(&self, css: impl AsRef<str>, origin: Origin) -> DocumentStyleSheet {
+        // Legacy ::-webkit-slider-thumb → accent-color
+        // compat rewrite (no-op for sheets without the pseudos).
+        let css = css.as_ref();
+        let rewritten = crate::css_compat::rewrite_legacy_widget_pseudo_rules(css);
+        let css = rewritten.as_deref().unwrap_or(css);
         let data = Stylesheet::from_str(
-            css.as_ref(),
+            css,
             self.url.url_extra_data(),
             origin,
             ServoArc::new(self.guard.wrap(MediaList::empty())),

@@ -369,6 +369,12 @@ pub enum SpecialElementData {
     TextInput(TextInputData),
     /// Checkbox checked state
     CheckboxInput(bool),
+    /// Live IDL value of an `<input type=range>` slider.
+    /// The paint layer combines it with the min/max/step attributes
+    /// to place the thumb; JS updates it via the setInputText wasm
+    /// entry (same IDL-vs-attribute decoupling as TextInput's
+    /// value_override).
+    RangeInput(f64),
     /// Selected files
     #[cfg(feature = "file-input")]
     FileInput(FileData),
@@ -389,6 +395,7 @@ impl Clone for SpecialElementData {
             Self::TableRoot(data) => Self::TableRoot(data.clone()),
             Self::TextInput(data) => Self::TextInput(data.clone()),
             Self::CheckboxInput(data) => Self::CheckboxInput(*data),
+            Self::RangeInput(data) => Self::RangeInput(*data),
             #[cfg(feature = "file-input")]
             Self::FileInput(data) => Self::FileInput(data.clone()),
             Self::None => Self::None,
@@ -600,6 +607,15 @@ impl ElementData {
     pub fn checkbox_input_checked(&self) -> Option<bool> {
         match self.special_data {
             SpecialElementData::CheckboxInput(checked) => Some(checked),
+            _ => None,
+        }
+    }
+
+    /// Live value of an `<input type=range>`, when the
+    /// special data has been initialized (layout construct pass).
+    pub fn range_input_value(&self) -> Option<f64> {
+        match self.special_data {
+            SpecialElementData::RangeInput(value) => Some(value),
             _ => None,
         }
     }
@@ -939,6 +955,7 @@ impl std::fmt::Debug for SpecialElementData {
             SpecialElementData::TableRoot(_) => f.write_str("NodeSpecificData::TableRoot"),
             SpecialElementData::TextInput(_) => f.write_str("NodeSpecificData::TextInput"),
             SpecialElementData::CheckboxInput(_) => f.write_str("NodeSpecificData::CheckboxInput"),
+            SpecialElementData::RangeInput(_) => f.write_str("NodeSpecificData::RangeInput"),
             #[cfg(feature = "file-input")]
             SpecialElementData::FileInput(_) => f.write_str("NodeSpecificData::FileInput"),
             SpecialElementData::None => f.write_str("NodeSpecificData::None"),

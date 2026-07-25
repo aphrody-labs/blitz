@@ -156,6 +156,10 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
 
         // NOTE(Nico): I don't *think* external stylesheets should have HTML entities escaped
         // let escaped_css = html_escape::decode_html_entities(css);
+        // Legacy ::-webkit-slider-thumb -> accent-color
+        // compat rewrite (no-op for sheets without the pseudos).
+        let rewritten = crate::css_compat::rewrite_legacy_widget_pseudo_rules(css);
+        let css: &str = rewritten.as_deref().unwrap_or(css);
 
         let sheet = Stylesheet::from_str(
             css,
@@ -271,6 +275,10 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
 
         // NOTE(Nico): I don't *think* external stylesheets should have HTML entities escaped
         // let escaped_css = html_escape::decode_html_entities(css);
+        // Legacy ::-webkit-slider-thumb -> accent-color
+        // compat rewrite (no-op for sheets without the pseudos).
+        let rewritten = crate::css_compat::rewrite_legacy_widget_pseudo_rules(css);
+        let css: &str = rewritten.as_deref().unwrap_or(css);
 
         let sheet = ServoArc::new(Stylesheet::from_str(
             css,

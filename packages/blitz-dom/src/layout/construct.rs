@@ -470,6 +470,43 @@ fn collect_layout_children_with_wrap(
             } else if matches!(type_attr, Some("checkbox" | "radio")) {
                 create_checkbox_input(doc, container_node_id);
                 return;
+            } else if matches!(type_attr, Some("range")) {
+                // Seed the slider's live value from the
+                // value/min/max attributes (HTML default: midpoint
+                // of the range when no value attribute). Construct
+                // re-runs on every layout pass; keep an existing
+                // RangeInput (it carries the live IDL value).
+                let el = doc.nodes[container_node_id]
+                    .data
+                    .downcast_element_mut()
+                    .unwrap();
+                if !matches!(el.special_data, SpecialElementData::RangeInput(_)) {
+                    // Rust `str::parse::<f64>()` accepts "NaN",
+                    // "inf", "-inf": feeding those into
+                    // f64::clamp panics (requires !NaN and min<=
+                    // max). Untrusted `<input type=range min=NaN>`
+                    // would take the whole layout down; filter to
+                    // finite values before clamping.
+                    fn parse_finite(v: &str) -> Option<f64> {
+                        v.parse::<f64>().ok().filter(|n| n.is_finite())
+                    }
+                    let min = el
+                        .attr(local_name!("min"))
+                        .and_then(parse_finite)
+                        .unwrap_or(0.0);
+                    let max = el
+                        .attr(local_name!("max"))
+                        .and_then(parse_finite)
+                        .unwrap_or(100.0);
+                    let max = max.max(min);
+                    let value = el
+                        .attr(local_name!("value"))
+                        .and_then(parse_finite)
+                        .unwrap_or((min + max) / 2.0)
+                        .clamp(min, max);
+                    el.special_data = SpecialElementData::RangeInput(value);
+                }
+                return;
             }
         }
 
