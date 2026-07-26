@@ -1531,6 +1531,140 @@ impl BaseDocument {
 
     /// Cache a loaded image and apply it to all nodes waiting on it
     /// (`<img>` elements, `background-image` layers and `mask-image` layers).
+    /// Set a canvas element's framebuffer as its replaced
+    /// image content (same special_data slot an <img> load fills).
+    ///
+    /// Returns: -1 unknown/non-canvas node, 0 stored (same dims as
+    /// before), 1 stored + dims changed (caller must re-layout).
+    pub fn kitesurf_set_canvas_image(
+        &mut self,
+        node_id: NodeId,
+        width: u32,
+        height: u32,
+        data: Arc<Vec<u8>>,
+    ) -> i32 {
+        let Some(node) = self.get_node_mut(node_id) else {
+            return -1;
+        };
+        let Some(el) = node.element_data_mut() else {
+            return -1;
+        };
+        if el.name.local != local_name!("canvas") {
+            return -1;
+        }
+        let size_changed = match &el.special_data {
+            SpecialElementData::Image(d) => match &**d {
+                ImageData::Raster(r) => r.width != width || r.height != height,
+                _ => true,
+            },
+            _ => true,
+        };
+        el.special_data = SpecialElementData::Image(Box::new(ImageData::Raster(
+            RasterImageData::new(width, height, data),
+        )));
+        if size_changed {
+            node.cache_mut().clear();
+            node.insert_damage(ALL_DAMAGE);
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Set an iframe element's rendered bitmap as its
+    /// replaced-element image content (same special_data slot an
+    /// <img> load fills). This is the load-bearing primitive for
+    /// OOPIF rendering: a child page-script isolate paints the
+    /// iframe's document to RGBA via the pageRenderer, the parent
+    /// pushes those bytes here, and blitz-paint draws them in-flow
+    /// with correct z-order, scaling, and clipping: no compositor
+    /// wire changes required.
+    ///
+    /// Guarded on the iframe local-name to survive slab id reuse: a
+    /// stale iframe id may now be an <img> whose data
+    /// must survive. Same-dims frame updates skip relayout; dim
+    /// changes clear the node cache and insert full damage.
+    ///
+    /// Returns: -1 unknown/non-iframe node, 0 stored (same dims as
+    /// before), 1 stored + dims changed (caller must re-layout).
+    pub fn kitesurf_set_iframe_image(
+        &mut self,
+        node_id: NodeId,
+        width: u32,
+        height: u32,
+        data: Arc<Vec<u8>>,
+    ) -> i32 {
+        let Some(node) = self.get_node_mut(node_id) else {
+            return -1;
+        };
+        let Some(el) = node.element_data_mut() else {
+            return -1;
+        };
+        if el.name.local != local_name!("iframe") {
+            return -1;
+        }
+        let size_changed = match &el.special_data {
+            SpecialElementData::Image(d) => match &**d {
+                ImageData::Raster(r) => r.width != width || r.height != height,
+                _ => true,
+            },
+            _ => true,
+        };
+        el.special_data = SpecialElementData::Image(Box::new(ImageData::Raster(
+            RasterImageData::new(width, height, data),
+        )));
+        if size_changed {
+            node.clear_layout_cache();
+            node.insert_damage(ALL_DAMAGE);
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Drop an iframe framebuffer set by
+    /// kitesurf_set_iframe_image (frame detached / re-navigated).
+    /// Same slab-reuse guard as the canvas variant.
+    pub fn kitesurf_clear_iframe_image(&mut self, node_id: NodeId) {
+        let Some(node) = self.get_node_mut(node_id) else {
+            return;
+        };
+        let Some(el) = node.element_data_mut() else {
+            return;
+        };
+        if el.name.local != local_name!("iframe") {
+            return;
+        }
+        if !matches!(el.special_data, SpecialElementData::Image(_)) {
+            return;
+        }
+        el.special_data = SpecialElementData::None;
+        node.clear_layout_cache();
+        node.insert_damage(ALL_DAMAGE);
+    }
+
+    /// Drop a canvas framebuffer set by
+    /// kitesurf_set_canvas_image (canvas removed / reset).
+    pub fn kitesurf_clear_canvas_image(&mut self, node_id: NodeId) {
+        let Some(node) = self.get_node_mut(node_id) else {
+            return;
+        };
+        let Some(el) = node.element_data_mut() else {
+            return;
+        };
+        // Same guard as the setter: node ids are reused (slab), so a
+        // stale canvas id may now be an <img> whose data must survive.
+        if el.name.local != local_name!("canvas") {
+            return;
+        }
+        if !matches!(el.special_data, SpecialElementData::Image(_)) {
+            return;
+        }
+        el.special_data = SpecialElementData::None;
+        node.cache_mut().clear();
+        node.insert_damage(ALL_DAMAGE);
+    }
+
     fn apply_loaded_image(&mut self, url: &str, image: ImageData) {
         // Get all nodes waiting for this image
         let waiting_nodes = self.pending_images.remove(url).unwrap_or_default();
