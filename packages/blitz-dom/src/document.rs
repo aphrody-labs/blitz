@@ -1340,6 +1340,17 @@ impl BaseDocument {
     }
 
     pub fn process_style_element(&mut self, target_id: NodeId) {
+        // HTML §the-style-element: the sheet applies only while the element's
+        // media attribute matches. Ignoring it applies mobile-only rules
+        // unconditionally: a <style media="(max-width:767px)"> carrying an
+        // off-canvas sidebar transform hides the sidebar at every viewport
+        // width. The
+        // attr is parsed into the stylesheet's MediaList so stylo evaluates
+        // it against the device on every cascade (viewport changes
+        // included), exactly like a media-conditional linked sheet.
+        let media_attr = self.nodes[target_id]
+            .attr(local_name!("media"))
+            .map(|s| s.to_string());
         let css = self.nodes[target_id].text_content();
         // Hash on the pre-decode bytes via inline FNV-1a (~2-3 GB/s,
         // vs SipHash's ~1 GB/s). For typical CSS (no HTML entities)
@@ -1355,12 +1366,22 @@ impl BaseDocument {
             h ^= b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
+        // The media attribute is part of the sheet's identity: the same
+        // body under a different media list must not share a cache entry.
+        if let Some(media) = &media_attr {
+            h ^= 0xff;
+            h = h.wrapping_mul(0x100000001b3);
+            for &b in media.as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
         let cache_key = h;
         let sheet = if let Some(cached) = self.author_sheet_cache.get(&cache_key) {
             cached.clone()
         } else {
             let decoded = html_escape::decode_html_entities(&css);
-            let s = self.make_stylesheet(&decoded, Origin::Author);
+            let s = self.make_stylesheet_with_media(&decoded, Origin::Author, media_attr.as_deref());
             self.author_sheet_cache.insert(cache_key, s.clone());
             s
         };
@@ -1400,16 +1421,49 @@ impl BaseDocument {
     }
 
     pub fn make_stylesheet(&self, css: impl AsRef<str>, origin: Origin) -> DocumentStyleSheet {
+        self.make_stylesheet_with_media(css, origin, None)
+    }
+
+    pub fn make_stylesheet_with_media(
+        &self,
+        css: impl AsRef<str>,
+        origin: Origin,
+        media: Option<&str>,
+    ) -> DocumentStyleSheet {
         // Legacy ::-webkit-slider-thumb → accent-color
         // compat rewrite (no-op for sheets without the pseudos).
         let css = css.as_ref();
         let rewritten = crate::css_compat::rewrite_legacy_widget_pseudo_rules(css);
         let css = rewritten.as_deref().unwrap_or(css);
+        // Parse the element's media attribute into a real MediaList (empty
+        // list == matches everything, same as no attribute / "all").
+        let media_list = media
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("all"))
+            .map(|m| {
+                let url_data = self.url.url_extra_data();
+                let context = style::parser::ParserContext::new(
+                    origin,
+                    &url_data,
+                    Some(style::stylesheets::CssRuleType::Media),
+                    style_traits::ParsingMode::DEFAULT,
+                    QuirksMode::NoQuirks,
+                    Default::default(),
+                    None,
+                    None,
+                    Default::default(),
+                );
+                let mut input = cssparser::ParserInput::new(m);
+                let mut parser = cssparser::Parser::new(&mut input);
+                MediaList::parse(&context, &mut parser)
+            })
+            .unwrap_or_else(MediaList::empty);
+
         let data = Stylesheet::from_str(
             css,
             self.url.url_extra_data(),
             origin,
-            ServoArc::new(self.guard.wrap(MediaList::empty())),
+            ServoArc::new(self.guard.wrap(media_list)),
             self.guard.clone(),
             Some(&StylesheetLoader {
                 tx: self.tx.clone(),
