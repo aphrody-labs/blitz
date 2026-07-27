@@ -1455,6 +1455,16 @@ impl<'doc> DocumentMutator<'doc> {
     }
 
     fn load_image(&mut self, target_id: NodeId) {
+        // An <img> waits on its latest request only. Changing
+        // src left the node queued under the previous URL too, so
+        // whichever response landed first won: a stale success painted
+        // the old image, and a stale 404 reported the node broken (the
+        // shim keeps the first terminal state), swallowing the real
+        // load event (WPT img.complete.html "async src complete test").
+        // The old fetch stays in flight and still fills the cache.
+        for waiting in self.doc.pending_images.values_mut() {
+            waiting.retain(|(id, ty)| !(*id == target_id && matches!(ty, ImageType::Image)));
+        }
         if let Some(raw_src) = self.select_image_url(target_id) {
             if !raw_src.is_empty() {
                 // Fallible resolve. `img.src = "http://"`

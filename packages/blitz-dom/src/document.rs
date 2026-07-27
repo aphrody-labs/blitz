@@ -1674,6 +1674,22 @@ impl BaseDocument {
             .unwrap_or_default()
     }
 
+    /// Whether `node_id` is currently waiting on an
+    /// in-flight image fetch (any URL). Complements image_cache_has
+    /// for the srcset case: the JS side can't re-run candidate
+    /// selection, so after a src/srcset mutation it asks whether
+    /// load_image actually started a fetch. Not pending = the
+    /// mutation reached a terminal state synchronously (cache-hit
+    /// apply, or no fetchable candidate) and no delivery
+    /// notification will ever fire.
+    pub fn node_has_pending_image(&self, node_id: NodeId) -> bool {
+        self.pending_images.values().any(|waiting| {
+            waiting
+                .iter()
+                .any(|(id, ty)| *id == node_id && matches!(ty, ImageType::Image))
+        })
+    }
+
     pub fn load_resource(&mut self, res: ResourceLoadResponse) {
         self.pending_critical_resources.remove(&res.request_id);
 
