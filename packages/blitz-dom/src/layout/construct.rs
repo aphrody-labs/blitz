@@ -41,6 +41,107 @@ use super::{
 
 const DUMMY_NAME: QualName = qual_name!("div", html);
 
+// Elements whose fragment ref pulls another element INTO the render tree.
+// `<a href="#x">` is a link, not a resource ref, so it must not hoist.
+#[cfg(feature = "svg")]
+const FRAGMENT_REF_ELEMENTS: [&str; 4] = ["<use", "<image", "<feImage", "<feimage"];
+
+// Fragment refs (`href="#id"` / `xlink:href="#id"`) in serializer output.
+// Only ever run on write_outer_html output, so `href="#` is canonical.
+#[cfg(feature = "svg")]
+fn collect_fragment_refs(html: &str, out: &mut Vec<String>) {
+    for tag in FRAGMENT_REF_ELEMENTS {
+        let mut rest = html;
+        while let Some(pos) = rest.find(tag) {
+            rest = &rest[pos + tag.len()..];
+            // A tag-name boundary must follow, else `<uses>`/`<imagexyz>`
+            // (any element sharing the prefix) would match too.
+            let at_boundary = match rest.chars().next() {
+                Some(c) => c.is_whitespace() || c == '>' || c == '/',
+                None => false,
+            };
+            // Scan the opening TAG only: a ref in a later sibling belongs
+            // to that element, and gets its own iteration of this loop.
+            let Some(tag_end) = rest.find('>') else { break };
+            if at_boundary {
+                if let Some(h) = rest[..tag_end].find("href=\"#") {
+                    let after = &rest[h + 7..tag_end];
+                    if let Some(end) = after.find('"') {
+                        if end > 0 && end <= 256 {
+                            out.push(after[..end].to_string());
+                        }
+                    }
+                }
+            }
+            rest = &rest[tag_end..];
+        }
+    }
+}
+
+// Ids the serializer has already emitted. Indexed once per chunk so the
+// hoist loop tests membership in O(1) instead of rescanning the buffer.
+#[cfg(feature = "svg")]
+fn collect_ids(html: &str, out: &mut std::collections::HashSet<String>) {
+    let mut rest = html;
+    while let Some(pos) = rest.find(" id=\"") {
+        rest = &rest[pos + 5..];
+        let Some(end) = rest.find('"') else { break };
+        out.insert(rest[..end].to_string());
+        rest = &rest[end..];
+    }
+}
+
+// SVG sprite support: hoist same-document `<use>` targets that live
+// outside this <svg> into an injected <defs> block before usvg parse.
+#[cfg(feature = "svg")]
+fn inline_external_fragment_refs(doc: &BaseDocument, outer_html: &mut String) {
+    let mut queue = Vec::new();
+    collect_fragment_refs(outer_html, &mut queue);
+    if queue.is_empty() {
+        return;
+    }
+
+    // Ids usvg will already see: the subtree's own, plus each hoisted
+    // chunk's (a hoisted subtree can define ids nothing queued asked for).
+    let mut present = std::collections::HashSet::new();
+    collect_ids(outer_html, &mut present);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut defs = String::new();
+    while let Some(id) = queue.pop() {
+        if defs.len() > 512 * 1024 {
+            break; // runaway guard: pathological ref chains stop growing
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if present.contains(&id) {
+            continue;
+        }
+        let Some(target_id) = doc.get_element_by_id(&id) else {
+            continue;
+        };
+        let Some(node) = doc.get_node(target_id) else {
+            continue;
+        };
+        // Verbatim (currentColor not baked): <use> content inherits color
+        // from the referencing site, not the sprite's hidden context.
+        let before = defs.len();
+        node.write_outer_html_verbatim(&mut defs);
+        collect_fragment_refs(&defs[before..], &mut queue);
+        collect_ids(&defs[before..], &mut present);
+    }
+    if defs.is_empty() {
+        return;
+    }
+
+    // Self-closing roots have no children hence no refs, so the first
+    // `>` here is always the end of the root <svg>'s opening tag.
+    if let Some(open_end) = outer_html.find('>') {
+        outer_html.insert_str(open_end + 1, &format!("<defs>{defs}</defs>"));
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConstructionTask {
     pub(crate) node_id: NodeId,
@@ -539,6 +640,13 @@ fn collect_layout_children_with_wrap(
                         outer_html.replacen("<svg", &format!("<svg color=\"{color}\""), 1);
                 }
             }
+
+            // Browsers resolve `<use href="#id">` against the WHOLE
+            // document; usvg only sees this one serialized element.
+
+            // Inline externally-defined targets (sprite-sheet <symbol>s etc.)
+            // as a <defs> block so usvg can resolve them.
+            inline_external_fragment_refs(doc, &mut outer_html);
 
             // Remove contruction damage from subtree
             doc.iter_subtree_mut(container_node_id, |id: NodeId, doc: &mut BaseDocument| {

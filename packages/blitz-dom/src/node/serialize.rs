@@ -113,6 +113,17 @@ impl Node {
         output
     }
 
+    // Serialize WITHOUT baking currentColor, for subtrees that
+    // get re-parented under a different color context (sprite <symbol>s).
+    pub fn write_outer_html_verbatim(&self, writer: &mut String) {
+        let opts = SerializeOpts {
+            style: OutputStyle::Normal,
+            resolve_current_color: false,
+            declare_xlink_ns: false,
+        };
+        self.write_outer_html_in_style(writer, opts, 0);
+    }
+
     fn write_outer_html_in_style(&self, writer: &mut String, opts: SerializeOpts, nesting: usize) {
         const INDENT: &str = "  ";
         let style = opts.style;
