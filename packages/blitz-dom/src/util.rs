@@ -157,6 +157,145 @@ pub fn walk_tree(indent: usize, node: &Node) {
 
 /// Parse an SVG image.
 #[cfg(feature = "svg")]
+/// SVG fragment views: `image.svg#viewname` selects a `<view>` whose
+/// viewBox (and preserveAspectRatio, when present) override the root's
+/// (SVG2 linking.html#ViewElement). usvg has no fragment handling, so
+/// rewrite the root tag before the parse: string-level, same technique
+/// as the inline-svg stamps. An unmatched or viewBox-less view leaves
+/// the source untouched, which is the spec's fallback to a normal view.
+pub fn apply_svg_view_fragment(source: &str, fragment: &str) -> Option<String> {
+    if fragment.is_empty() {
+        return None;
+    }
+    let id_attr_a = format!("id=\"{fragment}\"");
+    let id_attr_b = format!("id='{fragment}'");
+    // Find the <view ...> opening tag carrying this id.
+    let mut at = 0usize;
+    let view_tag = loop {
+        let rel = source[at..].find("<view")?;
+        let start = at + rel;
+        let end = start + source[start..].find('>')?;
+        let tag = &source[start..=end];
+        if tag.contains(&id_attr_a) || tag.contains(&id_attr_b) {
+            break tag;
+        }
+        at = end + 1;
+    };
+    let attr_of = |tag: &str, name: &str| -> Option<String> {
+        let pos = tag.find(&format!("{name}="))?;
+        let rest = &tag[pos + name.len() + 1..];
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let inner = &rest[1..];
+        Some(inner[..inner.find(quote)?].to_string())
+    };
+    let vb = attr_of(view_tag, "viewBox")?;
+    // An invalid view viewBox (malformed, or non-positive extents) makes
+    // the whole fragment invalid; the spec falls back to the normal view,
+    // so the source must stay untouched. Without this gate the negative
+    // extents would be stamped and then disable rendering outright.
+    {
+        // Every token must parse (filter_map would let "0 0 bogus 0 100"
+        // pass as four numbers) and be finite.
+        let tokens: Vec<&str> = vb
+            .split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if tokens.len() != 4 {
+            return None;
+        }
+        let nums: Vec<f64> = tokens
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .filter(|n: &f64| n.is_finite())
+            .collect();
+        if nums.len() != 4 || nums[2] <= 0.0 || nums[3] <= 0.0 {
+            return None;
+        }
+    }
+    let par = attr_of(view_tag, "preserveAspectRatio");
+
+    // Rewrite the root <svg ...> tag: drop its own viewBox (and PAR when
+    // the view supplies one), then inject the view's values.
+    let root_start = source.find("<svg")?;
+    let root_end = root_start + source[root_start..].find('>')?;
+    let mut root = source[root_start..root_end].to_string();
+    let strip_attr = |tag: &mut String, name: &str| {
+        if let Some(pos) = tag.find(&format!(" {name}=")) {
+            let rest = &tag[pos + name.len() + 2..];
+            if let Some(q) = rest.chars().next() {
+                if q == '"' || q == '\'' {
+                    if let Some(close) = rest[1..].find(q) {
+                        let end = pos + name.len() + 2 + 1 + close + 1;
+                        tag.replace_range(pos..end, "");
+                    }
+                }
+            }
+        }
+    };
+    strip_attr(&mut root, "viewBox");
+    if par.is_some() {
+        strip_attr(&mut root, "preserveAspectRatio");
+    }
+    let mut inject = format!(" viewBox=\"{vb}\"");
+    if let Some(par) = &par {
+        inject.push_str(&format!(" preserveAspectRatio=\"{par}\""));
+    }
+    root.insert_str(4, &inject);
+    let mut out = String::with_capacity(source.len() + inject.len());
+    out.push_str(&source[..root_start]);
+    out.push_str(&root);
+    out.push_str(&source[root_end..]);
+    Some(out)
+}
+
+/// SVG stacks: `sprite.svg#name` shows one icon out of many through
+/// `svg>[id]{display:none} svg>[id]:target{display:inline}` in the
+/// sprite's `<style>` (tldraw's toolbar icons are CSS masks of this
+/// kind). usvg knows no document URL, so it cannot match `:target`,
+/// and simplecss drops the rule: every icon stayed hidden. Rewrite
+/// `:target` inside `<style>` blocks to the id selector it stands for.
+///
+/// Without a fragment nothing is targeted, which is what the dropped
+/// rule already gives, so there is nothing to rewrite.
+pub fn apply_svg_target_fragment(source: &str, fragment: &str) -> Option<String> {
+    // The fragment lands inside a quoted attribute selector; refuse
+    // anything that could close the quote or the style block early.
+    if fragment.is_empty()
+        || fragment
+            .chars()
+            .any(|c| matches!(c, '"' | '\\' | '<' | '>') || c.is_control())
+        || !source.contains(":target")
+    {
+        return None;
+    }
+    let id_selector = format!("[id=\"{fragment}\"]");
+    let mut out = String::with_capacity(source.len() + 64);
+    let mut rest = source;
+    let mut changed = false;
+    while let Some(open) = rest.find("<style") {
+        let Some(body_start) = rest[open..].find('>').map(|i| open + i + 1) else {
+            break;
+        };
+        let Some(close) = rest[body_start..].find("</style").map(|i| body_start + i) else {
+            break;
+        };
+        out.push_str(&rest[..body_start]);
+        let body = &rest[body_start..close];
+        if body.contains(":target") {
+            out.push_str(&body.replace(":target", &id_selector));
+            changed = true;
+        } else {
+            out.push_str(body);
+        }
+        rest = &rest[close..];
+    }
+    out.push_str(rest);
+    changed.then_some(out)
+}
+
 pub fn parse_svg_image(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
     let options = usvg::Options {
         fontdb: Arc::clone(&*FONT_DB),

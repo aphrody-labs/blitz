@@ -1523,6 +1523,7 @@ impl<'doc> DocumentMutator<'doc> {
                 // outbound gateway routes through the Image
                 // cross-origin bypass even for URLs without a useful
                 // file extension.
+                let src_fragment = src.fragment().map(|f| f.to_string());
                 let mut req = self.doc.build_request(src);
                 req.content_type = Some("image/*".to_string());
                 // Normal mode uses the attribute hint to size the returned raster.
@@ -1534,7 +1535,9 @@ impl<'doc> DocumentMutator<'doc> {
                         Some(d) => ImageHandler::with_max_dim(ImageType::Image, d),
                         None => ImageHandler::new(ImageType::Image),
                     }
-                };
+                }
+                // SVG view selection: img.svg#viewname (SVG2 linking).
+                .with_view_fragment(src_fragment.as_deref());
                 self.doc.net_provider.fetch(
                     self.doc.id(),
                     req,

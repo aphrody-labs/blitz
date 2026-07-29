@@ -622,7 +622,10 @@ impl BaseDocument {
                                     ImageHandler::new_dims_only(kind.image_type(idx))
                                 } else {
                                     ImageHandler::new(kind.image_type(idx))
-                                },
+                                }
+                                // `mask: url(sprite.svg#icon)` picks one
+                                // icon out of an SVG stack.
+                                .with_view_fragment(new_url.fragment()),
                             ),
                         );
 

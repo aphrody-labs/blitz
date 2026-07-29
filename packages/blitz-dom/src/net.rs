@@ -612,6 +612,9 @@ pub struct ImageHandler {
     /// original bytes and no pixel decode. An unreadable header falls back to
     /// normal decoding; renderer mode decodes retained bytes in another isolate.
     dims_only: bool,
+    /// URL fragment from the image src (`img.svg#viewname`),
+    /// applied as an SVG view selection before the usvg parse.
+    view_fragment: Option<String>,
 }
 
 /// Default maximum dimension of the returned raster when the `<img>` has no
@@ -621,13 +624,22 @@ const DEFAULT_DECODE_MAX_DIM: u32 = 600;
 
 impl ImageHandler {
     pub fn new(kind: ImageType) -> Self {
-        Self { kind, decode_max_dim: None, dims_only: false }
+        Self { kind, decode_max_dim: None, dims_only: false, view_fragment: None }
     }
 
     /// Dims-only handler for renderer mode. See the
     /// `dims_only` field doc.
     pub fn new_dims_only(kind: ImageType) -> Self {
-        Self { kind, decode_max_dim: None, dims_only: true }
+        Self { kind, decode_max_dim: None, dims_only: true, view_fragment: None }
+    }
+
+    /// Remember the src URL's fragment so an SVG body can
+    /// honour its `<view>` selection (SVG2 linking.html#ViewElement).
+    pub fn with_view_fragment(mut self, fragment: Option<&str>) -> Self {
+        self.view_fragment = fragment
+            .filter(|f| !f.is_empty())
+            .map(|f| f.to_string());
+        self
     }
 
     /// Set the maximum dimension of the returned raster. The source is fully
@@ -641,6 +653,7 @@ impl ImageHandler {
             kind,
             decode_max_dim: Some(cap),
             dims_only: false,
+            view_fragment: None,
         }
     }
 }
@@ -776,8 +789,22 @@ impl ImageHandler {
 
         #[cfg(feature = "svg")]
         let svg_err = {
-            use crate::util::parse_svg_image;
-            match parse_svg_image(&bytes) {
+            use crate::util::{apply_svg_target_fragment, apply_svg_view_fragment, parse_svg_image};
+            // `img.svg#viewname`: the named <view>'s viewBox overrides the
+            // root's before the parse; unmatched fragments fall through.
+            // `sprite.svg#icon`: the fragment is also what `:target`
+            // matches in the sprite's own stylesheet.
+            let rewritten: Option<Vec<u8>> = self
+                .view_fragment
+                .as_deref()
+                .and_then(|frag| {
+                    let source = std::str::from_utf8(&bytes).ok()?;
+                    let viewed = apply_svg_view_fragment(source, frag);
+                    let base = viewed.as_deref().unwrap_or(source);
+                    apply_svg_target_fragment(base, frag).or(viewed)
+                })
+                .map(String::into_bytes);
+            match parse_svg_image(rewritten.as_deref().unwrap_or(&bytes)) {
                 Ok(svg) => return Ok(Resource::Svg(self.kind, svg)),
                 Err(e) => e.to_string(),
             }
