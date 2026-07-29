@@ -1662,6 +1662,10 @@ pub(crate) fn build_inline_layout_into(
     let mut text_transformer = TextTransformer::default();
     text_transformer.word_break(&builder);
 
+    // Per-text-node byte ranges for the DOM-selection
+    // paint bridge; measured around each push (see TextLayout).
+    let node_ranges: &mut Vec<(NodeId, core::ops::Range<usize>)> = &mut Vec::new();
+
     if let Some(before_id) = root_node.before() {
         build_inline_layout_recursive(
             &mut builder,
@@ -1669,6 +1673,7 @@ pub(crate) fn build_inline_layout_into(
             nodes,
             before_id,
             &text_transform,
+            node_ranges,
         );
     }
     for child_id in root_node.flat_children().iter().copied() {
@@ -1678,6 +1683,7 @@ pub(crate) fn build_inline_layout_into(
             nodes,
             child_id,
             &text_transform,
+            node_ranges,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -1687,10 +1693,12 @@ pub(crate) fn build_inline_layout_into(
             nodes,
             after_id,
             &text_transform,
+            node_ranges,
         );
     }
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
+    text_layout.node_ranges = core::mem::take(node_ranges);
     return;
 
     fn build_inline_layout_recursive(
@@ -1699,6 +1707,7 @@ pub(crate) fn build_inline_layout_into(
         nodes: &crate::NodeTree,
         node_id: NodeId,
         parent_text_transform: &CaseTransform,
+        node_ranges: &mut Vec<(NodeId, core::ops::Range<usize>)>,
     ) {
         let node = &nodes[node_id];
 
@@ -1761,6 +1770,7 @@ pub(crate) fn build_inline_layout_into(
                                 nodes,
                                 child_id,
                                 &text_transform,
+                                node_ranges,
                             );
                         }
                         builder.pop_style_span();
@@ -1836,6 +1846,7 @@ pub(crate) fn build_inline_layout_into(
                                     nodes,
                                     before_id,
                                     &text_transform,
+                                    node_ranges,
                                 );
                             }
 
@@ -1846,6 +1857,7 @@ pub(crate) fn build_inline_layout_into(
                                     nodes,
                                     child_id,
                                     &text_transform,
+                                    node_ranges,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -1855,6 +1867,7 @@ pub(crate) fn build_inline_layout_into(
                                     nodes,
                                     after_id,
                                     &text_transform,
+                                    node_ranges,
                                 );
                             }
 
@@ -1891,9 +1904,14 @@ pub(crate) fn build_inline_layout_into(
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                 // dbg!(&data.content);
 
+                let range_start = builder.current_text_len();
                 let text =
                     text_transformer.transform(&data.content, parent_text_transform, builder);
                 builder.push_text(text);
+                let range_end = builder.current_text_len();
+                if range_end > range_start {
+                    node_ranges.push((node_id, range_start..range_end));
+                }
             }
             NodeData::Comment { .. } => {
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);

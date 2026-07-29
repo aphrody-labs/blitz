@@ -33,6 +33,11 @@ pub struct TextLayout {
     /// containing block (as `SPAN_*_CB` flags). The inline root claims those boxes in its place.
     /// Set by each `RunMode::PerformLayout` run of inline layout.
     pub span_cb_flags: stylo_taffy::StyleFlags,
+    // (text node id, byte range in the layout text) per
+    // pushed text node: approximate under whitespace collapse
+    // (measured committed+pending around each push), consumed by
+    // the DOM-selection paint bridge with clamping.
+    pub node_ranges: Vec<(NodeId, core::ops::Range<usize>)>,
 }
 
 impl TextLayout {

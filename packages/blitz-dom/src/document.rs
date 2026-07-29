@@ -3172,6 +3172,49 @@ impl BaseDocument {
         Some((inline_root.id, byte_offset))
     }
 
+    // DOM caret from a point: the reverse of resolve_text_boundary.
+    // Returns (text_node_id, utf16_offset) for Selection.collapse().
+
+    // Approximate under whitespace collapse / text-transform (layout
+    // bytes shift against DOM text), so the offset clamps into the node.
+    pub fn dom_caret_from_point(&self, x: f32, y: f32) -> Option<(NodeId, usize)> {
+        let hit = self.hit(x, y)?;
+        let hit_node = self.get_node(hit.node_id)?;
+        // Replaced content is an atomic inline: it has no text positions,
+        // so a drag across a <canvas> must not select the text around it
+        // (WPT selection/canvas-drag). The IFC walk below would otherwise
+        // resolve the hit to a neighbouring text run's offset.
+        if let Some(el) = hit_node.element_data() {
+            let name = &el.name.local;
+            if matches!(
+                name.as_ref(),
+                "canvas" | "img" | "video" | "audio" | "iframe" | "object" | "embed" | "svg"
+            ) {
+                return None;
+            }
+        }
+        let inline_root = hit_node.inline_root_ancestor()?;
+        let byte_offset = inline_root.text_offset_at_point(hit.x, hit.y)?;
+        let el = inline_root.element_data()?;
+        let il = el.inline_layout_data.as_ref()?;
+        let (node_id, range) = il
+            .node_ranges
+            .iter()
+            .find(|(_, r)| byte_offset >= r.start && byte_offset <= r.end)
+            .map(|(nid, r)| (*nid, r.clone()))?;
+        let text_node = self.get_node(node_id)?;
+        let content: &str = match &text_node.data {
+            NodeData::Text(t) => &t.content,
+            _ => return None,
+        };
+        let slice_start = range.start.min(il.text.len());
+        let slice_end = byte_offset.min(il.text.len());
+        let slice = il.text.get(slice_start..slice_end)?;
+        let node_u16_len = content.encode_utf16().count();
+        let u16 = slice.encode_utf16().count().min(node_u16_len);
+        Some((node_id, u16))
+    }
+
     /// Set the text selection range (creates a new selection from anchor to focus)
     pub fn set_text_selection(
         &mut self,
@@ -3237,6 +3280,141 @@ impl BaseDocument {
     /// Clear the text selection
     pub fn clear_text_selection(&mut self) {
         self.text_selection.clear();
+    }
+
+    // DOM-selection paint bridge. Resolves DOM boundary
+    // points (node id + DOM offset) onto (inline root, layout byte)
+    // and feeds the same TextSelection the pointer-drag path fills,
+    // so the existing highlight paint works unchanged. Offsets are
+    // clamped, not computed exactly: whitespace collapse, injected
+    // bidi controls and text-transform all shift layout bytes.
+    pub fn set_dom_selection(
+        &mut self,
+        anchor_node: NodeId,
+        anchor_offset: usize,
+        focus_node: NodeId,
+        focus_offset: usize,
+    ) -> bool {
+        let anchor = self.resolve_dom_boundary(anchor_node, anchor_offset, false);
+        let focus = self.resolve_dom_boundary(focus_node, focus_offset, true);
+        match (anchor, focus) {
+            (Some((an, ao)), Some((fn_, fo))) => {
+                self.set_text_selection(an, ao, fn_, fo);
+                true
+            }
+            _ => {
+                self.text_selection.clear();
+                false
+            }
+        }
+    }
+
+    fn resolve_dom_boundary(
+        &self,
+        node_id: NodeId,
+        dom_offset: usize,
+        is_end: bool,
+    ) -> Option<(NodeId, usize)> {
+        let node = self.get_node(node_id)?;
+        if node.is_text_node() {
+            return self.resolve_text_boundary(node_id, dom_offset);
+        }
+        // Element boundary (node, child index k): descend to the
+        // nearest text position: at-or-after child k going forward
+        // for a start boundary, at-or-before going backward for an
+        // end boundary (matches how ranges enclose child content).
+        let children = &node.children;
+        let k = dom_offset.min(children.len());
+        if is_end {
+            for child in children[..k].iter().rev() {
+                if let Some(text_id) = self.last_text_descendant(*child) {
+                    let n = self.get_node(text_id)?;
+                    let len = match &n.data {
+                        NodeData::Text(t) => t.content.chars().map(char::len_utf16).sum(),
+                        _ => 0,
+                    };
+                    return self.resolve_text_boundary(text_id, len);
+                }
+            }
+        } else {
+            for child in children[k..].iter() {
+                if let Some(text_id) = self.first_text_descendant(*child) {
+                    return self.resolve_text_boundary(text_id, 0);
+                }
+            }
+        }
+        None
+    }
+
+    // Flat-tree descent: shadow content hangs off the host's
+    // shadow_root link, not children: selections must reach it.
+    fn first_text_descendant(&self, node_id: NodeId) -> Option<NodeId> {
+        let node = self.get_node(node_id)?;
+        if node.is_text_node() {
+            return Some(node_id);
+        }
+        node.flat_children()
+            .iter()
+            .find_map(|c| self.first_text_descendant(*c))
+    }
+
+    fn last_text_descendant(&self, node_id: NodeId) -> Option<NodeId> {
+        let node = self.get_node(node_id)?;
+        if node.is_text_node() {
+            return Some(node_id);
+        }
+        node.flat_children()
+            .iter()
+            .rev()
+            .find_map(|c| self.last_text_descendant(*c))
+    }
+
+    fn resolve_text_boundary(&self, text_id: NodeId, dom_offset: usize) -> Option<(NodeId, usize)> {
+        // Inline roots live on the layout chain: anonymous blocks
+        // wrap loose text and never appear in the DOM parent chain.
+        let text_node = self.get_node(text_id)?;
+        // Shared borrows only: the walk below reads other nodes,
+        // so borrowing the text avoids cloning whole node contents.
+        let content: &str = match &text_node.data {
+            NodeData::Text(t) => &t.content,
+            _ => return None,
+        };
+        let mut cur = text_node.layout_parent.get().or(text_node.parent);
+        let mut hops = 0;
+        while let Some(id) = cur {
+            let n = self.get_node(id)?;
+            if n.flags.is_inline_root() {
+                let el = n.element_data()?;
+                let il = el.inline_layout_data.as_ref()?;
+                let range = il
+                    .node_ranges
+                    .iter()
+                    .find(|(nid, _)| *nid == text_id)?
+                    .1
+                    .clone();
+                // DOM offsets are UTF-16 code units; the layout text
+                // is UTF-8. Convert against the original data, then
+                // clamp into the recorded range so collapse or
+                // transform skew can never point outside the node.
+                let mut u16_seen = 0usize;
+                let mut byte = 0usize;
+                for ch in content.chars() {
+                    if u16_seen >= dom_offset {
+                        break;
+                    }
+                    u16_seen += ch.len_utf16();
+                    byte += ch.len_utf8();
+                }
+                let end = range.end;
+                return Some((id, (range.start + byte).min(end)));
+            }
+            cur = n.layout_parent.get().or(n.parent);
+            hops += 1;
+            if hops > 512 {
+                return None;
+            }
+        }
+        None
     }
 
     /// Update the selection focus point (used during mouse drag to extend selection).
