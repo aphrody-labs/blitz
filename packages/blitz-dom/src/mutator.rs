@@ -1751,11 +1751,18 @@ impl<'doc> DocumentMutator<'doc> {
         if element.text_input_data_mut().is_none() {
             let tag: &str = &element.name.local;
             let is_multiline = tag == "textarea";
+            // Mirror construct's gate: ASCII-ci type matching with
+            // unknown/empty falling to the Text state per HTML.
+            let ty = element
+                .attr(local_name!("type"))
+                .map(|t| t.to_ascii_lowercase());
             let is_text_input = tag == "input"
-                && matches!(
-                    element.attr(local_name!("type")),
-                    None | Some(
-                        "text" | "password" | "email" | "number" | "search" | "tel" | "url"
+                && !matches!(
+                    ty.as_deref(),
+                    Some(
+                        "checkbox" | "radio" | "range" | "hidden" | "submit" | "button"
+                            | "reset" | "file" | "image" | "color" | "date"
+                            | "datetime-local" | "month" | "week" | "time"
                     )
                 );
             if !(is_multiline || is_text_input) {

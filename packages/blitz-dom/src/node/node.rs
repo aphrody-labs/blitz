@@ -1354,6 +1354,124 @@ impl Node {
         out
     }
 
+    // HTML "the directionality" with whatwg/html#9796's
+    // shadow rules; drives :dir() matching and the dir=auto hint.
+
+    // The upward chain is the light tree plus the shadow-root→host
+    // crossing. Slotted nodes do not take directionality from their
+    // assigned slot (dir-shadow-03/04/31: dir=rtl on the slot gives
+    // ltr :dir but rtl computed; CSS inherits flat, HTML doesn't).
+    pub(crate) fn html_directionality_is_rtl(&self) -> bool {
+        let mut cur = Some(self.id);
+        while let Some(id) = cur {
+            let node = self.with(id);
+            if let Some(el) = node.data.downcast_element() {
+                let dir = el.attr(local_name!("dir"));
+                if let Some(d) = dir {
+                    if d.eq_ignore_ascii_case("rtl") {
+                        return true;
+                    }
+                    if d.eq_ignore_ascii_case("ltr") {
+                        return false;
+                    }
+                }
+                // bdi defaults to auto; an invalid dir value on it
+                // is also auto per HTML's "undefined" attr state.
+                let auto = dir.is_some_and(|d| d.eq_ignore_ascii_case("auto"))
+                    || el.name.local == local_name!("bdi");
+                if auto {
+                    return node.dir_auto_scan_is_rtl().unwrap_or(false);
+                }
+            }
+            cur = node.directionality_flat_parent();
+        }
+        false
+    }
+
+    fn directionality_flat_parent(&self) -> Option<NodeId> {
+        let parent_id = self.parent?;
+        if let NodeData::ShadowRoot(ref data) = self.with(parent_id).data {
+            return Some(data.host);
+        }
+        Some(parent_id)
+    }
+
+    // HTML auto-directionality: tree-order first-strong scan. Slots
+    // scan their assigned nodes (fallback content when unassigned);
+    // other elements scan light children: a host's shadow tree is
+    // not its descendant. Excluded subtrees match the spec list.
+    pub(crate) fn dir_auto_scan_is_rtl(&self) -> Option<bool> {
+        // HTML: a text control's auto-directionality comes from its
+        // value, not its children. The dirty IDL value lives in the
+        // editor's value_override (set_text_input_value restyles the
+        // control on every write, so the cascade hint stays fresh);
+        // pre-dirty falls back to the value attribute for inputs.
+        // Textareas fall through to child text = the default value.
+        if let Some(el) = self.data.downcast_element() {
+            if let Some(data) = el.text_input_data() {
+                if let Some(v) = &data.value_override {
+                    return match parley::first_strong_direction(v) {
+                        Some(parley::BaseDirection::Rtl) => Some(true),
+                        Some(_) => Some(false),
+                        None => None,
+                    };
+                }
+            }
+            if el.name.local == local_name!("input") {
+                let v = el.attr(local_name!("value")).unwrap_or("");
+                return match parley::first_strong_direction(v) {
+                    Some(parley::BaseDirection::Rtl) => Some(true),
+                    Some(_) => Some(false),
+                    None => None,
+                };
+            }
+        }
+        fn scan(node: &Node, is_scan_root: bool) -> Option<bool> {
+            match &node.data {
+                NodeData::Text(t) => match parley::first_strong_direction(&t.content) {
+                    Some(parley::BaseDirection::Rtl) => Some(true),
+                    Some(_) => Some(false),
+                    None => None,
+                },
+                NodeData::Element(el) | NodeData::AnonymousBlock(el) => {
+                    if !is_scan_root {
+                        let tag = &el.name.local;
+                        if *tag == local_name!("bdi")
+                            || *tag == local_name!("script")
+                            || *tag == local_name!("style")
+                            || *tag == local_name!("textarea")
+                        {
+                            return None;
+                        }
+                        // A slot met as a descendant contributes
+                        // nothing: its assigned nodes belong to the
+                        // light tree and must not leak into shadow-
+                        // side scans (WPT dir-shadow-30/34 pin this).
+                        if node.is_slot_element() {
+                            return None;
+                        }
+                        if el.attr(local_name!("dir")).is_some_and(|d| {
+                            d.eq_ignore_ascii_case("auto")
+                                || d.eq_ignore_ascii_case("ltr")
+                                || d.eq_ignore_ascii_case("rtl")
+                        }) {
+                            return None;
+                        }
+                    }
+                    let kids: &[NodeId] = if node.is_slot_element() {
+                        node.flat_children()
+                    } else {
+                        &node.children
+                    };
+                    kids.iter()
+                        .find_map(|child| scan(&node.with(*child), false))
+                }
+                _ => None,
+            }
+        }
+        scan(self, true)
+    }
+
     fn write_text_content(&self, out: &mut String) {
         match &self.data {
             NodeData::Text(data) => {

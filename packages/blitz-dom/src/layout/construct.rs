@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use markup5ever::{QualName, local_name, ns};
 use parley::{
-    FontContext, InlineBox, InlineBoxKind, LayoutContext, StyleProperty, TreeBuilder,
-    WhiteSpaceCollapse,
+    BaseDirection, FontContext, InlineBox, InlineBoxKind, LayoutContext, StyleProperty,
+    TreeBuilder, WhiteSpaceCollapse,
 };
 use style::{
     computed_values::position::T as PositionProperty,
@@ -773,16 +773,26 @@ fn collect_layout_children_with_wrap(
         // Handle text inputs
         let tag_name = el.name.local.as_ref();
         if matches!(tag_name, "input" | "textarea") {
-            let type_attr: Option<&str> = doc.nodes[container_node_id]
+            // Type is an ASCII-ci enumerated attribute and
+            // unknown/empty values fall to the Text state per HTML:
+            // type="TEXT" / type="" / type="foo" must all build an
+            // editor, not silently render nothing.
+            let type_attr: Option<String> = doc.nodes[container_node_id]
                 .data
                 .downcast_element()
-                .and_then(|el| el.attr(local_name!("type")));
+                .and_then(|el| el.attr(local_name!("type")))
+                .map(|t| t.to_ascii_lowercase());
+            let type_attr: Option<&str> = type_attr.as_deref();
             if tag_name == "textarea" {
                 create_text_editor(doc, container_node_id, true);
                 return;
-            } else if matches!(
+            } else if !matches!(
                 type_attr,
-                None | Some("text" | "password" | "email" | "number" | "search" | "tel" | "url")
+                Some(
+                    "checkbox" | "radio" | "range" | "hidden" | "submit" | "button"
+                        | "reset" | "file" | "image" | "color" | "date"
+                        | "datetime-local" | "month" | "week" | "time"
+                )
             ) {
                 create_text_editor(doc, container_node_id, false);
                 return;
@@ -1306,9 +1316,16 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         .primary_styles()
         .map(|s| stylo_to_parley::text_align(s.clone_text_align()))
         .unwrap_or(parley::layout::Alignment::Start);
+    // `unicode-bidi: plaintext` (the UA sheet's dir=auto rule for
+    // text controls) means per-paragraph first-strong, not whole-text.
     let base_direction = node
         .primary_styles()
-        .map(|s| stylo_to_parley::base_direction(s.clone_direction(), s.clone_unicode_bidi()))
+        .map(|s| match s.clone_unicode_bidi() {
+            style::computed_values::unicode_bidi::T::Plaintext => {
+                parley::BaseDirection::AutoPerParagraph
+            }
+            bidi => stylo_to_parley::base_direction(s.clone_direction(), bidi),
+        })
         .unwrap_or(parley::BaseDirection::Auto);
 
     let initial_text = if is_multiline {
@@ -1485,7 +1502,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
             NodeData::Element(element_data) | NodeData::AnonymousBlock(element_data) => {
                 // if the input type is hidden, hide it
                 if *element_data.name.local == *"input" {
-                    if let Some("hidden") = element_data.attr(local_name!("type")) {
+                    if element_data.attr(local_name!("type")).is_some_and(|t| t.eq_ignore_ascii_case("hidden")) {
                         return;
                     }
                 }
@@ -1543,6 +1560,35 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     }
 }
 
+// UAX#9 control pair for a computed unicode-bidi value.
+// Isolates close with PDI, embeds/overrides with PDF.
+
+// The isolate direction follows computed direction: dir=auto is
+// already resolved into it by the presentational hint (stylo.rs),
+// with the HTML scan exclusions FSI can't express (dir-shadow-33:
+// shadow text must not steer a host's isolate). Plaintext keeps
+// FSI: it is first-strong-of-content by definition.
+fn bidi_wrap_chars(
+    ub: style::computed_values::unicode_bidi::T,
+    rtl: bool,
+) -> (&'static str, &'static str) {
+    use style::computed_values::unicode_bidi::T as UnicodeBidi;
+    match ub {
+        UnicodeBidi::Isolate => (if rtl { "\u{2067}" } else { "\u{2066}" }, "\u{2069}"),
+        UnicodeBidi::Plaintext => ("\u{2068}", "\u{2069}"),
+        UnicodeBidi::IsolateOverride => {
+            if rtl {
+                ("\u{2067}\u{202E}", "\u{202C}\u{2069}")
+            } else {
+                ("\u{2066}\u{202D}", "\u{202C}\u{2069}")
+            }
+        }
+        UnicodeBidi::Embed => (if rtl { "\u{202B}" } else { "\u{202A}" }, "\u{202C}"),
+        UnicodeBidi::BidiOverride => (if rtl { "\u{202E}" } else { "\u{202D}" }, "\u{202C}"),
+        UnicodeBidi::Normal => ("", ""),
+    }
+}
+
 pub(crate) fn build_inline_layout_into(
     nodes: &crate::NodeTree,
     layout_ctx: &mut LayoutContext<TextBrush>,
@@ -1569,11 +1615,19 @@ pub(crate) fn build_inline_layout_into(
 
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
-    if let Some(style) = root_node_style.as_deref() {
-        builder.set_base_direction(stylo_to_parley::base_direction(
-            style.clone_direction(),
-            style.clone_unicode_bidi(),
-        ));
+
+    // Stamp the block's bidi base direction; parley's
+    // default whole-text autodetect ignores CSS direction entirely.
+
+    // Computed direction is authoritative: dir=auto resolves into
+    // the cascade via the presentational hint (stylo.rs).
+    if let Some(s) = root_node_style.as_deref() {
+        use style::computed_values::unicode_bidi::T as UnicodeBidi;
+        let base_direction = match s.clone_unicode_bidi() {
+            UnicodeBidi::Plaintext => BaseDirection::AutoPerParagraph,
+            bidi => stylo_to_parley::base_direction(s.clone_direction(), bidi),
+        };
+        builder.set_base_direction(base_direction);
     }
 
     let text_transform = root_node_style
@@ -1659,7 +1713,7 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Element(element_data) | NodeData::AnonymousBlock(element_data) => {
                 // if the input type is hidden, hide it
                 if *element_data.name.local == *"input" {
-                    if let Some("hidden") = element_data.attr(local_name!("type")) {
+                    if element_data.attr(local_name!("type")).is_some_and(|t| t.eq_ignore_ascii_case("hidden")) {
                         return;
                     }
                 }
@@ -1744,6 +1798,22 @@ pub(crate) fn build_inline_layout_into(
                             builder.pop_style_span();
                             text_transformer.word_break(builder);
                         } else {
+                            // Inline bidi isolation: wrap the span's
+                            // text in the controls its unicode-bidi implies.
+
+                            // Cf chars shape to nothing and TextBrush spans are
+                            // node-id keyed, so only the resolver sees them.
+                            let bidi_wrap = style.and_then(|s| {
+                                use style::computed_values::direction::T as Direction;
+                                use style::computed_values::unicode_bidi::T as UnicodeBidi;
+                                let ub = s.clone_unicode_bidi();
+                                if matches!(ub, UnicodeBidi::Normal) {
+                                    return None;
+                                }
+                                let rtl = s.clone_direction() == Direction::Rtl;
+                                Some(bidi_wrap_chars(ub, rtl))
+                            });
+
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let style = node
                                 .primary_styles()
@@ -1754,6 +1824,10 @@ pub(crate) fn build_inline_layout_into(
                                 });
 
                             builder.push_style_span(style);
+
+                            if let Some((open, _)) = bidi_wrap {
+                                builder.push_text(open);
+                            }
 
                             if let Some(before_id) = node.before() {
                                 build_inline_layout_recursive(
@@ -1782,6 +1856,10 @@ pub(crate) fn build_inline_layout_into(
                                     after_id,
                                     &text_transform,
                                 );
+                            }
+
+                            if let Some((_, close)) = bidi_wrap {
+                                builder.push_text(close);
                             }
 
                             builder.pop_style_span();

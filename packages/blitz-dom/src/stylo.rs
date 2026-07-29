@@ -510,6 +510,16 @@ impl selectors::Element for BlitzNode<'_> {
     ) -> bool {
         match *pseudo_class {
             NonTSPseudoClass::Active => self.element_state().contains(ElementState::ACTIVE),
+            // :dir() matches HTML directionality (not the
+            // CSS direction property): unknown idents never match.
+            NonTSPseudoClass::Dir(ref dir) => {
+                let rtl = self.html_directionality_is_rtl();
+                match &**dir {
+                    "rtl" => rtl,
+                    "ltr" => !rtl,
+                    _ => false,
+                }
+            }
             NonTSPseudoClass::AnyLink => self
                 .element_state()
                 .intersects(ElementState::VISITED_OR_UNVISITED),
@@ -1039,6 +1049,28 @@ impl<'a> TElement for BlitzNode<'a> {
                 LayerOrder::root(),
             ));
         };
+
+        // Dir=auto can't ride a stylesheet (its scan skips
+        // subtrees no selector can express): resolve it here so
+        // getComputedStyle().direction and flat-tree inheritance see
+        // the result. ltr/rtl attrs stay on the UA [dir] rules.
+        {
+            use style::properties::longhands::direction::SpecifiedValue as Direction;
+            let dir_attr = elem.attr(local_name!("dir"));
+            let has_fixed = dir_attr.is_some_and(|d| {
+                d.eq_ignore_ascii_case("ltr") || d.eq_ignore_ascii_case("rtl")
+            });
+            let dir_auto = dir_attr.is_some_and(|d| d.eq_ignore_ascii_case("auto"))
+                || (*tag == local_name!("bdi") && !has_fixed);
+            if dir_auto {
+                let rtl = self.dir_auto_scan_is_rtl().unwrap_or(false);
+                push_style(PropertyDeclaration::Direction(if rtl {
+                    Direction::Rtl
+                } else {
+                    Direction::Ltr
+                }));
+            }
+        }
 
         fn parse_color_attr(value: &str) -> Option<(u8, u8, u8, f32)> {
             if !value.starts_with('#') {

@@ -327,7 +327,14 @@ impl LayoutPassState<'_> {
                 }
 
                 if *element_data.name.local == *"input" {
-                    match element_data.attr(local_name!("type")) {
+                    // Same ASCII-ci type normalization as
+                    // construct's editor gate: unknown/empty types
+                    // fall to the Text state, so their leaf layout
+                    // must match (else the editor paints in a sliver).
+                    let type_attr = element_data
+                        .attr(local_name!("type"))
+                        .map(|t| t.to_ascii_lowercase());
+                    match type_attr.as_deref() {
                         // if the input type is hidden, hide it
                         Some("hidden") => {
                             return taffy::LayoutOutput::HIDDEN;
@@ -355,7 +362,12 @@ impl LayoutPassState<'_> {
                                 },
                             );
                         }
-                        None | Some("text" | "password" | "email" | "tel" | "url" | "search") => {
+                        Some(
+                            "radio" | "range" | "submit" | "button" | "reset" | "file"
+                            | "image" | "color" | "date" | "datetime-local" | "month"
+                            | "week" | "time",
+                        ) => {}
+                        _ => {
                             return compute_leaf_layout(
                                 inputs,
                                 &node.layout_style(),
@@ -370,7 +382,6 @@ impl LayoutPassState<'_> {
                                 },
                             );
                         }
-                        _ => {}
                     }
                 }
 

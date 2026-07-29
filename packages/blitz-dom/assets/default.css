@@ -239,15 +239,18 @@ output {
     unicode-bidi: isolate;
 }
 
-/* We need the "bdo:-moz-has-dir-attr" bit because "bdo" has lower
-   specificity than the ":-moz-has-dir-attr" selector above. */
+/* The -moz selector invalidated the whole list (CSS drops a
+   rule when any selector fails to parse): bdo got nothing. */
 bdo,
-bdo:-moz-has-dir-attr {
+bdo[dir] {
     unicode-bidi: isolate-override;
 }
 
-textarea:-moz-dir-attr-like-auto,
-pre:-moz-dir-attr-like-auto {
+/* dir=auto on text-bearing controls means per-paragraph
+   first-strong (plaintext); non-textual inputs never paint text. */
+textarea[dir="auto" i],
+pre[dir="auto" i],
+input[dir="auto" i] {
     unicode-bidi: plaintext;
 }
 
