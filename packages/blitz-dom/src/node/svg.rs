@@ -34,7 +34,19 @@ impl SvgIntrinsicDimensions {
         let root = doc.root_element();
 
         let parse_length = |name: &str| -> Option<svgtypes::Length> {
-            root.attribute(name)?.parse::<svgtypes::Length>().ok()
+            // Root CSS beats the equivalent presentation attribute. Read the
+            // last declaration, matching normal declaration-list precedence.
+            let from_style = root.attribute("style").and_then(|style| {
+                style.split(';').rev().find_map(|declaration| {
+                    let (property, value) = declaration.split_once(':')?;
+                    property
+                        .trim()
+                        .eq_ignore_ascii_case(name)
+                        .then(|| value.trim().parse::<svgtypes::Length>().ok())
+                        .flatten()
+                })
+            });
+            from_style.or_else(|| root.attribute(name)?.parse::<svgtypes::Length>().ok())
         };
         // Parsed manually rather than via `svgtypes::ViewBox`, which rejects
         // zero sizes: a zero `viewBox` width/height is distinguished from an
@@ -106,33 +118,89 @@ impl SvgImageData {
         };
         let doc = roxmltree::Document::parse_with_options(text, xml_options)
             .map_err(usvg::Error::ParsingFailed)?;
-        let tree = usvg::Tree::from_xmltree(&doc, options)?;
-        Ok(Self {
+        let intrinsic_dimensions = SvgIntrinsicDimensions::from_xmltree(&doc);
+        let tree = match usvg::Tree::from_xmltree(&doc, options) {
+            Ok(tree) => tree,
+            Err(usvg::Error::InvalidSize) => {
+                let stripped = strip_root_dimensions(
+                    text,
+                    intrinsic_dimensions
+                        .width
+                        .is_some_and(|length| length.number <= 0.0),
+                    intrinsic_dimensions
+                        .height
+                        .is_some_and(|length| length.number <= 0.0),
+                );
+                let retry_options = roxmltree::ParsingOptions {
+                    allow_dtd: true,
+                    ..Default::default()
+                };
+                let retry_doc = roxmltree::Document::parse_with_options(&stripped, retry_options)
+                    .map_err(usvg::Error::ParsingFailed)?;
+                usvg::Tree::from_xmltree(&retry_doc, options)?
+            }
+            Err(err) => return Err(err),
+        };
+        let mut image = Self {
             tree: Arc::new(tree),
-            intrinsic_dimensions: SvgIntrinsicDimensions::from_xmltree(&doc),
-        })
+            intrinsic_dimensions,
+        };
+
+        // Keep usvg's viewport aligned with the CSS natural dimensions. usvg
+        // otherwise resolves a missing axis against the viewBox edge, which can
+        // letterbox the tree when it is scaled into the CSS-sized box.
+        let width = image.intrinsic_width();
+        let height = image.intrinsic_height();
+        let ratio = image.viewbox_aspect_ratio();
+        let normalized_size = match (width, height, ratio) {
+            (Some(width), None, ratio) if width > 0.0 => {
+                Some((width, ratio.map(|r| width / r).unwrap_or(150.0)))
+            }
+            (None, Some(height), ratio) if height > 0.0 => {
+                Some((ratio.map(|r| height * r).unwrap_or(300.0), height))
+            }
+            (None, None, None) => Some((300.0, 150.0)),
+            _ => None,
+        };
+        if let Some((width, height)) = normalized_size {
+            let normalized = inject_root_dimensions(text, width, height);
+            let normalized_options = roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            };
+            let normalized_doc =
+                roxmltree::Document::parse_with_options(&normalized, normalized_options)
+                    .map_err(usvg::Error::ParsingFailed)?;
+            image.tree = Arc::new(usvg::Tree::from_xmltree(&normalized_doc, options)?);
+        }
+
+        Ok(image)
     }
 
     /// The intrinsic width in CSS px, present only when the root `<svg>`
     /// declared an absolute (non-percentage) `width`.
     pub fn intrinsic_width(&self) -> Option<f32> {
         use svgtypes::LengthUnit;
-        let declared = self
-            .intrinsic_dimensions
-            .width
-            .is_some_and(|len| len.unit != LengthUnit::Percent);
-        declared.then(|| self.tree.size().width())
+        match self.intrinsic_dimensions.width {
+            Some(len) if len.unit != LengthUnit::Percent && len.number == 0.0 => Some(0.0),
+            Some(len) if len.unit != LengthUnit::Percent && len.number > 0.0 => {
+                Some(self.tree.size().width())
+            }
+            _ => None,
+        }
     }
 
     /// The intrinsic height in CSS px, present only when the root `<svg>`
     /// declared an absolute (non-percentage) `height`.
     pub fn intrinsic_height(&self) -> Option<f32> {
         use svgtypes::LengthUnit;
-        let declared = self
-            .intrinsic_dimensions
-            .height
-            .is_some_and(|len| len.unit != LengthUnit::Percent);
-        declared.then(|| self.tree.size().height())
+        match self.intrinsic_dimensions.height {
+            Some(len) if len.unit != LengthUnit::Percent && len.number == 0.0 => Some(0.0),
+            Some(len) if len.unit != LengthUnit::Percent && len.number > 0.0 => {
+                Some(self.tree.size().height())
+            }
+            _ => None,
+        }
     }
 
     /// The aspect ratio of the root `<svg>`'s `viewBox`, if it declares one.
@@ -173,9 +241,14 @@ impl SvgImageData {
     pub fn resolved_width(&self, container_width: Option<f32>) -> Option<f32> {
         use svgtypes::LengthUnit;
         match self.intrinsic_dimensions.width {
-            Some(len) if len.unit != LengthUnit::Percent => Some(self.tree.size().width()),
-            Some(len) => container_width.map(|cw| cw * (len.number as f32) / 100.0),
-            None => None,
+            Some(len) if len.unit != LengthUnit::Percent && len.number == 0.0 => Some(0.0),
+            Some(len) if len.unit != LengthUnit::Percent && len.number > 0.0 => {
+                Some(self.tree.size().width())
+            }
+            Some(len) if len.unit == LengthUnit::Percent => {
+                container_width.map(|cw| cw * (len.number as f32) / 100.0)
+            }
+            _ => None,
         }
     }
 
@@ -184,9 +257,14 @@ impl SvgImageData {
     pub fn resolved_height(&self, container_height: Option<f32>) -> Option<f32> {
         use svgtypes::LengthUnit;
         match self.intrinsic_dimensions.height {
-            Some(len) if len.unit != LengthUnit::Percent => Some(self.tree.size().height()),
-            Some(len) => container_height.map(|ch| ch * (len.number as f32) / 100.0),
-            None => None,
+            Some(len) if len.unit != LengthUnit::Percent && len.number == 0.0 => Some(0.0),
+            Some(len) if len.unit != LengthUnit::Percent && len.number > 0.0 => {
+                Some(self.tree.size().height())
+            }
+            Some(len) if len.unit == LengthUnit::Percent => {
+                container_height.map(|ch| ch * (len.number as f32) / 100.0)
+            }
+            _ => None,
         }
     }
 
@@ -262,4 +340,98 @@ fn view_box_transform(
     let tx = (width - view_box.width() * sx) * align_x - view_box.x() * sx;
     let ty = (height - view_box.height() * sy) * align_y - view_box.y() * sy;
     usvg::Transform::from_row(sx, 0.0, 0.0, sy, tx, ty)
+}
+
+fn strip_root_dimensions(source: &str, strip_width: bool, strip_height: bool) -> String {
+    let Some(root_start) = source.find("<svg") else {
+        return source.to_string();
+    };
+    let Some(rel_end) = source[root_start..].find('>') else {
+        return source.to_string();
+    };
+    let root_end = root_start + rel_end;
+    let mut root = source[root_start..root_end].to_string();
+
+    if strip_width {
+        strip_tag_attr(&mut root, "width");
+    }
+    if strip_height {
+        strip_tag_attr(&mut root, "height");
+    }
+
+    format!("{}{}{}", &source[..root_start], root, &source[root_end..])
+}
+
+fn inject_root_dimensions(source: &str, width: f32, height: f32) -> String {
+    let source = strip_root_dimensions(source, true, true);
+    let Some(root_start) = source.find("<svg") else {
+        return source;
+    };
+    let mut out = String::with_capacity(source.len() + 40);
+    out.push_str(&source[..root_start + 4]);
+    out.push_str(&format!(" width=\"{width}\" height=\"{height}\""));
+    out.push_str(&source[root_start + 4..]);
+    out
+}
+
+fn strip_tag_attr(tag: &mut String, name: &str) {
+    let bytes = tag.as_bytes().to_vec();
+    let mut i = 0;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+        {
+            i += 1;
+        }
+        if i == name_start {
+            break;
+        }
+        let attr_name = &tag[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            if attr_name.eq_ignore_ascii_case(name) {
+                tag.replace_range(name_start..i, "");
+                return;
+            }
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                i += 1;
+            }
+        }
+        if attr_name.eq_ignore_ascii_case(name) {
+            let cut_from = if name_start > 0 {
+                name_start - 1
+            } else {
+                name_start
+            };
+            tag.replace_range(cut_from..i, "");
+            return;
+        }
+    }
 }

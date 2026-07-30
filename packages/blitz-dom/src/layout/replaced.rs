@@ -117,7 +117,6 @@ pub fn compute_replaced_layout(
                 },
         }
     };
-
     // Return early if both width and height are known
     if run_mode == RunMode::ComputeSize {
         if let Size {

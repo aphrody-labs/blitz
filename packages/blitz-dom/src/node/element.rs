@@ -574,6 +574,16 @@ impl ElementData {
         }
     }
 
+    // Full svg metadata (naturals + viewBox presence), so the
+    // painter can tell a real viewBox from usvg's synthesized size.
+    #[cfg(feature = "svg")]
+    pub fn svg_image_data(&self) -> Option<&SvgImageData> {
+        match self.image_data()? {
+            ImageData::Svg(data) => Some(data),
+            _ => None,
+        }
+    }
+
     pub fn text_input_data(&self) -> Option<&TextInputData> {
         match &self.special_data {
             SpecialElementData::TextInput(data) => Some(data),

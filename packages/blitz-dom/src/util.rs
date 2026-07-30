@@ -359,6 +359,16 @@ mod svg_tests {
     }
 
     #[test]
+    fn root_style_dimensions_override_attributes() {
+        let src = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10" style="width: 400px; height: 50px" viewBox="0 0 200 100"></svg>"#;
+        let svg = parse_svg_image(src).unwrap();
+        assert_eq!(svg.intrinsic_width(), Some(400.0));
+        assert_eq!(svg.intrinsic_height(), Some(50.0));
+        assert_eq!(svg.tree.size().width(), 400.0);
+        assert_eq!(svg.tree.size().height(), 50.0);
+    }
+
+    #[test]
     fn percentage_dimensions_are_not_intrinsic() {
         let src = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="50%" viewBox="0 0 200 100"></svg>"#;
         let svg = parse_svg_image(src).unwrap();
@@ -380,6 +390,22 @@ mod svg_tests {
         let svg = parse_svg_image(src).unwrap();
         assert_eq!(svg.intrinsic_width(), None);
         assert_eq!(svg.intrinsic_height(), None);
+    }
+
+    #[test]
+    fn zero_dimension_survives_usvg_invalid_size() {
+        let src = br#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="20"></svg>"#;
+        let svg = parse_svg_image(src).unwrap();
+        assert_eq!(svg.intrinsic_width(), Some(0.0));
+        assert_eq!(svg.intrinsic_height(), Some(20.0));
+    }
+
+    #[test]
+    fn negative_dimension_is_not_intrinsic() {
+        let src = br#"<svg xmlns="http://www.w3.org/2000/svg" width="-5" height="20"></svg>"#;
+        let svg = parse_svg_image(src).unwrap();
+        assert_eq!(svg.intrinsic_width(), None);
+        assert_eq!(svg.intrinsic_height(), Some(20.0));
     }
 }
 

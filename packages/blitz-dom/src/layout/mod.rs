@@ -419,12 +419,18 @@ impl LayoutPassState<'_> {
                             ImageData::Svg(svg) => {
                                 let mut width = svg.intrinsic_width();
                                 let mut height = svg.intrinsic_height();
+                                let viewbox_ratio = svg.viewbox_aspect_ratio();
+                                let ratio = match (width, height, viewbox_ratio) {
+                                    (Some(width), Some(height), _) => Some(width / height),
+                                    (_, _, Some(ratio)) => Some(ratio),
+                                    _ => None,
+                                };
                                 // An SVG with no declared dimensions and no viewBox has no
                                 // intrinsic dimensions per CSS, but usvg still resolves a
                                 // concrete size; use it in place of the default object size.
                                 if width.is_none()
                                     && height.is_none()
-                                    && svg.viewbox_aspect_ratio().is_none()
+                                    && viewbox_ratio.is_none()
                                 {
                                     let size = svg.tree.size();
                                     width = Some(size.width());
@@ -434,7 +440,7 @@ impl LayoutPassState<'_> {
                                     IntrinsicSizes {
                                         width,
                                         height,
-                                        ratio: Some(svg.aspect_ratio()),
+                                        ratio,
                                     },
                                     DEFAULT_OBJECT_SIZE,
                                 )
