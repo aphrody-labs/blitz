@@ -48,6 +48,9 @@ impl From<StyloBackgroundClip> for BoxModelBox {
             StyloBackgroundClip::BorderBox => Self::BorderBox,
             StyloBackgroundClip::PaddingBox => Self::PaddingBox,
             StyloBackgroundClip::ContentBox => Self::ContentBox,
+            // clip:text layers are skipped before conversion; this is an
+            // unreachable fallback for exhaustive matching.
+            StyloBackgroundClip::Text => Self::PaddingBox,
 
             // TODO: support BorderArea
             StyloBackgroundClip::BorderArea => Self::BorderBox,
@@ -139,14 +142,16 @@ impl ElementCx<'_, '_> {
         let layer_count = bg_styles.background_image.0.len();
 
         // The background color is clipped by the clip of the last layer in the list
-        let background_clip: BoxModelBox =
-            (*get_cyclic(&bg_styles.background_clip.0, layer_count - 1)).into();
-        let background_clip_path = self.box_path(background_clip);
-
-        // Draw background color (if any)
-        self.draw_solid_bg(scene, &background_clip_path);
+        let last_clip = *get_cyclic(&bg_styles.background_clip.0, layer_count - 1);
+        if last_clip != StyloBackgroundClip::Text {
+            let background_clip_path = self.box_path(last_clip.into());
+            self.draw_solid_bg(scene, &background_clip_path);
+        }
 
         for idx in (0..layer_count).rev() {
+            if *get_cyclic(&bg_styles.background_clip.0, idx) == StyloBackgroundClip::Text {
+                continue;
+            }
             let layer = ImageLayerStyles::from_background(bg_styles, image_data, idx);
             if layer_paints_nothing(&layer) {
                 continue;
