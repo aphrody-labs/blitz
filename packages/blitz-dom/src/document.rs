@@ -2667,6 +2667,15 @@ impl BaseDocument {
         &self.viewport
     }
 
+    /// Used grid track sizes for a grid container laid out in the
+    /// last resolve_layout pass; None for non-grid / stale ids.
+    pub fn grid_track_info(&self, node_id: NodeId) -> Option<&taffy::DetailedGridInfo<Atom>> {
+        match &self.get_node(node_id)?.element_data()?.detailed_layout_info {
+            taffy::DetailedLayoutInfo::Grid(info) => Some(info),
+            _ => None,
+        }
+    }
+
     pub fn viewport_mut(&mut self) -> ViewportMut<'_> {
         ViewportMut::new(self)
     }

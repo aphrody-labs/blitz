@@ -449,6 +449,8 @@ impl BaseDocument {
     /// TODO: update taffy to use an associated type instead of slab key
     /// TODO: update taffy to support traited styles so we don't even need to rely on taffy for storage
     pub fn resolve_layout(&mut self) {
+        // Track info is layout-pass-scoped: stale entries would pin
+        // recycled slab ids to a different element's tracks.
         let size = self.stylist.device().au_viewport_size();
 
         let available_space = taffy::Size {
