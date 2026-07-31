@@ -805,6 +805,20 @@ impl LayoutPassState<'_> {
             breaker.finish();
         }
 
+        // -webkit-box + orient:vertical + line-clamp:N was rewritten to
+        // flow-root at computed-value time; the stylo flag says clamp here.
+        let clamp_lines = self.nodes[node_id].primary_styles().and_then(|s| {
+            use style::computed_value_flags::ComputedValueFlags;
+            if !s.flags.contains(ComputedValueFlags::IS_WEBKIT_LINE_CLAMP_CONTEXT) {
+                return None;
+            }
+            let clamp = s.get_box().clone__webkit_line_clamp();
+            (!clamp.is_none()).then(|| clamp.0.max(1) as usize)
+        });
+        if let Some(max_lines) = clamp_lines {
+            inline_layout.layout.truncate_lines(max_lines);
+        }
+
         // Propagate the height consumed by floats placed within this container to the
         // enclosing block context (so that the BFC root can contain them)
         #[cfg(feature = "floats")]

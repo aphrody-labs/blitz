@@ -1322,6 +1322,11 @@ impl Node {
                     )
                 {
                     taffy::Display::FlowRoot
+                } else if display.inside() == DisplayInside::WebkitBox {
+                    // Stylo_taffy's fallback maps -webkit-box to Block;
+                    // emulate the legacy box as a flex container (the main axis
+                    // comes from -webkit-box-orient, see FlexContainerStyle).
+                    taffy::Display::Flex
                 } else {
                     stylo_taffy::convert::display(display)
                 }

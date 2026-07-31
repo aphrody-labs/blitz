@@ -811,9 +811,69 @@ impl taffy::LayoutBlockContainer for LayoutPassState<'_> {
     }
 }
 
+/// A flex container style whose `flex-direction` can be overridden. Emulates the
+/// legacy `display: -webkit-box`, whose main axis comes from `-webkit-box-orient` rather than
+/// `flex-direction` (stylo_taffy has no -webkit-box mapping). Everything else delegates.
+pub(crate) struct FlexContainerStyle<'a> {
+    style: TaffyStyloStyle<ComputedStyleRef<'a>>,
+    direction_override: Option<FlexDirection>,
+}
+
+macro_rules! delegate_style {
+    ($trait:path { $($name:ident -> $ret:ty),* $(,)? }) => {
+        $(
+            #[inline]
+            fn $name(&self) -> $ret {
+                <TaffyStyloStyle<ComputedStyleRef<'_>> as $trait>::$name(&self.style)
+            }
+        )*
+    };
+}
+
+impl taffy::CoreStyle for FlexContainerStyle<'_> {
+    type CustomIdent = Atom;
+    delegate_style!(taffy::CoreStyle {
+        box_generation_mode -> taffy::BoxGenerationMode,
+        is_block -> bool,
+        is_compressible_replaced -> bool,
+        is_replaced -> bool,
+        box_sizing -> taffy::BoxSizing,
+        direction -> taffy::Direction,
+        overflow -> taffy::Point<taffy::Overflow>,
+        scrollbar_width -> f32,
+        position -> taffy::Position,
+        inset -> taffy::Rect<taffy::LengthPercentageAuto>,
+        is_containing_block -> taffy::ContainingBlockClaims,
+        size -> taffy::Size<taffy::Dimension>,
+        min_size -> taffy::Size<taffy::LengthPercentageAuto>,
+        max_size -> taffy::Size<taffy::LengthPercentageAuto>,
+        aspect_ratio -> Option<f32>,
+        margin -> taffy::Rect<taffy::LengthPercentageAuto>,
+        padding -> taffy::Rect<taffy::LengthPercentage>,
+        border -> taffy::Rect<taffy::LengthPercentage>,
+        contain -> taffy::Contain,
+    });
+}
+
+impl taffy::FlexboxContainerStyle for FlexContainerStyle<'_> {
+    #[inline]
+    fn flex_direction(&self) -> FlexDirection {
+        self.direction_override
+            .unwrap_or_else(|| taffy::FlexboxContainerStyle::flex_direction(&self.style))
+    }
+    delegate_style!(taffy::FlexboxContainerStyle {
+        flex_wrap -> taffy::FlexWrap,
+        flex_line_count -> u16,
+        gap -> taffy::Size<taffy::LengthPercentage>,
+        align_content -> taffy::AlignContent,
+        align_items -> taffy::AlignItems,
+        justify_content -> taffy::JustifyContent,
+    });
+}
+
 impl taffy::LayoutFlexboxContainer for LayoutPassState<'_> {
     type FlexboxContainerStyle<'a>
-        = TaffyStyloStyle<ComputedStyleRef<'a>>
+        = FlexContainerStyle<'a>
     where
         Self: 'a;
 
@@ -823,7 +883,23 @@ impl taffy::LayoutFlexboxContainer for LayoutPassState<'_> {
         Self: 'a;
 
     fn get_flexbox_container_style(&self, node_id: NodeId) -> Self::FlexboxContainerStyle<'_> {
-        self.get_core_container_style(node_id)
+        let style = self.get_core_container_style(node_id);
+        // -webkit-box lays out as a flex container whose main axis is
+        // `-webkit-box-orient` (see `Node::taffy_display`).
+        let direction_override = (style.style.clone_display().inside()
+            == style::values::specified::box_::DisplayInside::WebkitBox)
+            .then(|| {
+                use style::properties::generated::longhands::_moz_box_orient::computed_value::T as BoxOrient;
+                if style.style.get_xul().clone__moz_box_orient() == BoxOrient::Vertical {
+                    FlexDirection::Column
+                } else {
+                    FlexDirection::Row
+                }
+            });
+        FlexContainerStyle {
+            style,
+            direction_override,
+        }
     }
 
     fn get_flexbox_child_style(&self, child_node_id: NodeId) -> Self::FlexboxItemStyle<'_> {
