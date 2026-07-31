@@ -295,7 +295,22 @@ impl DocumentMutator<'_> {
             let node = &mut self.doc.nodes[node_id];
             if let Some(mut data) = node.try_stylo_element_data_mut().and_then(|s| s.get_mut()) {
                 data.hint |= RestyleHint::restyle_subtree();
-                data.damage.insert(ALL_DAMAGE);
+                // Do NOT eagerly stamp ALL_DAMAGE here.
+                // The restyle hint above makes the next resolve
+
+                // recascade this subtree, and stylo's
+                // compute_style_difference then computes the REAL
+
+                // per-node damage (REPAINT vs RELAYOUT vs box
+                // rebuild) from old-vs-new computed values. Eagerly
+                // OR-ing ALL_DAMAGE drowned that out, so a render-
+                // neutral attribute write (data-*, aria-* that
+                // matches no layout selector) looked like full
+                // layout damage, defeating damage-rect partial
+                // frames. The upstream TODO here asked for
+                // exactly this. Correctness rests on the cascade
+                // always running for a hinted node, which it does
+                // (mark_ancestors_dirty below drives the traversal).
             }
             node.mark_damaged();
 

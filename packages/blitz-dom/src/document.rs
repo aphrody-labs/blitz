@@ -264,6 +264,9 @@ pub struct BaseDocument {
     /// How deeply this document is nested within other documents
     /// (0 for a root document). Used to limit `<iframe>` nesting depth.
     pub(crate) subdocument_depth: usize,
+    /// Cross-resolve accumulation of per-node damage,
+    /// classified paint-only vs layout-class. See DamageSummary.
+    pub(crate) damage_summary: DamageSummary,
 
     // Events
     pub(crate) tx: Sender<DocumentEvent>,
@@ -541,6 +544,7 @@ impl BaseDocument {
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
             subdocument_depth: config.subdocument_depth,
+            damage_summary: DamageSummary::default(),
             devtool_settings: DevtoolSettings::default(),
             counters: Default::default(),
             counters_seen: false,
@@ -4286,4 +4290,71 @@ fn kitesurf_mip_dims(header_w: u32, header_h: u32, hint_w: u32, hint_h: u32, cei
         h = (h / 2).max(1);
     }
     (w, h)
+}
+
+/// Cross-resolve damage summary. Stylo + the mutators set
+/// per-node RestyleDamage but non-incremental builds never consume
+/// it: this folds each resolve's damage into two capped node lists
+/// (paint-only vs layout-class) so the embedder can decide whether a
+/// frame's changes are safe to rasterize as a partial clip.
+#[derive(Debug, Default, Clone)]
+pub struct DamageSummary {
+    /// Nodes whose damage exceeded REPAINT (layout may have moved).
+    pub layout_nodes: Vec<NodeId>,
+    /// Nodes whose damage was repaint-only (box unchanged).
+    pub paint_nodes: Vec<NodeId>,
+    /// The respective list hit DAMAGE_SUMMARY_CAP; treat as "damage
+    /// everywhere" (the embedder should fall back to a full frame).
+    pub layout_overflow: bool,
+    pub paint_overflow: bool,
+}
+
+/// Cap on each summary list; past it the overflow flag trips. Keeps
+/// the walk + the embedder's per-node rect reads O(small).
+const DAMAGE_SUMMARY_CAP: usize = 64;
+
+impl BaseDocument {
+    /// Fold the current per-node damage into `damage_summary`.
+    /// Runs every `resolve` (see resolve.rs) before damage is
+    /// cleared; accumulates until `take_damage_summary`.
+    pub(crate) fn accumulate_damage_summary(&mut self) {
+        use crate::node::NodeFlags;
+        use style::selector_parser::RestyleDamage;
+        let repaint_bits = RestyleDamage::REPAINT.bits();
+        let mut found: Vec<(NodeId, bool)> = Vec::new();
+        for (id, node) in self.nodes.iter() {
+            if !node.flags.contains(NodeFlags::IS_IN_DOCUMENT) {
+                continue;
+            }
+            let Some(damage) = node.damage() else { continue };
+            if damage.is_empty() {
+                continue;
+            }
+            let layout_class = (damage.bits() & !repaint_bits) != 0;
+            found.push((id, layout_class));
+        }
+        let s = &mut self.damage_summary;
+        for (id, layout_class) in found {
+            let (list, overflow) = if layout_class {
+                (&mut s.layout_nodes, &mut s.layout_overflow)
+            } else {
+                (&mut s.paint_nodes, &mut s.paint_overflow)
+            };
+            if list.contains(&id) {
+                continue;
+            }
+            if list.len() >= DAMAGE_SUMMARY_CAP {
+                *overflow = true;
+            } else {
+                list.push(id);
+            }
+        }
+    }
+
+    /// Take (and reset) the accumulated damage summary. The caller
+    /// owns interpretation; an empty summary means "no style- or
+    /// structure-driven render change since the last take".
+    pub fn take_damage_summary(&mut self) -> DamageSummary {
+        std::mem::take(&mut self.damage_summary)
+    }
 }

@@ -95,6 +95,13 @@ impl BaseDocument {
         // Needs computed styles; box construction consumes the side tables.
         self.resolve_counters();
 
+        // Fold this resolve's per-node damage (mutations +
+        // restyle diffs) into the cross-resolve summary BEFORE anyone
+        // consumes or clears it (and before non-incremental mode marks
+        // everything damaged). Cheap slab walk; consumed by the
+        // embedder via take_damage_summary (partial-frame gating).
+        self.accumulate_damage_summary();
+
         // Non-incremental mode is "every node is damaged every frame": mark the
         // whole tree and let the same damage pipeline reconstruct and relayout
         // everything.
