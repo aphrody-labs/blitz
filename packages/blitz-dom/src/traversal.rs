@@ -415,6 +415,17 @@ impl BaseDocument {
         let parent_id = chain_a[common_depth - 1];
         let parent = &self.nodes[parent_id];
 
+        // Pseudo-element nodes are not in parent.children, so the sibling
+        // scan below would never find them (and fell through to Equal /
+        // whichever real sibling it met first). Box order: ::before
+        // precedes all of the parent's children, ::after follows them.
+        if parent.before() == Some(divergent_a) || parent.after() == Some(divergent_b) {
+            return Ordering::Less;
+        }
+        if parent.after() == Some(divergent_a) || parent.before() == Some(divergent_b) {
+            return Ordering::Greater;
+        }
+
         for &child_id in &parent.children {
             if child_id == divergent_a {
                 return Ordering::Less;
