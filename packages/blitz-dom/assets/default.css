@@ -1152,3 +1152,12 @@ slot {
         background-color: transparent;
     }
 }
+
+/* SVG2 render.html#OverflowAndClipProperties: the UA sheet
+   establishes overflow:hidden on svg viewport elements. The paint-side
+   replaced-svg clip honours computed overflow, so an author
+   overflow:visible re-enables painting outside the viewport. `*|svg`
+   because this sheet's default @namespace is XHTML. */
+*|svg {
+    overflow: hidden;
+}

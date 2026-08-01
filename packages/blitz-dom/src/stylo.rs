@@ -1328,6 +1328,18 @@ impl<'a> TElement for BlitzNode<'a> {
                 }
             }
 
+            // SVG font-size presentation attribute (user units map to px).
+            // Keeps attr-styled svg text correct now that the serializer
+            // stamps computed font-size onto text elements: the attr feeds
+            // the cascade at pres-hint level, so the computed value has it.
+            if *name == local_name!("font-size") && *elem.name.ns == *"http://www.w3.org/2000/svg"
+            {
+                if let Some(size) = parse_svg_size_attr(value) {
+                    use style::values::specified::FontSize;
+                    push_style(PropertyDeclaration::FontSize(FontSize::Length(size)));
+                }
+            }
+
             if *name == local_name!("bgcolor") {
                 use style::values::specified::Color;
                 if let Some((r, g, b, a)) = parse_color_attr(value) {

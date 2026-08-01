@@ -191,7 +191,33 @@ impl Node {
                     writer.push('"');
                 }
 
+                // Svg text reaches usvg as a serialized snapshot, so
+                // CSS-driven font styling must be baked as presentation attrs.
+                // Computed values already include font attrs via the pres-hint
+                // path, so stamping supersedes the originals losslessly.
+                // font-size only: it is the one font property whose CSS
+                // value changes svg text geometry, and usvg resolves the
+                // rest acceptably on its own. Stamping family/weight/style
+                // too fed usvg a CSS-serialized family list it resolved
+                // differently from parley (Ahem became no glyphs at all,
+                // blanking a clipPath built from <text>).
+                let font_stamps: Option<[(&str, String); 1]> = if opts.resolve_current_color
+                    && matches!(&*data.name.local, "text" | "tspan" | "textPath")
+                {
+                    self.primary_styles().map(|style| {
+                        [(
+                            "font-size",
+                            format!("{}", style.clone_font_size().used_size().px()),
+                        )]
+                    })
+                } else {
+                    None
+                };
+
                 for attr in data.attrs() {
+                    if font_stamps.is_some() && &*attr.name.local == "font-size" {
+                        continue;
+                    }
                     writer.push(' ');
                     write_attr_name(&attr.name, writer);
                     writer.push_str("=\"");
@@ -205,6 +231,15 @@ impl Node {
                         encode_quoted_attribute_to_string(&attr.value, writer);
                     }
                     writer.push('"');
+                }
+                if let Some(stamps) = &font_stamps {
+                    for (name, value) in stamps {
+                        writer.push(' ');
+                        writer.push_str(name);
+                        writer.push_str("=\"");
+                        encode_quoted_attribute_to_string(value, writer);
+                        writer.push('"');
+                    }
                 }
                 if !has_children {
                     writer.push_str(" /");

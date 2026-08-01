@@ -41,8 +41,226 @@ use super::{
 
 const DUMMY_NAME: QualName = qual_name!("div", html);
 
-// Elements whose fragment ref pulls another element INTO the render tree.
-// `<a href="#x">` is a link, not a resource ref, so it must not hoist.
+// Colors stamped onto serialized SVG must be sRGB-legacy rgb()/rgba():
+// usvg's svgtypes parser rejects modern forms like oklch() / color().
+#[cfg(feature = "svg")]
+fn srgb_color_attr(c: &style::color::AbsoluteColor) -> String {
+    use crate::util::ToColorColor as _;
+    let [r, g, b, a] = c.as_color_color().components;
+    let (r, g, b) = (
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    );
+    // Clamp alpha too: an out-of-range (or NaN) value formats into an
+    // rgba() svgtypes rejects, which silently reverts the paint to black.
+    let a = if a.is_nan() { 1.0 } else { a.clamp(0.0, 1.0) };
+    if a >= 1.0 {
+        format!("rgb({r},{g},{b})")
+    } else {
+        format!("rgba({r},{g},{b},{a})")
+    }
+}
+
+// Presentation attributes usvg reads as paint. Their values go through the
+// CSS parser here, so `var()` and modern colour syntax resolve.
+#[cfg(feature = "svg")]
+const SVG_COLOR_ATTRS: [&str; 5] = [
+    "fill",
+    "stroke",
+    "stop-color",
+    "flood-color",
+    "lighting-color",
+];
+
+/// Does this attribute value need the CSS engine, i.e. is it something
+/// svgtypes will reject or mis-parse on its own?
+///
+/// Property-aware: paints care about CSS-only colour syntax, lengths care
+/// about CSS-only units. `font-size="0.6875rem"` carries no function call,
+/// and svgtypes reads it as the bare number 0.6875 (the very case this
+/// path exists for), so the length arm keys off the unit instead.
+#[cfg(feature = "svg")]
+fn needs_css_resolution(property: &str, value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    if v.contains("var(") {
+        return true;
+    }
+    if property == "font-size" {
+        // Strip the number off the front; whatever trails is the unit.
+        let unit = v.trim_start_matches(|c: char| {
+            c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c.is_whitespace()
+        });
+        return matches!(
+            unit.trim().to_ascii_lowercase().as_str(),
+            "rem" | "em" | "ex" | "ch" | "vw" | "vh" | "vmin" | "vmax" | "cap" | "ic" | "lh" | "rlh"
+        ) || v.contains("calc(")
+            || v.contains("clamp(")
+            || v.contains("min(")
+            || v.contains("max(");
+    }
+    // Paint keywords and references are already what usvg wants.
+    if v == "none" || v == "currentColor" || v.starts_with("url(") {
+        return false;
+    }
+    v.contains("color-mix(")
+        || v.contains("light-dark(")
+        || v.contains("oklch(")
+        || v.contains("oklab(")
+        || v.contains("lch(")
+        || v.contains("lab(")
+        || v.contains("color(")
+}
+
+/// Compute one declaration against the `<svg>` element's own style and
+/// hand back a value usvg accepts.
+///
+/// Inner SVG elements are never cascaded (they have no boxes), so a
+/// `fill="var(--token)"` reached usvg verbatim: svgtypes rejected it and the
+/// paint silently reverted to black: or, for `stroke`, vanished. Running the
+/// value through the real cascade with the svg element as parent resolves
+/// custom properties, color-mix(), light-dark() and rem units alike.
+#[cfg(feature = "svg")]
+fn resolve_css_attr_value(
+    doc: &BaseDocument,
+    parent_style: &style::properties::ComputedValues,
+    property: &str,
+    value: &str,
+) -> Option<String> {
+    use style::properties::{parse_style_attribute, PropertyDeclarationBlock};
+    use style::shared_lock::StylesheetGuards;
+    use style::stylesheets::CssRuleType;
+
+    let block: PropertyDeclarationBlock = parse_style_attribute(
+        &format!("{property}:{value}"),
+        &doc.url.url_extra_data(),
+        None,
+        style::context::QuirksMode::NoQuirks,
+        CssRuleType::Style,
+    );
+    // An unparseable value leaves the block empty; computing it would answer
+    // with the inherited colour, which is worse than leaving the attr alone.
+    if block.declarations().is_empty() {
+        return None;
+    }
+    let locked = style::servo_arc::Arc::new(doc.guard.wrap(block));
+    let read_guard = doc.guard.read();
+    let guards = StylesheetGuards::same(&read_guard);
+    let computed = doc
+        .stylist
+        .compute_for_declarations::<&Node>(&guards, parent_style, locked);
+    match property {
+        "font-size" => Some(format!("{}", computed.clone_font_size().used_size().px())),
+        // Paints go through the paint grammar, not `color`: a var() that
+        // expands to `none` or `url(#grad)` is invalid for `color` and would
+        // compute to the inherited colour, stamping a solid fill where the
+        // author asked for no fill or a gradient.
+
+        // `stroke` is a gecko-only longhand in this build, so it borrows
+        // `fill`'s grammar: both are <paint>, so the parse is identical.
+        "fill" => paint_attr(&computed.clone_fill().kind, &computed),
+        _ => Some(srgb_color_attr(&computed.clone_color())),
+    }
+}
+
+/// Serialize a computed SVG paint back into an attribute usvg accepts.
+#[cfg(feature = "svg")]
+fn paint_attr(
+    kind: &style::values::generics::svg::SVGPaintKind<
+        style::values::computed::Color,
+        style::values::computed::url::ComputedUrl,
+    >,
+    computed: &style::properties::ComputedValues,
+) -> Option<String> {
+    use style::values::generics::color::GenericColor;
+    use style::values::generics::svg::SVGPaintKind;
+    use style_traits::ToCss as _;
+    match kind {
+        SVGPaintKind::None => Some("none".to_string()),
+        SVGPaintKind::ContextFill => None,
+        SVGPaintKind::ContextStroke => None,
+        // A paint-server ref keeps its url(): usvg resolves it against the
+        // ids in this same serialized subtree, so hand back the fragment:
+        // the computed url is absolute and svgtypes wants `url(#id)`.
+        SVGPaintKind::PaintServer(url) => {
+            let css = url.to_css_string();
+            let inner = css
+                .trim_start_matches("url(")
+                .trim_end_matches(')')
+                .trim_matches('"')
+                .trim_matches('\'');
+            inner
+                .rfind('#')
+                .map(|at| format!("url({})", &inner[at..]))
+        }
+        SVGPaintKind::Color(GenericColor::CurrentColor) => {
+            Some(srgb_color_attr(&computed.clone_color()))
+        }
+        SVGPaintKind::Color(GenericColor::Absolute(abs)) => Some(srgb_color_attr(abs)),
+        SVGPaintKind::Color(_) => None,
+    }
+}
+
+/// Rewrite `attr="<css value>"` occurrences in the serialized subtree.
+#[cfg(feature = "svg")]
+fn resolve_attr_occurrences(
+    doc: &BaseDocument,
+    parent_style: &style::properties::ComputedValues,
+    html: &mut String,
+    attr: &str,
+    property: &str,
+) {
+    let needle = format!(" {attr}=\"");
+    let mut at = 0usize;
+    while let Some(pos) = html[at..].find(&needle) {
+        let start = at + pos + needle.len();
+        let Some(len) = html[start..].find('"') else { break };
+        let value = html[start..start + len].to_string();
+        if needs_css_resolution(property, &value) {
+            if let Some(resolved) = resolve_css_attr_value(doc, parent_style, property, &value) {
+                html.replace_range(start..start + len, &resolved);
+                at = start + resolved.len();
+                continue;
+            }
+        }
+        at = start + len;
+    }
+}
+
+/// Resolve CSS-era values in a serialized SVG subtree before usvg sees it.
+#[cfg(feature = "svg")]
+fn resolve_css_values_in_svg(doc: &BaseDocument, svg_id: NodeId, html: &mut String) {
+    if !html.contains("var(")
+        && !html.contains("color-mix(")
+        && !html.contains("light-dark(")
+        && !html.contains("font-size=")
+        && !html.contains("oklch(")
+        && !html.contains("oklab(")
+        && !html.contains("lch(")
+        && !html.contains("lab(")
+        && !html.contains("color(")
+    {
+        return;
+    }
+    let Some(parent_style) = doc.get_node(svg_id).and_then(|n| n.primary_styles()) else {
+        return;
+    };
+    for attr in SVG_COLOR_ATTRS {
+        // fill/stroke resolve through the paint grammar (both parse as
+        // <paint>); the rest are plain colours, so `color` fits them.
+        let property = if attr == "fill" || attr == "stroke" { "fill" } else { "color" };
+        resolve_attr_occurrences(doc, &parent_style, html, attr, property);
+    }
+    // font-size carries CSS units svgtypes doesn't know (rem above all), so
+    // it rides the same path and lands as a plain px number.
+    resolve_attr_occurrences(doc, &parent_style, html, "font-size", "font-size");
+}
+
+// Elements whose fragment ref pulls another element into the render tree.
+// `<a href="#x">` is a link, not a resource ref: it must not hoist.
 #[cfg(feature = "svg")]
 const FRAGMENT_REF_ELEMENTS: [&str; 4] = ["<use", "<image", "<feImage", "<feimage"];
 
@@ -622,12 +840,11 @@ fn collect_layout_children_with_wrap(
             // construct time) leaves currentColor verbatim, and usvg then
             // defaults it to black. A root color attr is usvg's inheritance
             // fallback.
-            use style_traits::values::ToCss as _;
             let root_color = doc
                 .get_node(container_node_id)
                 .and_then(|n| n.primary_styles())
                 .map(|s| s.clone_color())
-                .map(|c| c.to_css_string());
+                .map(|c| srgb_color_attr(&c));
             // Scope the "already has color" check to the opening <svg ...> tag;
             // a descendant color="..." must not suppress the root stamp.
             let root_tag_has_color = outer_html
@@ -641,12 +858,51 @@ fn collect_layout_children_with_wrap(
                 }
             }
 
-            // Browsers resolve `<use href="#id">` against the WHOLE
+            // Icon systems color glyphs via CSS (`fill: currentcolor`
+            // on the svg), which usvg never sees: it only reads attributes.
+
+            // Stamp the computed fill on the root so paths without their own
+            // fill attr inherit it, matching CSS inheritance.
+            let root_fill = doc
+                .get_node(container_node_id)
+                .and_then(|n| n.primary_styles())
+                .and_then(|s| {
+                    use style::values::generics::color::GenericColor;
+                    use style::values::generics::svg::SVGPaintKind;
+                    match &s.clone_fill().kind {
+                        SVGPaintKind::None => Some("none".to_string()),
+                        // svgtypes matches "currentColor" case-sensitively;
+                        // the root color stamp above gives it a value.
+                        SVGPaintKind::Color(GenericColor::CurrentColor) => {
+                            Some("currentColor".to_string())
+                        }
+                        SVGPaintKind::Color(GenericColor::Absolute(abs)) => {
+                            Some(srgb_color_attr(abs))
+                        }
+                        _ => None,
+                    }
+                });
+            let root_tag_has_fill = outer_html
+                .split_once('>')
+                .map(|(open_tag, _)| open_tag.contains(" fill=\""))
+                .unwrap_or(false);
+            if let Some(fill) = root_fill {
+                if !root_tag_has_fill {
+                    outer_html =
+                        outer_html.replacen("<svg", &format!("<svg fill=\"{fill}\""), 1);
+                }
+            }
+
+            // Browsers resolve `<use href="#id">` against the whole
             // document; usvg only sees this one serialized element.
 
             // Inline externally-defined targets (sprite-sheet <symbol>s etc.)
             // as a <defs> block so usvg can resolve them.
             inline_external_fragment_refs(doc, &mut outer_html);
+
+            // Inner SVG elements never cascade, so CSS-era attribute values
+            // (var(), color-mix(), rem) would reach usvg verbatim.
+            resolve_css_values_in_svg(doc, container_node_id, &mut outer_html);
 
             // Remove contruction damage from subtree
             doc.iter_subtree_mut(container_node_id, |id: NodeId, doc: &mut BaseDocument| {
