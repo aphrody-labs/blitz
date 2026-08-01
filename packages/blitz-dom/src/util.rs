@@ -44,11 +44,115 @@ use std::sync::{Arc, LazyLock};
 #[cfg(feature = "svg")]
 use usvg::fontdb;
 #[cfg(feature = "svg")]
-pub(crate) static FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-    Arc::new(db)
-});
+pub(crate) static FONT_DB: LazyLock<std::sync::RwLock<Arc<fontdb::Database>>> =
+    LazyLock::new(|| {
+        let mut db = fontdb::Database::new();
+        // No-op under wasm (no filesystem); the embedder pushes faces in
+        // through register_svg_font instead.
+        db.load_system_fonts();
+        std::sync::RwLock::new(Arc::new(db))
+    });
+
+/// Parsed trees keyed by the exact source they were built from. Icon systems
+/// repeat one `<svg>` per use site (136 inline svgs, 47 distinct on one
+/// heavy page), and
+/// box construction re-parses each from scratch.
+///
+/// Bounded because a mutating `<svg>` re-serializes on every write,
+/// so an animated one would otherwise add an entry per frame forever.
+#[cfg(feature = "svg")]
+static SVG_TREE_CACHE: LazyLock<
+    std::sync::RwLock<std::collections::HashMap<Box<str>, crate::node::SvgImageData>>,
+> = LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+#[cfg(feature = "svg")]
+const SVG_TREE_CACHE_CAP: usize = 512;
+
+/// Bumped by every clear, so a parse that overlapped one can tell.
+#[cfg(feature = "svg")]
+static SVG_TREE_CACHE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drop every cached tree. Parsing resolves text against `FONT_DB` and the
+/// default family, so a face arriving later invalidates anything already built.
+#[cfg(feature = "svg")]
+pub fn clear_svg_tree_cache() {
+    // Bump before the clear, never after: a parse in flight checks this on the
+    // way in and would otherwise repopulate the cache with a stale tree.
+    SVG_TREE_CACHE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut cache) = SVG_TREE_CACHE.write() {
+        cache.clear();
+    }
+}
+
+/// Which generic family a registered SVG font should answer for.
+#[cfg(feature = "svg")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SvgGenericSlot {
+    SansSerif,
+    Serif,
+    Monospace,
+}
+
+/// Register a font face for SVG `<text>` shaping, optionally pointing a
+/// generic family (and usvg's default family) at it.
+///
+/// usvg converts text to paths through its own fontdb, which on a
+/// system-font-less target (wasm) stays empty: every `<text>` was silently
+/// dropped, so SVG charts painted their series and no labels. Embedders
+/// that ship their own faces call this with the same bytes they hand the
+/// text stack: `data` is shared, not copied.
+#[cfg(feature = "svg")]
+pub fn register_svg_font(
+    data: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    slot: Option<SvgGenericSlot>,
+) {
+    let Ok(mut db_slot) = FONT_DB.write() else {
+        return;
+    };
+    let mut db = (**db_slot).clone();
+    let ids = db.load_font_source(fontdb::Source::Binary(data));
+    // Generic mapping reads the family name out of the face itself, so it
+    // can't drift from whatever the embedder actually loaded.
+    let family = ids
+        .first()
+        .and_then(|id| db.face(*id))
+        .and_then(|face| face.families.first().map(|(name, _)| name.clone()));
+    if let (Some(slot), Some(family)) = (slot, family) {
+        match slot {
+            SvgGenericSlot::SansSerif => {
+                db.set_sans_serif_family(family.clone());
+                // usvg's font selector appends fontdb's serif generic as its
+                // last resort, so an unregistered named family such as
+                // `Arial` resolves to nothing and the text is dropped.
+
+                // Point every generic at the sans face as a floor; a later
+                // register_svg_font for the serif/monospace slots overwrites
+                // its own entry with the real face.
+                db.set_serif_family(family.clone());
+                db.set_monospace_family(family.clone());
+                db.set_cursive_family(family.clone());
+                db.set_fantasy_family(family.clone());
+                // usvg falls back to Options::font_family for text with no
+                // usable family; point that at the sans face too.
+                if let Ok(mut default) = SVG_DEFAULT_FAMILY.write() {
+                    *default = Some(family);
+                }
+            }
+            SvgGenericSlot::Serif => db.set_serif_family(family),
+            SvgGenericSlot::Monospace => db.set_monospace_family(family),
+        }
+    }
+    *db_slot = Arc::new(db);
+    // After the swap, not before: a tree parsed in between would be built
+    // against the new db and must survive, one parsed before must not.
+    clear_svg_tree_cache();
+}
+
+/// Family usvg uses when the text names none we know; set by
+/// `register_svg_font` for the sans-serif slot.
+#[cfg(feature = "svg")]
+pub(crate) static SVG_DEFAULT_FAMILY: LazyLock<std::sync::RwLock<Option<String>>> =
+    LazyLock::new(|| std::sync::RwLock::new(None));
 
 /// Which kind of CSS image layer list (`background-image` or `mask-image`) to
 /// flush from style to dedicated storage on the node.
@@ -297,10 +401,47 @@ pub fn apply_svg_target_fragment(source: &str, fragment: &str) -> Option<String>
 }
 
 pub fn parse_svg_image(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
-    let options = usvg::Options {
-        fontdb: Arc::clone(&*FONT_DB),
+    // Cheap to hand back: SvgImageData is an Arc<Tree> plus three scalars.
+    let cache_key: Option<&str> = std::str::from_utf8(source).ok();
+    if let Some(key) = cache_key {
+        if let Ok(cache) = SVG_TREE_CACHE.read() {
+            if let Some(hit) = cache.get(key) {
+                return Ok(hit.clone());
+            }
+        }
+    }
+
+    // Read before the fonts are: a registration landing mid-parse invalidates
+    // what comes out of it, and wasm's single thread is not the only embedder.
+    let generation = SVG_TREE_CACHE_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    let parsed = parse_svg_image_uncached(source)?;
+
+    if let Some(key) = cache_key {
+        if let Ok(mut cache) = SVG_TREE_CACHE.write() {
+            if generation == SVG_TREE_CACHE_GEN.load(std::sync::atomic::Ordering::SeqCst) {
+                if cache.len() >= SVG_TREE_CACHE_CAP {
+                    cache.clear();
+                }
+                cache.insert(key.into(), parsed.clone());
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn parse_svg_image_uncached(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
+    let mut options = usvg::Options {
+        fontdb: match FONT_DB.read() {
+            Ok(db) => Arc::clone(&*db),
+            Err(_) => Arc::new(fontdb::Database::new()),
+        },
         ..Default::default()
     };
+    if let Some(family) = SVG_DEFAULT_FAMILY.read().ok().and_then(|f| f.clone()) {
+        options.font_family = family;
+    }
+
     crate::node::SvgImageData::from_data(source, &options)
 }
 
