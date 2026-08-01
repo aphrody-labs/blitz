@@ -131,6 +131,12 @@ impl BaseDocument {
         self.build_paint_tree(root_node_id);
         timer.record_time("paint_tree");
 
+        // Re-homed paint boxes live outside their flow parent's taffy
+        // bounds; compute the reach rects paint-cull and hit-prune widen
+        // by. Must run AFTER taffy layout (the one geometry pass in resolve
+        // that is never stale) and after the paint tree records re-homes.
+        self.compute_rehomed_reach();
+
         // Clear all damage and dirty flags, walking only subtrees which are
         // marked as (potentially) containing damage.
         let doc_node_id = self.root_node().id;
@@ -255,6 +261,103 @@ impl BaseDocument {
     }
 
     /// Ensure that the layout_children field is populated for all nodes
+    /// Post-layout: for every node that hosts re-homed paint children,
+    /// union their boxes (in the host's coordinate space) and propagate
+    /// the rect up the host's layout-parent chain. Paint-cull and
+    /// hit-prune treat the result as extra reach beyond taffy's bounds,
+    /// which cannot cover a re-homed box (it is not a layout child of
+    /// its flow parent). Direct rects use max(size, content_size), so a
+    /// re-homed box's own descendants are covered through taffy; boxes
+    /// re-homed into a subtree from an outer containing block are
+    /// covered because their flow parent is itself a host.
+    ///
+    /// Simply disabling the cull along flagged chains does not work: on
+    /// heavy pages the flag reaches the root, culling effectively turns
+    /// off, and the recorded scene grows until the renderer's wasm aborts.
+    pub fn compute_rehomed_reach(&mut self) {
+        // Reach is rebuilt from fresh layout every resolve.
+        for (_, node) in self.nodes.iter_mut() {
+            node.rehomed_reach.set(None);
+        }
+
+        let host_ids: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| !n.rehomed_paint_children.borrow().is_empty())
+            .map(|(id, _)| id)
+            .collect();
+
+        let union =
+            |acc: Option<(f32, f32, f32, f32)>, r: (f32, f32, f32, f32)| match acc {
+                None => Some(r),
+                Some(a) => Some((
+                    a.0.min(r.0),
+                    a.1.min(r.1),
+                    a.2.max(r.2),
+                    a.3.max(r.3),
+                )),
+            };
+
+        for host_id in host_ids {
+            let mut rect: Option<(f32, f32, f32, f32)> = None;
+            let rehomed: Vec<NodeId> = self.nodes[host_id]
+                .rehomed_paint_children
+                .borrow()
+                .iter()
+                .copied()
+                .filter(|id| self.nodes.contains_key(*id))
+                .collect();
+            for child_id in rehomed {
+                let child = &self.nodes[child_id];
+                let t = child.rehomed_paint_translate(host_id);
+                let loc = child.final_layout().location;
+                let size = child.final_layout().size;
+                let overflow = child.final_layout().scrollable_overflow_rect;
+                let x0 = t.x + loc.x;
+                let y0 = t.y + loc.y;
+                let w = size.width.max(overflow.right);
+                let h = size.height.max(overflow.bottom);
+                rect = union(rect, (x0, y0, x0 + w, y0 + h));
+            }
+            let Some(mut rect) = rect else { continue };
+
+            // Union into the host, then propagate up the chain paint and
+            // hit-test descend through (the paint parent of a re-homed box,
+            // otherwise the containing block its location is relative to),
+            // shifting into each ancestor's coordinate space.
+            let mut cur = host_id;
+            for _ in 0..512 {
+                let node = &self.nodes[cur];
+                node.rehomed_reach
+                    .set(union(node.rehomed_reach.get(), rect));
+                let mut loc = node.final_layout().location;
+                let parent = match node.paint_parent_override.get() {
+                    Some(paint_parent) => {
+                        let t = node.rehomed_paint_translate(paint_parent);
+                        loc.x += t.x;
+                        loc.y += t.y;
+                        paint_parent
+                    }
+                    None => {
+                        let Some(parent) = node.containing_block() else { break };
+                        parent
+                    }
+                };
+                if parent == cur || !self.nodes.contains_key(parent) {
+                    break;
+                }
+                let scroll = *node.scroll_offset();
+                rect = (
+                    rect.0 + loc.x - scroll.x as f32,
+                    rect.1 + loc.y - scroll.y as f32,
+                    rect.2 + loc.x - scroll.x as f32,
+                    rect.3 + loc.y - scroll.y as f32,
+                );
+                cur = parent;
+            }
+        }
+    }
+
     pub fn resolve_layout_children(&mut self) {
         resolve_layout_children_recursive(self, self.root_node().id);
 

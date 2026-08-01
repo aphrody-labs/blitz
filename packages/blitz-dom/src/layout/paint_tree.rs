@@ -274,6 +274,7 @@ impl BaseDocument {
             entries
         };
 
+        self.nodes[node_id].rehomed_paint_children.borrow_mut().clear();
         let children = self.nodes[node_id].layout_children.borrow_mut().take();
         if let Some(mut children) = children {
             // Anonymous blocks and pseudo-elements can be removed from the
@@ -301,15 +302,18 @@ impl BaseDocument {
             // and listed in tree order, directly after that child (CSS 2.1
             // Appendix E). Boxes whose layout-parent chain does not lead through
             // a layout child of this node come after all of them.
+            // Z-index:auto abspos boxes are re-homed to their flow
+            // parent instead (see `Node::paint_parent_override`), which visits
+            // them itself.
             let mut hoisted_past_parent: Vec<(usize, NodeId)> = self.nodes[node_id]
                 .hoisted_children
                 .borrow()
                 .iter()
                 .copied()
                 .filter(|&id| {
-                    self.nodes
-                        .get(id)
-                        .is_some_and(|n| n.layout_parent.get() != Some(node_id))
+                    self.nodes.get(id).is_some_and(|n| {
+                        n.layout_parent.get() != Some(node_id) && !Self::paints_rehomed(n)
+                    })
                 })
                 .map(|id| {
                     let anchor = self
@@ -331,7 +335,27 @@ impl BaseDocument {
             paint_children.reserve(children.len() + hoisted_past_parent.len());
 
             for (index, &child_id) in children.iter().enumerate() {
-                if owned_here(self, child_id) {
+                if !owned_here(self, child_id) && Self::paints_rehomed(&self.nodes[child_id]) {
+                    // An abspos box laid out by an ancestor containing
+                    // block still paints here, in tree order among this node's
+                    // children (CSS 2.1 Appendix E step 8); see
+                    // `Node::paint_parent_override`.
+                    self.nodes[child_id].paint_parent_override.set(Some(node_id));
+                    self.nodes[node_id]
+                        .rehomed_paint_children
+                        .borrow_mut()
+                        .push(child_id);
+                    let is_sc_root = self.nodes[child_id].is_stacking_context_root(false);
+                    self.build_paint_tree_impl(
+                        child_id,
+                        match is_sc_root {
+                            true => None,
+                            false => Some(&mut entries),
+                        },
+                    );
+                    paint_children.push(child_id);
+                } else if owned_here(self, child_id) {
+                    self.nodes[child_id].paint_parent_override.set(None);
                     let is_sc_root = self.nodes[child_id].is_stacking_context_root(is_flex_or_grid);
                     self.build_paint_tree_impl(
                         child_id,
@@ -382,6 +406,23 @@ impl BaseDocument {
         }
     }
 
+    /// Whether `node` (an out-of-flow box hoisted past its flow
+    /// parent) paints under its flow parent rather than its containing block.
+    /// Only `position: absolute` boxes with `z-index: auto`/`0`: their paint
+    /// order is tree order (CSS 2.1 Appendix E step 8), which painting under
+    /// the containing block destroys (todomvc's abspos `.filters` covered the
+    /// later `.clear-completed` button and swallowed its clicks). A z-indexed
+    /// box is ordered by its stacking context; fixed boxes keep upstream's
+    /// placement.
+    fn paints_rehomed(node: &Node) -> bool {
+        node.taffy_position() == taffy::Position::Absolute
+            && node.z_index() == 0
+            && node
+                .oof_containing_block
+                .get()
+                .is_some_and(|cb| node.layout_parent.get() != Some(cb))
+    }
+
     /// The layout child of `node_id` whose subtree contains `id`, following
     /// `layout_parent`.
     fn layout_child_containing(&self, node_id: NodeId, id: NodeId) -> Option<NodeId> {
@@ -406,6 +447,7 @@ impl BaseDocument {
         paint_children: &mut ThinVec<NodeId>,
         entries: &mut ThinVec<HoistedPaintChild>,
     ) {
+        self.nodes[child_id].paint_parent_override.set(None);
         self.build_paint_tree_impl(
             child_id,
             match self.nodes[child_id].is_stacking_context_root(false) {
