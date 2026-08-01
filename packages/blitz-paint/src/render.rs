@@ -379,7 +379,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         } = *node.final_layout();
         let box_position = Vec2::new(location.x as f64, location.y as f64) * self.scale;
         let box_size = Size::new(size.width as f64, size.height as f64);
-        let border_box = Rect::from_origin_size(box_position.to_point(), box_size);
+        // Node-local: `screen_transform` applies `box_position` below.
+        let border_box = Rect::from_origin_size(kurbo::Point::ORIGIN, box_size);
         let scaled_pb = (padding + border).map(f64::from);
         let content_position = kurbo::Point {
             x: scaled_pb.left,
@@ -401,6 +402,18 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             y: -self.initial_y,
         }) * transform;
         let screen_bbox = screen_transform.transform_rect_bbox(overflow.union(border_box));
+        let screen_bbox = match node.rehomed_reach.get() {
+            Some((x0, y0, x1, y1)) => {
+                let reach = Rect::new(
+                    x0 as f64 * self.scale,
+                    y0 as f64 * self.scale,
+                    x1 as f64 * self.scale,
+                    y1 as f64 * self.scale,
+                );
+                screen_bbox.union(screen_transform.transform_rect_bbox(reach))
+            }
+            None => screen_bbox,
+        };
 
         // Cull elements that fall entirely outside the current clip rectangle. In addition to
         // the viewport, `clip_rect` is narrowed by any ancestor scrollport (see below), so this
@@ -434,7 +447,11 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         let clip_area = content_box_size.width * content_box_size.height;
         let overflow_area =
             node.scrollable_overflow().width() * node.scrollable_overflow().height();
-        if should_clip && clip_area < 0.01 && overflow_area < 0.01 {
+        if should_clip
+            && clip_area < 0.01
+            && overflow_area < 0.01
+            && node.rehomed_reach.get().is_none()
+        {
             return;
         }
 
@@ -1071,21 +1088,31 @@ impl ElementCx<'_, '_> {
         // Regular children
         if let Some(children) = &*self.node.paint_children.borrow() {
             for child_id in children {
-                // Fixed-position children of the root element are positioned against
-                // the viewport and do not scroll with it, so cancel out the viewport
-                // scroll (applied in `paint_scene`). A fixed box contained by a
-                // transformed ancestor scrolls with it like any out-of-flow box.
                 let child = &self.context.dom.as_ref().tree()[*child_id];
-                let child_transform = if child.taffy_position() == taffy::Position::Fixed
-                    && Some(self.node.id) == self.context.root_element_id
-                {
-                    let scroll = self.context.dom.as_ref().viewport_scroll();
-                    parent_style_transform.pre_translate(kurbo::Vec2 {
-                        x: scroll.x * self.scale,
-                        y: scroll.y * self.scale,
-                    })
-                } else {
-                    parent_style_transform
+                let child_transform = match child.paint_parent_override.get() {
+                    Some(parent) if parent == self.node.id => {
+                        let translation = child.rehomed_paint_translate(parent);
+                        parent_style_transform.pre_translate(kurbo::Vec2 {
+                            x: translation.x as f64 * self.scale,
+                            y: translation.y as f64 * self.scale,
+                        })
+                    }
+                    // Fixed-position children of the root element are positioned against
+                    // the viewport and do not scroll with it, so cancel out the viewport
+                    // scroll (applied in `paint_scene`), or the fixed anchor a clipped
+                    // paint keeps them at (`set_viewport_scroll_with_fixed_anchor`).
+                    // A fixed box contained by a transformed ancestor scrolls with it
+                    // like any out-of-flow box.
+                    _ if child.taffy_position() == taffy::Position::Fixed
+                        && Some(self.node.id) == self.context.root_element_id =>
+                    {
+                        let scroll = self.context.dom.as_ref().tree().fixed_anchor_scroll();
+                        parent_style_transform.pre_translate(kurbo::Vec2 {
+                            x: scroll.x * self.scale,
+                            y: scroll.y * self.scale,
+                        })
+                    }
+                    _ => parent_style_transform,
                 };
                 self.render_node(scene, *child_id, child_transform, clip_rect);
             }
