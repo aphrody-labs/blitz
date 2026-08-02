@@ -1138,33 +1138,65 @@ impl ElementCx<'_, '_> {
         };
         let object_position = self.style.clone_object_position();
 
-        // Apply object-fit algorithm
-        let container_size = taffy::Size { width, height };
-        let object_size = taffy::Size {
-            width: svg_size.width(),
-            height: svg_size.height(),
+        let is_inline_svg_element = &*self.element.name.local == "svg";
+        let has_view_box = svg.viewbox_aspect_ratio().is_some();
+
+        // An inline <svg> without a viewBox has no geometric scaling: user
+        // units are CSS px and the viewport only crops (SVG2 section 7.7).
+        // The usvg tree size is a synthesized natural size there, so
+        // contain-fitting it would letterbox and shrink the content. Real viewBoxes and
+        // replaced hosts (<img>) keep the object-fit path.
+        let transform = if is_inline_svg_element && !has_view_box {
+            self.transform
+                .pre_scale(self.scale)
+                .then_translate(Vec2 { x, y })
+        } else {
+            // Apply object-fit algorithm
+            let container_size = taffy::Size { width, height };
+            let object_size = taffy::Size {
+                width: svg_size.width(),
+                height: svg_size.height(),
+            };
+            let paint_size = compute_object_fit(container_size, Some(object_size), object_fit);
+
+            // Compute object-position
+            let x_offset = object_position.horizontal.resolve(
+                CSSPixelLength::new(container_size.width - paint_size.width) / self.scale as f32,
+            ) * self.scale as f32;
+            let y_offset = object_position.vertical.resolve(
+                CSSPixelLength::new(container_size.height - paint_size.height) / self.scale as f32,
+            ) * self.scale as f32;
+            let x = x + x_offset.px() as f64;
+            let y = y + y_offset.px() as f64;
+
+            let viewport = svg_viewport_affine(svg, paint_size.width, paint_size.height);
+            (self.transform * viewport).then_translate(Vec2 { x, y })
         };
-        let paint_size = compute_object_fit(container_size, Some(object_size), object_fit);
 
-        // Compute object-position
-        let x_offset = object_position.horizontal.resolve(
-            CSSPixelLength::new(container_size.width - paint_size.width) / self.scale as f32,
-        ) * self.scale as f32;
-        let y_offset = object_position.vertical.resolve(
-            CSSPixelLength::new(container_size.height - paint_size.height) / self.scale as f32,
-        ) * self.scale as f32;
-        let x = x + x_offset.px() as f64;
-        let y = y + y_offset.px() as f64;
-
-        let viewport = svg_viewport_affine(svg, paint_size.width, paint_size.height);
-        let transform = (self.transform * viewport).then_translate(Vec2 { x, y });
-
-        self.with_replaced_content_clip(
+        // Clip to the content box. An svg viewport establishes
+        // overflow:hidden by default (UA stylesheet), but render_svg_tree
+        // paints the tree unclipped, so content past the viewBox (for
+        // example after a dynamic viewBox shrink scales user units up)
+        // would bleed outside the element. Only an inline <svg> element ties
+        // its CSS overflow to viewport clipping (author overflow:visible
+        // paints outside). Any other host of svg content, such as an <img>,
+        // is a replaced element that never bleeds, whatever its computed
+        // overflow says (img's initial overflow is visible).
+        let clips = if is_inline_svg_element {
+            let box_styles = self.style.get_box();
+            !matches!(box_styles.overflow_x, Overflow::Visible)
+                || !matches!(box_styles.overflow_y, Overflow::Visible)
+        } else {
+            true
+        };
+        self.context.layer_manager.maybe_with_layer(
             scene,
-            container_size,
-            paint_size,
-            x_offset.px(),
-            y_offset.px(),
+            clips,
+            1.0,
+            self.transform,
+            &self.frame.content_box_path(),
+            None,
+            None,
             |scene| {
                 anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
             },
