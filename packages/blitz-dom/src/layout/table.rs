@@ -134,6 +134,20 @@ pub struct TableRow {
     pub is_constrained: bool,
 }
 
+impl TableRow {
+    /// An implicit row wrapping table content outside any real row
+    /// (CSS 2.2 §17.2.1). Its null node id resolves to no element, so it
+    /// paints no row background.
+    fn anonymous() -> Self {
+        Self {
+            node_id: NodeId::default(),
+            group: None,
+            height: None,
+            is_constrained: false,
+        }
+    }
+}
+
 /// The used width of one border side: border widths are not adjusted for
 /// border-style in computed styles, so a border with `none`/`hidden` style
 /// must be treated as zero-width.
@@ -268,6 +282,7 @@ pub(crate) fn build_table_context(
             _ => 1,
         }
     };
+    let mut stray_run = false;
     for order in 0..3 {
         for child_id in children.iter().copied() {
             if row_group_order(doc, child_id) != order {
@@ -287,6 +302,8 @@ pub(crate) fn build_table_context(
                 &mut column_sizes,
                 &mut first_cell_border,
                 &mut percent_columns,
+                false,
+                &mut stray_run,
             );
         }
     }
@@ -510,6 +527,8 @@ fn collect_columns(
     }
 }
 
+// `in_row` is true under a real table-row element; `stray_run` tracks an
+// open implicit row collecting consecutive cells outside any real row.
 #[allow(clippy::too_many_arguments)]
 fn collect_table_cells(
     doc: &mut BaseDocument,
@@ -525,6 +544,8 @@ fn collect_table_cells(
     columns: &mut Vec<TrackSizingFunction>,
     first_cell_border: &mut Option<ServoArc<Border>>,
     percent_columns: &mut Vec<(u16, f32, f32)>,
+    in_row: bool,
+    stray_run: &mut bool,
 ) {
     let node = &mut doc.nodes[node_id];
 
@@ -557,7 +578,9 @@ fn collect_table_cells(
         | DisplayInside::TableFooterGroup
         | DisplayInside::Contents => {
             let first_row = rows.len();
+            *stray_run = false;
             let children = std::mem::take(&mut doc.nodes[node_id].children);
+            let mut group_stray = false;
             for child_id in children.iter().copied() {
                 doc.nodes[child_id]
                     .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -575,6 +598,8 @@ fn collect_table_cells(
                     columns,
                     first_cell_border,
                     percent_columns,
+                    false,
+                    &mut group_stray,
                 );
             }
             doc.nodes[node_id].children = children;
@@ -586,6 +611,7 @@ fn collect_table_cells(
         }
         DisplayInside::TableRow => {
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+            *stray_run = false;
             *row += 1;
             cursor.start_row();
 
@@ -601,6 +627,7 @@ fn collect_table_cells(
             });
 
             let children = std::mem::take(&mut doc.nodes[node_id].children);
+            let mut row_stray = false;
             for child_id in children.iter().copied() {
                 collect_table_cells(
                     doc,
@@ -616,11 +643,21 @@ fn collect_table_cells(
                     columns,
                     first_cell_border,
                     percent_columns,
+                    true,
+                    &mut row_stray,
                 );
             }
             doc.nodes[node_id].children = children;
         }
         DisplayInside::TableCell => {
+            // A cell outside any real row opens an implicit (anonymous)
+            // row; consecutive stray cells share it (CSS 2.2 §17.2.1).
+            if !in_row && !*stray_run {
+                *row += 1;
+                cursor.start_row();
+                rows.push(TableRow::anonymous());
+                *stray_run = true;
+            }
             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             let stylo_style = &node.primary_styles().unwrap();
             let colspan: u16 = node
@@ -740,12 +777,40 @@ fn collect_table_cells(
         | DisplayInside::Flex
         | DisplayInside::Grid
         | DisplayInside::WebkitBox => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            // Probably a table caption: ignore
-            // println!(
-            //     "Warning: ignoring non-table typed descendent of table ({:?})",
-            //     display.inside()
-            // );
+            // CSS 2.2 §17.2.1: non-table content inside a table wraps in
+            // an anonymous cell. Dropping them would lose the content of any
+            // page using `display: table` for centering.
+            // Each such child becomes a cell; outside a real row it also
+            // opens its own implicit row so consecutive blocks stack
+            // vertically like the single anonymous cell the spec builds.
+            *stray_run = false;
+            if !in_row {
+                *row += 1;
+                cursor.start_row();
+                rows.push(TableRow::anonymous());
+            }
+            let stylo_style = &node.primary_styles().unwrap();
+            let mut style = table_taffy_style(stylo_style, wm);
+            let col = cursor.next_free();
+            if *row == 1 && (col as usize) >= columns.len() {
+                columns.resize(col as usize, style_helpers::auto());
+                columns.push(style_helpers::auto());
+            }
+            style.grid_column = taffy::Line {
+                start: style_helpers::auto(),
+                end: style_helpers::span(1),
+            };
+            style.grid_row = taffy::Line {
+                start: style_helpers::line(*row as i16),
+                end: style_helpers::span(1),
+            };
+            cells.push(TableCell {
+                node_id,
+                row: row.saturating_sub(1),
+                column: col,
+                style,
+            });
+            cursor.place(1, 1);
         }
         DisplayInside::TableColumnGroup | DisplayInside::TableColumn | DisplayInside::Table => {
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);

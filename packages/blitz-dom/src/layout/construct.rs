@@ -394,19 +394,105 @@ pub(crate) struct LayoutChildren {
     /// These are recorded on the container node so they can be deallocated the
     /// next time it is reconstructed.
     pub(crate) anonymous_blocks: ThinVec<NodeId>,
+    /// Open anonymous `display: table` wrapper collecting a run of
+    /// misparented table-internal children (CSS 2.2 §17.2.1 fixup).
+    pub(crate) anonymous_table_id: Option<NodeId>,
+}
+
+// Table-internal display values that require a table ancestor; a run of
+// them under a non-table parent gets an anonymous table wrapper.
+pub(crate) fn is_table_internal(display: Display) -> bool {
+    matches!(
+        display.inside(),
+        DisplayInside::TableCell
+            | DisplayInside::TableRow
+            | DisplayInside::TableRowGroup
+            | DisplayInside::TableHeaderGroup
+            | DisplayInside::TableFooterGroup
+    )
 }
 
 impl LayoutChildren {
     /// Append a single layout child.
     fn push(&mut self, child_id: NodeId, doc: &mut BaseDocument) {
         self.maybe_push_anon_block(doc);
+        self.anonymous_table_id = None;
         self.children.push(child_id);
     }
 
     /// Append all layout children in `slice`.
     fn extend(&mut self, slice: &[NodeId], doc: &mut BaseDocument) {
         self.maybe_push_anon_block(doc);
+        self.anonymous_table_id = None;
         self.children.extend_from_slice(slice);
+    }
+
+    // Route a misparented table-internal child into the open anonymous
+    // table, creating the wrapper at the run's first member.
+    fn push_table_wrapped(
+        &mut self,
+        container_node_id: NodeId,
+        child_id: NodeId,
+        doc: &mut BaseDocument,
+    ) {
+        self.maybe_push_anon_block(doc);
+        if self.anonymous_table_id.is_none() {
+            self.create_anonymous_table(container_node_id, doc);
+        }
+        doc.nodes[self.anonymous_table_id.unwrap()]
+            .children
+            .push(child_id);
+    }
+
+    fn create_anonymous_table(&mut self, container_node_id: NodeId, doc: &mut BaseDocument) {
+        use style::selector_parser::PseudoElement;
+
+        const NAME: QualName = QualName {
+            prefix: None,
+            ns: ns!(html),
+            local: local_name!("table"),
+        };
+        let node_id = doc.create_node(NodeData::AnonymousBlock(Box::new(ElementData::new(
+            NAME,
+            Vec::new(),
+        ))));
+
+        let parent_style = doc.nodes[container_node_id].primary_styles().unwrap();
+        let read_guard = doc.guard.read();
+        let guards = StylesheetGuards::same(&read_guard);
+        // display:table comes from the UA sheet's ::-servo-anonymous-table
+        // rule; everything else inherits from the real parent.
+        let style = doc.stylist.style_for_anonymous::<&Node>(
+            &guards,
+            &PseudoElement::ServoAnonymousTable,
+            &parent_style,
+        );
+        let mut stylo_element_data = StyloElementData {
+            damage: ALL_DAMAGE,
+            ..Default::default()
+        };
+        drop(parent_style);
+
+        stylo_element_data.styles.primary = Some(style);
+        stylo_element_data.set_restyled();
+        *doc.nodes[node_id]
+            .stylo_element_data_mut()
+            .ensure_init_mut() = stylo_element_data;
+
+        if doc.nodes[container_node_id]
+            .flags
+            .contains(NodeFlags::IS_IN_DOCUMENT)
+        {
+            doc.nodes[node_id].flags.insert(NodeFlags::IS_IN_DOCUMENT);
+        }
+        doc.nodes[node_id].parent = Some(container_node_id);
+        doc.nodes[node_id]
+            .layout_parent
+            .set(Some(container_node_id));
+
+        self.children.push(node_id);
+        self.anonymous_blocks.push(node_id);
+        self.anonymous_table_id = Some(node_id);
     }
 
     fn maybe_push_anon_block(&mut self, doc: &mut BaseDocument) {
@@ -443,6 +529,7 @@ impl LayoutChildren {
         child_id: NodeId,
         doc: &mut BaseDocument,
     ) {
+        self.anonymous_table_id = None;
         if self.anonymous_block_id.is_none() {
             self.create_anonymous_block(container_node_id, doc);
         }
@@ -1082,15 +1169,34 @@ fn collect_layout_children_with_wrap(
                 return;
             }
 
+            // Misparented table-internal children force the complex path,
+            // which owns the anonymous-table fixup (CSS 2.2 §17.2.1).
+            let has_table_internal = doc.nodes[container_node_id]
+                .flat_children()
+                .iter()
+                .any(|&child_id| {
+                    let child = &doc.nodes[child_id];
+                    child.data.kind() == NodeKind::Element
+                        && child
+                            .display_style()
+                            .map(is_table_internal)
+                            .unwrap_or(false)
+                });
+
             // If the children are either all inline or all block then simply return the regular children
             // as the layout children
-            if classification.all_block & !classification.has_contents {
-                return push_non_whitespace_children_and_pseudos(
-                    &mut out.children,
-                    &doc.nodes[container_node_id],
-                );
-            } else if classification.all_inline & !classification.has_contents {
-                return push_children_and_pseudos(&mut out.children, &doc.nodes[container_node_id]);
+            if !has_table_internal {
+                if classification.all_block & !classification.has_contents {
+                    return push_non_whitespace_children_and_pseudos(
+                        &mut out.children,
+                        &doc.nodes[container_node_id],
+                    );
+                } else if classification.all_inline & !classification.has_contents {
+                    return push_children_and_pseudos(
+                        &mut out.children,
+                        &doc.nodes[container_node_id],
+                    );
+                }
             }
 
             collect_complex_layout_children(
@@ -1301,7 +1407,17 @@ fn collect_complex_layout_children(
             // return;
         }
         // Recurse into `Display::Contents` nodes, wrapping hoisted text and
-        // inline children as if they were direct children of this container
+        // inline children as if they were direct children of this container.
+        // Whitespace between table-internal boxes is dropped by the
+        // anonymous-table fixup instead of terminating the run.
+        else if is_whitespace_node && out.anonymous_table_id.is_some() {
+            // return;
+        }
+        // Misparented table-internal children collect into an anonymous
+        // `display: table` wrapper (CSS 2.2 §17.2.1).
+        else if child_node_kind == NodeKind::Element && is_table_internal(*child_display) {
+            out.push_table_wrapped(container_node_id, child_id, doc);
+        }
         else if display_inside == DisplayInside::Contents {
             let wrap = Some(WrapContext {
                 container_node_id,
@@ -1322,6 +1438,7 @@ fn collect_complex_layout_children(
 
     // If anonymous block node only contains whitespace then delete it, else push it
     out.maybe_push_anon_block(doc);
+    out.anonymous_table_id = None;
 }
 
 fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multiline: bool) {

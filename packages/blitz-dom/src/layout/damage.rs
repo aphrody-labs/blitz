@@ -206,24 +206,49 @@ impl BaseDocument {
             return RestyleDamage::empty();
         }
 
+        // Anonymous table wrappers (see `LayoutChildren::create_anonymous_table`)
+        // are named `table` and take the ::-servo-anonymous-table style instead.
+        let is_anonymous_table = |doc: &Self, id: NodeId| {
+            doc.nodes.get(id).is_some_and(|node| {
+                node.element_data()
+                    .is_some_and(|el| el.name.local == local_name!("table"))
+            })
+        };
+        let has_anonymous_table = self.nodes[node_id]
+            .anonymous_blocks
+            .iter()
+            .any(|&id| is_anonymous_table(self, id));
+
         // Cascade once from the owner, sharing the result across its anonymous boxes.
-        let style = {
+        let (style, table_style) = {
             let Some(parent_style) = self.nodes[node_id].primary_styles() else {
                 return RestyleDamage::empty();
             };
             let read_guard = self.guard.read();
             let guards = StylesheetGuards::same(&read_guard);
-            self.stylist.style_for_anonymous::<&Node>(
+            let style = self.stylist.style_for_anonymous::<&Node>(
                 &guards,
                 &PseudoElement::ServoAnonymousBox,
                 &parent_style,
-            )
+            );
+            let table_style = has_anonymous_table.then(|| {
+                self.stylist.style_for_anonymous::<&Node>(
+                    &guards,
+                    &PseudoElement::ServoAnonymousTable,
+                    &parent_style,
+                )
+            });
+            (style, table_style)
         };
 
         // Take the ownership list so we can mutate nodes without copying it.
         let anonymous_blocks = std::mem::take(&mut self.nodes[node_id].anonymous_blocks);
         let mut damage_for_parent = RestyleDamage::empty();
         for &anonymous_id in &anonymous_blocks {
+            let style = match &table_style {
+                Some(table_style) if is_anonymous_table(self, anonymous_id) => table_style,
+                _ => &style,
+            };
             let (mut damage, changed) = {
                 // Skip boxes whose node, style data, or previous style is unavailable.
                 let Some(node) = self.nodes.get_mut(anonymous_id) else {
@@ -238,7 +263,7 @@ impl BaseDocument {
                 };
 
                 // Compute precise damage, retaining the old style allocation if unchanged.
-                let diff = RestyleDamage::compute_style_difference::<&Node>(old_style, &style);
+                let diff = RestyleDamage::compute_style_difference::<&Node>(old_style, style);
                 let changed = matches!(diff.change, StyleChange::Changed { .. });
                 if changed {
                     data.styles.primary = Some(style.clone());
