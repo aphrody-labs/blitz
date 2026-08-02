@@ -91,6 +91,10 @@ impl BaseDocument {
         // loading; see flush_needed_font_faces).
         self.flush_needed_font_faces();
 
+        // CSS counters: list-item values + counter()/attr() pseudo content.
+        // Needs computed styles; box construction consumes the side tables.
+        self.resolve_counters();
+
         // Non-incremental mode is "every node is damaged every frame": mark the
         // whole tree and let the same damage pipeline reconstruct and relayout
         // everything.

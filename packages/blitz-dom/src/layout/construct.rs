@@ -1126,6 +1126,25 @@ fn pe_content_text(style: &style::properties::ComputedValues) -> Option<String> 
     }
 }
 
+// Pseudo content with counters/attr/multiple items resolves through the
+// side table the resolve_counters pass built; plain strings stay inline.
+fn pe_content_text_resolved(
+    doc: &BaseDocument,
+    node_id: NodeId,
+    pseudo_idx: usize,
+    style: &style::properties::ComputedValues,
+) -> Option<String> {
+    let over = if pseudo_idx == 1 {
+        doc.counters.before_text.get(&node_id)
+    } else {
+        doc.counters.after_text.get(&node_id)
+    };
+    if let Some(t) = over {
+        return Some(t.clone());
+    }
+    pe_content_text(style)
+}
+
 fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
     let (before_style, after_style, before_node_id, after_node_id) = {
         let node = &doc.nodes[node_id];
@@ -1172,7 +1191,7 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
                     .insert(NodeFlags::IS_IN_DOCUMENT);
             }
 
-            if let Some(text) = pe_content_text(pe_style) {
+            if let Some(text) = pe_content_text_resolved(doc, node_id, idx, pe_style) {
                 let text_node_id = doc.create_text_node(&text);
                 doc.nodes[text_node_id].parent = Some(new_node_id);
                 doc.nodes[new_node_id].children.push(text_node_id);
@@ -1202,7 +1221,7 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
             // the style-pointer comparison below, as the pseudo-element's style may
             // already have been updated by `sync_pseudo_element_styles` during the
             // style traversal without the text having been updated.
-            let new_text = pe_content_text(&pe_style);
+            let new_text = pe_content_text_resolved(doc, node_id, idx, &pe_style);
             let existing_text_node_id = doc.nodes[pe_node_id]
                 .children
                 .first()

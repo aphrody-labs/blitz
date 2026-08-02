@@ -243,6 +243,12 @@ pub struct BaseDocument {
     pub(crate) devtool_settings: DevtoolSettings,
     // Viewport details such as the dimensions, HiDPI scale, and zoom factor,
     pub(crate) viewport: Viewport,
+    /// CSS counter side tables (list-item values + resolved pseudo
+    /// content), rebuilt by resolve_counters on every resolve pass.
+    pub(crate) counters: crate::layout::counters::CounterOutput,
+    /// Sticky positive gate: set once a resolve pass finds any counter
+    /// usage, so later passes skip the flat usage scan (see counters.rs).
+    pub(crate) counters_seen: bool,
     /// CSS media type used to evaluate `@media` rules.
     pub(crate) media_type: MediaType,
     /// Changes to the stylist [`Device`] that have been requested since the
@@ -536,6 +542,8 @@ impl BaseDocument {
             incremental_layout: config.incremental.unwrap_or(true),
             subdocument_depth: config.subdocument_depth,
             devtool_settings: DevtoolSettings::default(),
+            counters: Default::default(),
+            counters_seen: false,
             url: base_url,
             author_sheet_cache: HashMap::new(),
             dirty_shadow_style_roots: Vec::new(),

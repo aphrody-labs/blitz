@@ -8,6 +8,7 @@ use style::{
 
 use crate::{
     BaseDocument,
+    layout::counters::format_counter,
     node::{ListItemLayout, ListItemLayoutPosition, Marker},
     stylo_to_parley,
 };
@@ -25,7 +26,15 @@ pub(super) fn collect_list_item_children(
         children.reverse();
     }
     for child in children.into_iter() {
-        if let Some(layout) = node_list_item_child(doc, child, *index) {
+        // The counter pass owns numbering (ol[start]/li[value]/counter-*);
+        // the sibling index only backstops nodes the pass didn't visit.
+        let value = doc
+            .counters
+            .list_item_values
+            .get(&child)
+            .copied()
+            .unwrap_or((*index + 1) as i32);
+        if let Some(layout) = node_list_item_child(doc, child, value) {
             let node = &mut doc.nodes[child];
             node.element_data_mut().unwrap().list_item_data = Some(Box::new(layout));
             *index += 1;
@@ -44,7 +53,7 @@ pub(super) fn collect_list_item_children(
 fn node_list_item_child(
     doc: &mut BaseDocument,
     child_id: NodeId,
-    index: usize,
+    value: i32,
 ) -> Option<ListItemLayout> {
     let node = &doc.nodes[child_id];
 
@@ -73,7 +82,7 @@ fn node_list_item_child(
     let styles = node.primary_styles().unwrap();
     let list_style_type = styles.clone_list_style_type();
     let list_style_position = styles.clone_list_style_position();
-    let marker = marker_for_style(list_style_type.clone(), index)?;
+    let marker = marker_for_style(list_style_type.clone(), value)?;
 
     let position = match list_style_position {
         ListStylePosition::Inside => ListItemLayoutPosition::Inside,
@@ -112,47 +121,27 @@ fn node_list_item_child(
     Some(ListItemLayout { marker, position })
 }
 
-// Determine the marker to render for a given list style type
-fn marker_for_style(list_style_type: ListStyleType, index: usize) -> Option<Marker> {
+// Determine the marker to render for a given list style type and the
+// list-item counter value (1-based; negatives/zero happen via counter-set).
+fn marker_for_style(list_style_type: ListStyleType, value: i32) -> Option<Marker> {
     Some(match list_style_type.0 {
         CounterStyle::None => return None,
         CounterStyle::Name(name) => match &*name.0 {
-            "lower-alpha" => {
-                let mut marker = String::new();
-                build_alpha_marker(index, &mut marker);
-                Marker::String(format!("{marker}. "))
-            }
-            "upper-alpha" => {
-                let mut marker = String::new();
-                build_alpha_marker(index, &mut marker);
-                Marker::String(format!("{}. ", marker.to_ascii_uppercase()))
-            }
-            "decimal" => Marker::String(format!("{}. ", index + 1)),
             "disc" => Marker::Char('•'),
             "circle" => Marker::Char('◦'),
             "square" => Marker::Char('▪'),
             "disclosure-open" => Marker::Char('▾'),
             "disclosure-closed" => Marker::Char('▸'),
+            "decimal" | "decimal-leading-zero" | "lower-alpha" | "lower-latin" | "upper-alpha"
+            | "upper-latin" | "lower-roman" | "upper-roman" => Marker::String(format!(
+                "{}. ",
+                format_counter(value, &CounterStyle::Name(name))
+            )),
             _ => Marker::Char('□'),
         },
         CounterStyle::String(atom_string) => Marker::String(atom_string.as_ref().to_string()),
-        CounterStyle::Symbols { symbols, .. } => {
-            // Use symbols from counter-style definition
-            let syms = &symbols.0;
-            let len = syms.len();
-            if len == 0 {
-                Marker::Char('•')
-            } else {
-                // Cycle through symbols based on index: 1st, 2nd, 1st, 2nd, etc.
-                let idx = if len > 1 { index % len } else { 0 };
-                // Symbol is String or Ident variant, extract the string value
-                let sym = &syms[idx];
-                let marker_str = match sym {
-                    style::counter_style::Symbol::String(s) => s.to_string(),
-                    style::counter_style::Symbol::Ident(id) => id.0.to_string(),
-                };
-                Marker::String(marker_str)
-            }
+        style @ CounterStyle::Symbols { .. } => {
+            Marker::String(format_counter(value, &style))
         }
     })
 }
@@ -164,22 +153,6 @@ fn font_for_bullet_style(list_style_type: ListStyleType) -> Option<FontFamily<'s
     }
 
     None
-}
-
-const ALPHABET: [char; 26] = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
-    't', 'u', 'v', 'w', 'x', 'y', 'z',
-];
-
-// Construct alphanumeric marker from index, appending characters when index exceeds powers of 26
-fn build_alpha_marker(index: usize, str: &mut String) {
-    let rem = index % 26;
-    let sym = ALPHABET[rem];
-    str.insert(0, sym);
-    let rest = (index - rem) as i64 / 26 - 1;
-    if rest >= 0 {
-        build_alpha_marker(rest as usize, str);
-    }
 }
 
 #[cfg(test)]
@@ -199,24 +172,24 @@ mod tests {
 
     #[test]
     fn test_marker_for_disc() {
-        let result = marker_for_style(ListStyleType::disc(), 0);
+        let result = marker_for_style(ListStyleType::disc(), 1);
         assert_eq!(result, Some(Marker::Char('•')));
     }
 
     #[test]
     fn test_marker_for_decimal() {
-        let result_1 = marker_for_style(list_style("decimal"), 0);
-        let result_2 = marker_for_style(list_style("decimal"), 1);
+        let result_1 = marker_for_style(list_style("decimal"), 1);
+        let result_2 = marker_for_style(list_style("decimal"), 2);
         assert_eq!(result_1, Some(Marker::String("1. ".to_string())));
         assert_eq!(result_2, Some(Marker::String("2. ".to_string())));
     }
 
     #[test]
     fn test_marker_for_lower_alpha() {
-        let result_1 = marker_for_style(list_style("lower-alpha"), 0);
-        let result_2 = marker_for_style(list_style("lower-alpha"), 1);
-        let result_extended_1 = marker_for_style(list_style("lower-alpha"), 26);
-        let result_extended_2 = marker_for_style(list_style("lower-alpha"), 27);
+        let result_1 = marker_for_style(list_style("lower-alpha"), 1);
+        let result_2 = marker_for_style(list_style("lower-alpha"), 2);
+        let result_extended_1 = marker_for_style(list_style("lower-alpha"), 27);
+        let result_extended_2 = marker_for_style(list_style("lower-alpha"), 28);
         assert_eq!(result_1, Some(Marker::String("a. ".to_string())));
         assert_eq!(result_2, Some(Marker::String("b. ".to_string())));
         assert_eq!(result_extended_1, Some(Marker::String("aa. ".to_string())));
@@ -225,10 +198,10 @@ mod tests {
 
     #[test]
     fn test_marker_for_upper_alpha() {
-        let result_1 = marker_for_style(list_style("upper-alpha"), 0);
-        let result_2 = marker_for_style(list_style("upper-alpha"), 1);
-        let result_extended_1 = marker_for_style(list_style("upper-alpha"), 26);
-        let result_extended_2 = marker_for_style(list_style("upper-alpha"), 27);
+        let result_1 = marker_for_style(list_style("upper-alpha"), 1);
+        let result_2 = marker_for_style(list_style("upper-alpha"), 2);
+        let result_extended_1 = marker_for_style(list_style("upper-alpha"), 27);
+        let result_extended_2 = marker_for_style(list_style("upper-alpha"), 28);
         assert_eq!(result_1, Some(Marker::String("A. ".to_string())));
         assert_eq!(result_2, Some(Marker::String("B. ".to_string())));
         assert_eq!(result_extended_1, Some(Marker::String("AA. ".to_string())));
