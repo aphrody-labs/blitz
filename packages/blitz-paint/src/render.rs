@@ -538,14 +538,39 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     .map(|f| f.expansion_rect())
                     .unwrap_or(Rect::ZERO);
 
+                // The effect layer covers the element's whole painted subtree:
+                // filter/opacity apply to overflowing content and to abspos
+
+                // descendants re-homed here for paint (a filter IS their
+                // containing block). Border-box-only clipping amputated them
+
+                // (WPT filtered-block-is-container: the abspos child painted
+                // in the transform reference but vanished under the filter).
+                // Live reach, not the resolve-time cache: pure-scroll frames
+                // skip resolve and the cached rect goes stale by the delta.
                 let mut effect_layer_clip = cx.frame.border_box_path().bounding_box();
+                effect_layer_clip = effect_layer_clip.union(*cx.node.scrollable_overflow());
+                if let Some((x0, y0, x1, y1)) = cx.node.live_rehomed_reach() {
+                    effect_layer_clip = effect_layer_clip.union(Rect::new(
+                        x0 as f64 * self.scale,
+                        y0 as f64 * self.scale,
+                        x1 as f64 * self.scale,
+                        y1 as f64 * self.scale,
+                    ));
+                }
+
+                // Filter expansion (blur radius etc.) applies to the whole
+                // painted region, so it has to widen the union. Expanding
+                // the border box first and unioning after would clip the blur
+                // that bleeds off overflowing or re-homed content.
                 effect_layer_clip.x0 += filter_expansion_area.x0;
                 effect_layer_clip.y0 += filter_expansion_area.y0;
                 effect_layer_clip.x1 += filter_expansion_area.x1;
                 effect_layer_clip.y1 += filter_expansion_area.y1;
 
                 // Opacity/Filter layer if box has opacity or a filter.
-                // Clipped to border-box as it needs to include the background and borders.
+                // Clipped to the painted subtree (border box ∪ overflow ∪
+                // re-homed reach, widened by the filter expansion above).
                 self.layer_manager.maybe_with_layer(
                     scene,
                     has_opacity || filter.is_some() || backdrop_filter.is_some(),
