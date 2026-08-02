@@ -208,6 +208,39 @@ impl BaseDocument {
         let url_extra_data = self.url.url_extra_data();
         SelectorParser::parse_author_origin_no_namespace(input, &url_extra_data)
     }
+
+    // Namespace-aware variant for CSSOM selectorText writes: a rule in a
+    // sheet with @namespace must resolve `svg|*` against the sheet's map,
+    // which parse_author_origin_no_namespace (built for querySelector)
+    // never sees: every prefixed selector failed to parse there.
+    pub fn try_parse_selector_list_with_namespaces(
+        &self,
+        input: &str,
+        default_namespace: Option<&str>,
+        prefixes: &[(String, String)],
+    ) -> Result<SelectorList<SelectorImpl>, ParseError> {
+        use cssparser::Parser as CssParser;
+        use selectors::parser::ParseRelative;
+        use style::selector_parser::SelectorParser;
+        use style::stylesheets::{Namespaces, Origin};
+        use style::{Namespace, Prefix};
+
+        let mut namespaces = Namespaces::default();
+        namespaces.default = default_namespace.map(Namespace::from);
+        for (prefix, url) in prefixes {
+            namespaces
+                .prefixes
+                .insert(Prefix::from(prefix.as_str()), Namespace::from(url.as_str()));
+        }
+        let url_extra_data = self.url.url_extra_data();
+        let parser = SelectorParser {
+            stylesheet_origin: Origin::Author,
+            namespaces: &namespaces,
+            url_data: &url_extra_data,
+            for_supports_rule: false,
+        };
+        SelectorList::parse(&parser, &mut CssParser::new(input), ParseRelative::No)
+    }
 }
 
 impl Node {
