@@ -1303,6 +1303,15 @@ impl<'doc> DocumentMutator<'doc> {
             return;
         }
 
+        // A `crossorigin` attribute (any value, including the
+        // empty string) puts the CSS fetch in mode "cors"; its absence
+        // means "no-cors", whose response is opaque even when the server
+        // does send Access-Control-Allow-Origin. HTML §link-type-stylesheet.
+        let cors_mode = match node.attr(LocalName::from("crossorigin")) {
+            Some(_) => "cors",
+            None => "no-cors",
+        };
+
         let url = self.doc.resolve_url(href);
         let handler = ResourceHandler::new(
             self.doc.tx.clone(),
@@ -1314,6 +1323,7 @@ impl<'doc> DocumentMutator<'doc> {
                 guard: self.doc.guard.clone(),
                 net_provider: self.doc.net_provider.clone(),
                 abort_signal: self.doc.abort_signal.clone(),
+                cors_mode: Some(String::from(cors_mode)),
             },
         );
 
@@ -1329,8 +1339,11 @@ impl<'doc> DocumentMutator<'doc> {
         // the NetHandler trait object. Blitz's NetProvider trait
         // doesn't expose the handler type, and Request has no
         // `kind` field, so content_type is the cleanest signal.
+        //
+        // The `ks-cors` MIME parameter rides along so the embedder can
+        // tell a CORS-mode sheet from an opaque one.
         let mut req = self.doc.build_request(url);
-        req.content_type = Some("text/css".to_string());
+        req.content_type = Some(crate::net::css_content_type(Some(cors_mode)));
         self.doc.net_provider.fetch(self.doc.id(), req, Box::new(handler));
     }
 

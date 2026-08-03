@@ -146,13 +146,50 @@ pub struct StylesheetHandler {
     pub guard: SharedRwLock,
     pub net_provider: Arc<dyn NetProvider>,
     pub abort_signal: Option<AbortSignal>,
+    // The CSS fetch mode this sheet was requested with,
+    // "cors" or "no-cors". Threaded onto nested @import loads, which
+    // inherit the importing sheet's mode per CSSOM.
+    pub cors_mode: Option<String>,
+}
+
+/// Stylesheet `content_type` tag, carrying the fetch mode as
+/// a MIME parameter so the embedder can decide whether the sheet's text
+/// is ever allowed to reach page JS.
+pub(crate) fn css_content_type(cors_mode: Option<&str>) -> String {
+    match cors_mode {
+        Some(mode) => format!("text/css;ks-cors={mode}"),
+        None => String::from("text/css"),
+    }
+}
+
+// Css-syntax §3.2 "decode a stylesheet": BOM, then @charset,
+// then strict UTF-8. Legacy non-UTF-8 bytes (sigarra.up.pt ships
+// iso-8859-15 sheets) fall back to windows-1252 instead of the old
+// hard `Err("Invalid UTF8")`, which silently dropped the whole sheet.
+pub(crate) fn decode_css_bytes(bytes: &[u8]) -> String {
+    use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252};
+    // @charset "<label>"; must be the exact byte prefix per the spec;
+    // utf-16 labels decode as utf-8 (css-syntax's deliberate quirk).
+    let prelude = bytes
+        .strip_prefix(b"@charset \"")
+        .and_then(|rest| {
+            let end = rest.iter().position(|&b| b == b'"')?;
+            (rest.get(end + 1) == Some(&b';')).then(|| &rest[..end])
+        })
+        .and_then(Encoding::for_label)
+        .map(|enc| if enc == UTF_16BE || enc == UTF_16LE { UTF_8 } else { enc });
+    let fallback = prelude.unwrap_or_else(|| {
+        if std::str::from_utf8(bytes).is_ok() { UTF_8 } else { WINDOWS_1252 }
+    });
+    // encoding_rs's decode() sniffs a UTF-8/16 BOM ahead of the fallback.
+    let (text, _, _) = fallback.decode(bytes);
+    text.into_owned()
 }
 
 impl NetHandler for ResourceHandler<StylesheetHandler> {
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
-        let Ok(css) = std::str::from_utf8(&bytes) else {
-            return self.respond(resolved_url, Err(String::from("Invalid UTF8")));
-        };
+        let css = decode_css_bytes(&bytes);
+        let css: &str = &css;
 
         // NOTE(Nico): I don't *think* external stylesheets should have HTML entities escaped
         // let escaped_css = html_escape::decode_html_entities(css);
@@ -174,6 +211,7 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
                 shell_provider: self.shell_provider.clone(),
                 abort_signal: self.data.abort_signal.clone(),
                 import_depth: 0,
+                cors_mode: self.data.cors_mode.clone(),
             }),
             None, // error_reporter
             QuirksMode::NoQuirks,
@@ -203,6 +241,9 @@ pub(crate) struct StylesheetLoader {
     /// Depth of `@import` nesting for the stylesheet this loader is parsing
     /// (0 for a top-level stylesheet)
     pub(crate) import_depth: usize,
+    // Fetch mode inherited from the importing sheet, so a
+    // whole @import chain carries the mode its root <link> declared.
+    pub(crate) cors_mode: Option<String>,
 }
 impl ServoStylesheetLoader for StylesheetLoader {
     fn request_stylesheet(
@@ -234,9 +275,15 @@ impl ServoStylesheetLoader for StylesheetLoader {
 
         let url = import.url.url().unwrap().clone();
         let import = ServoArc::new(lock.wrap(import));
+        // Tag nested @import loads `text/css` too. Without
+        // it the embedder falls back to URL-extension inference, and
+        // an extension-less @import (load.php?…) resolves to a generic
+        // kind, losing the stylesheet handling the top level gets.
+        let mut req = stamped_request(url.as_ref().clone(), self.abort_signal.as_ref());
+        req.content_type = Some(css_content_type(self.cors_mode.as_deref()));
         self.net_provider.fetch(
             self.doc_id,
-            stamped_request(url.as_ref().clone(), self.abort_signal.as_ref()),
+            req,
             ResourceHandler::boxed(
                 self.tx.clone(),
                 self.doc_id,
@@ -269,9 +316,10 @@ struct NestedStylesheetHandler {
 
 impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
-        let Ok(css) = std::str::from_utf8(&bytes) else {
-            return self.respond(resolved_url, Err(String::from("Invalid UTF8")));
-        };
+        // Same lossy legacy-encoding decode as the top level
+        // (an @import'ed sheet can be iso-8859-* just as easily).
+        let css = decode_css_bytes(&bytes);
+        let css: &str = &css;
 
         // NOTE(Nico): I don't *think* external stylesheets should have HTML entities escaped
         // let escaped_css = html_escape::decode_html_entities(css);

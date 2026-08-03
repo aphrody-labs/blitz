@@ -337,6 +337,9 @@ impl BaseDocument {
             shell_provider: self.shell_provider.clone(),
             abort_signal: self.abort_signal.clone(),
             import_depth: 0,
+            // The owning sheet's fetch mode isn't known here; treat
+            // CSSOM-inserted @imports as opaque ("no-cors").
+            cors_mode: Some(String::from("no-cors")),
         }
     }
 

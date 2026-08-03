@@ -1359,6 +1359,14 @@ impl BaseDocument {
                                     guard: self.guard.clone(),
                                     net_provider: self.net_provider.clone(),
                                     abort_signal: self.abort_signal.clone(),
+                                    // Same crossorigin rule as the
+                                    // initial load in load_linked_stylesheet.
+                                    cors_mode: Some(String::from(
+                                        match element.attr(LocalName::from("crossorigin")) {
+                                            Some(_) => "cors",
+                                            None => "no-cors",
+                                        },
+                                    )),
                                 },
                             ),
                         );
@@ -1501,6 +1509,9 @@ impl BaseDocument {
                 shell_provider: self.shell_provider.clone(),
                 abort_signal: self.abort_signal.clone(),
                 import_depth: 0,
+                // An inline <style> carries no crossorigin
+                // attribute, so its @imports fetch in mode "no-cors".
+                cors_mode: Some(String::from("no-cors")),
             }),
             None,
             QuirksMode::NoQuirks,
@@ -1807,7 +1818,22 @@ impl BaseDocument {
 
         match resource {
             Resource::Css(css) => {
-                let node_id = res.node_id.unwrap();
+                // Script can remove the <link> while its sheet is
+                // still in flight. A dropped node leaves a stale key, and
+                // indexing it panicked in the middle of handle_messages; a
+                // detached one would apply its sheet to a document it is no
+                // longer part of. Chrome drops that load too. Inserting the
+                // link again starts a new fetch (process_added_subtree).
+                let Some(node_id) = res.node_id else {
+                    return;
+                };
+                let connected = self
+                    .nodes
+                    .get(node_id)
+                    .is_some_and(|node| node.is_element() && node.flags.is_in_document());
+                if !connected {
+                    return;
+                }
                 self.add_stylesheet_for_node(css, node_id);
             }
             Resource::ImportedCss(import_rule, sheet) => {
