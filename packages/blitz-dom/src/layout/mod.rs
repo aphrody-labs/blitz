@@ -12,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use style::Atom;
 use style::values::computed::CSSPixelLength;
+use style::values::specified::box_::DisplayInside;
 use style::values::computed::length_percentage::CalcLengthPercentage;
 use stylo_taffy::TaffyStyloStyle;
 use taffy::{
@@ -598,6 +599,15 @@ impl LayoutPassState<'_> {
 
                     return output;
                 }
+
+                // display:flow-root establishes a block formatting context, so it
+                // contains its own floats. taffy infers one from overflow alone,
+                let is_flow_root = node
+                    .primary_styles()
+                    .is_some_and(|styles| styles.clone_display().inside() == DisplayInside::FlowRoot);
+
+                // so withhold the inherited context to make this node a root.
+                let block_ctx = if is_flow_root { None } else { block_ctx };
 
                 if node.flags.is_inline_root() {
                     return self.compute_inline_layout(dom_node_id(node_id), inputs, block_ctx);
