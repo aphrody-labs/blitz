@@ -232,6 +232,16 @@ pub enum DocumentEvent {
     PendingFontFaces(Vec<crate::net::PendingFontFace>),
 }
 
+/// One author @font-face face as fontique filed it: the
+/// blob plus the exact (family, attrs) key unregister_font needs.
+pub struct AuthorFontRegistration {
+    pub bytes: Blob<u8>,
+    pub family: parley::fontique::FamilyId,
+    pub width: parley::fontique::FontWidth,
+    pub style: parley::fontique::FontStyle,
+    pub weight: parley::fontique::FontWeight,
+}
+
 pub struct BaseDocument {
     /// ID of the document
     id: usize,
@@ -246,6 +256,12 @@ pub struct BaseDocument {
     /// CSS counter side tables (list-item values + resolved pseudo
     /// content), rebuilt by resolve_counters on every resolve pass.
     pub(crate) counters: crate::layout::counters::CounterOutput,
+
+    /// Every author @font-face registration (blob + the
+    /// (family, attrs) keys fontique filed it under), drained by the
+    /// embedder's shaping-until-raster upgrade so it can unregister
+    /// the stripped faces and re-register full files in place.
+    pub author_font_registrations: Vec<AuthorFontRegistration>,
     /// Sticky positive gate: set once a resolve pass finds any counter
     /// usage, so later passes skip the flat usage scan (see counters.rs).
     pub(crate) counters_seen: bool,
@@ -547,6 +563,7 @@ impl BaseDocument {
             damage_summary: DamageSummary::default(),
             devtool_settings: DevtoolSettings::default(),
             counters: Default::default(),
+            author_font_registrations: Vec::new(),
             counters_seen: false,
             url: base_url,
             author_sheet_cache: HashMap::new(),
@@ -1863,9 +1880,22 @@ impl BaseDocument {
 
                 // TODO: Investigate eliminating double-box
                 let mut global_font_ctx = self.font_ctx.lock().unwrap();
-                global_font_ctx
+                let registered = global_font_ctx
                     .collection
                     .register_fonts(font.clone(), Some(info_override));
+                // Record (blob, family, attrs) so the
+                // shaping-until-raster upgrade can swap this face.
+                for (family, fonts) in &registered {
+                    for f in fonts {
+                        self.author_font_registrations.push(AuthorFontRegistration {
+                            bytes: font.clone(),
+                            family: *family,
+                            width: f.width(),
+                            style: f.style(),
+                            weight: f.weight(),
+                        });
+                    }
+                }
 
                 #[cfg(feature = "parallel-construct")]
                 {
@@ -2658,6 +2688,41 @@ impl BaseDocument {
         let changes = DeviceChanges::from_viewports(&self.viewport, &viewport);
         self.viewport = viewport;
         self.queue_device_changes(changes);
+    }
+
+    /// Drain the author @font-face registrations recorded
+    /// by load_resource's Resource::Font arm. See the field docs.
+    pub fn take_author_font_registrations(&mut self) -> Vec<AuthorFontRegistration> {
+        std::mem::take(&mut self.author_font_registrations)
+    }
+
+    /// Font blobs were swapped in the shared collection
+    /// (shaping-only faces upgraded to full files). Re-shape every
+    /// inline context so glyph runs re-bind to the new blobs, and
+    /// throw away every inline-SVG snapshot: those were serialized
+    /// while usvg's fontdb had no outline-bearing faces, so their
+    /// `<text>` was dropped from the parsed tree for good.
+    pub fn fonts_upgraded(&mut self) {
+        self.invalidate_inline_contexts();
+        let svg_roots: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                let has_svg_snapshot = node
+                    .element_data()
+                    .and_then(|el| el.svg_image_data())
+                    .is_some();
+                has_svg_snapshot.then_some(id)
+            })
+            .collect();
+        for id in svg_roots {
+            if let Some(el) = self.nodes[id].element_data_mut() {
+                el.special_data = SpecialElementData::None;
+            }
+            self.iter_subtree_mut(id, |sid, doc| {
+                doc.nodes[sid].insert_damage(crate::layout::damage::ALL_DAMAGE);
+            });
+        }
     }
 
     /// Returns the current CSS media type used to evaluate `@media` rules.
