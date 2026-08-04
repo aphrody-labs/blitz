@@ -2834,6 +2834,21 @@ impl BaseDocument {
             .and_then(|el| el.sub_doc_data_mut())
     }
 
+    /// The document's live CSS animations and transitions. An embedder that
+    /// drives its own frame clock reads the per-element state from here to
+    /// decide whether to schedule another tick and to emit the DOM events.
+    pub fn animations(&self) -> &DocumentAnimationSet {
+        &self.animations
+    }
+
+    /// Whether any CSS animation or transition still needs a tick. Narrower
+    /// than [`Self::is_animating`], which also reports canvases, custom
+    /// widgets and scroll/scrollbar animation: those have their own redraw
+    /// paths, so a caller gating a restyle clock wants only this.
+    pub fn has_active_animations(&self) -> bool {
+        self.has_active_animations | self.subdoc_is_animating
+    }
+
     pub fn is_animating(&self) -> bool {
         #[cfg(feature = "custom-widget")]
         let custom_widget_is_animating = self.custom_widget_nodes.iter().any(|&node_id| {

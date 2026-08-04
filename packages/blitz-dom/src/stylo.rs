@@ -121,7 +121,14 @@ impl crate::document::BaseDocument {
                 continue;
             }
 
-            self.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_SELF);
+            // Only a set with something left to tick can change what it
+            // contributes; a finished fill or a paused animation cannot.
+
+            // The hint also walks the ancestor chain, so an idle set costs a
+            // recascade of itself plus that walk, on every single resolve.
+            if set.needs_animation_ticks() {
+                self.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_SELF);
+            }
 
             for animation in set.animations.iter_mut() {
                 if animation.state == AnimationState::Pending && animation.started_at <= now {
