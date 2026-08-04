@@ -7,11 +7,15 @@ const LAYER_LIMIT: u32 = 1024;
 
 #[derive(Default)]
 pub(crate) struct LayerManager {
-    layers_used: Cell<u32>,
     layer_depth: Cell<u32>,
-    layers_wanted: Cell<u32>,
 
-    #[allow(unused)] // Only used for debugging. Enabled as required.
+    // Diagnostics only. layers_wanted minus layers_used is how many layers
+    // LAYER_LIMIT refused; layer_depth_used is the depth high-water mark.
+    #[allow(unused)]
+    layers_used: Cell<u32>,
+    #[allow(unused)]
+    layers_wanted: Cell<u32>,
+    #[allow(unused)]
     layer_depth_used: Cell<u32>,
 }
 
@@ -57,9 +61,11 @@ impl LayerManager {
         }
         self.layers_wanted.update(|x| x + 1);
 
-        // Check if clips are above limit
-        let layers_available = self.layers_used.get() <= LAYER_LIMIT;
-        if !layers_available {
+        // Budget concurrently-open layers, not the running total: each open
+        // layer costs the rasterizer a scratch buffer, and pops give that back.
+        // Counting every push ever made exhausts the budget partway through a
+        // heavy page, and a refused clip then paints its content unclipped.
+        if self.layer_depth.get() >= LAYER_LIMIT {
             return false;
         }
 
@@ -81,7 +87,8 @@ impl LayerManager {
         // Update accounting
         self.layers_used.update(|x| x + 1);
         self.layer_depth.update(|x| x + 1);
-        self.layer_depth.update(|x| x.max(self.layer_depth.get()));
+        self.layer_depth_used
+            .update(|x| x.max(self.layer_depth.get()));
 
         true
     }

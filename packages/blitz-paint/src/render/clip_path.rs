@@ -157,12 +157,10 @@ impl ElementCx<'_, '_> {
 
                 let x0 = ox + left;
                 let y0 = oy + top;
-                let x1 = ox + w - right;
-                let y1 = oy + h - bottom;
-
-                if x1 <= x0 || y1 <= y0 {
-                    return None;
-                }
+                // Insets that meet or cross over leave an empty region, which clips the
+                // element away; clamping keeps the rect empty rather than inverting it.
+                let x1 = (ox + w - right).max(x0);
+                let y1 = (oy + h - bottom).max(y0);
 
                 // TODO: Support border-radius on inset()
                 Some(kurbo::Rect::new(x0, y0, x1, y1).into_path(0.1))

@@ -40,7 +40,7 @@ use style::{
     },
 };
 
-use kurbo::{self, Affine, Insets, Point, Rect, Shape, Size, Stroke, Vec2};
+use kurbo::{self, Affine, BezPath, Insets, Point, Rect, Shape, Size, Stroke, Vec2};
 use peniko::{self, Fill, ImageData, ImageSampler};
 use style::values::generics::color::GenericColor;
 use taffy::Layout;
@@ -482,9 +482,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // Compute clip-path (if any) and wrap all rendering in a clip layer
         let clip_path_shape = cx.clip_path_shape();
         let has_clip_path = clip_path_shape.is_some();
-        let default_clip = cx.frame.border_box_path();
-        let mut clip_path_for_layer = clip_path_shape.unwrap_or(default_clip);
-        clip_path_for_layer.apply_affine(Affine::scale(self.scale));
 
         // CSS 2 `clip` property (absolutely positioned elements only). Applies to the whole of
         // the element's rendering (including outlines and shadows), so it is the outermost layer.
@@ -502,8 +499,24 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             None,
         );
 
+        // An empty clip-path region means every pixel the subtree paints is discarded
+        // by the layer that wraps it, so the whole traversal below is dead work.
+        let clipped_away = is_empty_clip_region(clip_path_shape.as_ref());
+
         cx.draw_outline(scene);
         cx.draw_outset_box_shadow(scene);
+
+        // Outline and outset shadow paint outside the clip-path layer here, so they
+        // stay above the skip to keep an empty-clipped frame pixel-identical.
+        if clipped_away {
+            self.layer_manager
+                .maybe_pop_layer(scene, css_clip_layer_pushed);
+            return;
+        }
+
+        let default_clip = cx.frame.border_box_path();
+        let mut clip_path_for_layer = clip_path_shape.unwrap_or(default_clip);
+        clip_path_for_layer.apply_affine(Affine::scale(self.scale));
 
         // clip-path clip ayer
         self.layer_manager.maybe_with_layer(
@@ -775,6 +788,17 @@ struct ElementCx<'dom, 'a> {
 /// Converts parley BoundingBox into peniko Rect
 fn convert_rect(rect: &parley::BoundingBox) -> kurbo::Rect {
     peniko::kurbo::Rect::new(rect.x0, rect.y0, rect.x1, rect.y1)
+}
+
+/// Whether a resolved clip region covers no area, and so hides the element and
+/// everything painted inside its clip layer.
+fn is_empty_clip_region(shape: Option<&BezPath>) -> bool {
+    // Zero-area bounding box is sufficient, not necessary: it catches the empty
+    // rects inset() collapses to without walking odd-even fill rules.
+    shape.is_some_and(|shape| {
+        let bounds = shape.bounding_box();
+        bounds.width() <= 0.0 || bounds.height() <= 0.0
+    })
 }
 
 impl ElementCx<'_, '_> {
