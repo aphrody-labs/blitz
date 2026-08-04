@@ -382,7 +382,15 @@ impl BaseDocument {
             let mut damage = doc.nodes[node_id].damage().unwrap_or(ALL_DAMAGE);
             let _flags = doc.nodes[node_id].flags;
 
-            if damage.intersects(CONSTRUCT_FC | CONSTRUCT_BOX) {
+            // A node with no cached children has nothing to skip
+            // TO, so it must re-collect whatever its damage says. The skip
+            // branch below take()s the list and restores it at the end, so
+            // a panic anywhere in between (the embedder recovers from wasm
+            // panics) leaves it None forever. Without this the
+            // whole page silently resolves to zero height on the next pass.
+            let ks_gate_open = damage.intersects(CONSTRUCT_FC | CONSTRUCT_BOX)
+                || doc.nodes[node_id].layout_children.borrow().is_none();
+            if ks_gate_open {
                 //} || flags.contains(NodeFlags::IS_INLINE_ROOT) {
 
                 // Deallocate the anonymous blocks created for this node in the
@@ -515,6 +523,9 @@ impl BaseDocument {
                     let font_ctx_mut = &mut *self.font_ctx.lock().unwrap();
 
                     layout.content_widths = None;
+                    // The rebuild throws the lines away with the tree, so
+                    // the recorded break width describes nothing.
+                    layout.last_break_width = f32::NAN;
                     build_inline_layout_into(
                         &self.nodes,
                         layout_ctx_mut,
@@ -551,6 +562,7 @@ impl BaseDocument {
                         .element_data_mut()
                         .unwrap()
                         .inline_layout_data = Some(layout);
+                    self.inline_roots.push(result.node_id);
                 }
             }
         }
@@ -592,7 +604,75 @@ impl BaseDocument {
         #[cfg(not(feature = "writing-mode"))]
         taffy::round_layout(&mut state, root_element_id);
 
+        self.restore_clobbered_inline_breaks();
+
         // println!("\n\n");
         // taffy::print_tree(self, root_node_id)
+    }
+
+    /// A measure pass can run after a container's final layout pass and
+    /// leave parley broken at max-content, so card text painted on one
+    /// 474px line inside a 249px block. Nothing dirties afterwards,
+    /// so there is no later resolve to correct it. Re-break any container
+    /// whose lines do not match the box it committed to, back to that
+    /// box. Steady state finds none.
+    ///
+    /// NaN is the other half of "doesn't match": box construction rebuilds
+    /// the parley tree with no lines at all, and taffy only re-breaks it
+    /// if an ancestor relaid out: so construct damage under a warm
+    /// ancestor left todomvc's quote paragraph correctly sized and blank.
+    ///
+    /// This walks every node on every resolve, deliberately: the whole
+    /// reason it exists is that nothing is left dirty to key off, so a
+
+    /// damage gate would skip exactly the passes it has to run on.
+    /// Non-inline nodes bail on the downcast, well under the cascade above.
+    fn restore_clobbered_inline_breaks(&mut self) {
+        let mut stale: Vec<(NodeId, f32)> = Vec::new();
+        let mut roots = std::mem::take(&mut self.inline_roots);
+        // Only the push sites can add duplicates or unsorted ids; if none ran
+        // this frame the vec is still sorted from last time.
+        if roots.len() > self.inline_roots_settled {
+            roots.sort_unstable();
+            roots.dedup();
+        }
+        debug_assert!(
+            !self.nodes.iter().any(|(id, n)| n
+                .data
+                .downcast_element()
+                .is_some_and(|el| el.inline_layout_data.is_some())
+                && roots.binary_search(&id).is_err()),
+            "an inline root escaped the index; its breaks would never restore"
+        );
+        // Prune dead entries in the same pass that checks them: retain keeps
+        // the sort order, so the invariant above survives.
+        let nodes = &self.nodes;
+        roots.retain(|&id| {
+            let Some(node) = nodes.get(id) else {
+                return false;
+            };
+            let Some(inline) = node
+                .data
+                .downcast_element()
+                .and_then(|el| el.inline_layout_data.as_ref())
+            else {
+                return false;
+            };
+            let l = node.final_layout();
+            let content_w =
+                l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right;
+            if content_w > 0.0 {
+                let unbroken = !inline.last_break_width.is_finite();
+                if unbroken || (content_w - inline.last_break_width).abs() > 0.5 {
+                    stale.push((id, content_w));
+                }
+            }
+            true
+        });
+        self.inline_roots_settled = roots.len();
+        self.inline_roots = roots;
+        for (id, content_w) in stale {
+            self.rebreak_inline_to_width(id, content_w);
+        }
     }
 }

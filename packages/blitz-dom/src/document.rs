@@ -407,6 +407,13 @@ pub struct BaseDocument {
     pub(crate) iframe_loads: HashMap<NodeId, crate::iframe::IframeLoad>,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) changed_nodes: HashSet<NodeId>,
+    /// Nodes that have been given inline_layout_data. A superset, pruned
+    /// where it is read: restore_clobbered_inline_breaks only cares about
+    /// inline roots, and scanning the slab to find them dominated layout.
+    pub(crate) inline_roots: Vec<NodeId>,
+    /// Length of `inline_roots` when it was last left sorted+deduped, so a
+    /// frame that pushed nothing new can skip re-sorting 80k+ entries.
+    pub(crate) inline_roots_settled: usize,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) deferred_construction_nodes: Vec<ConstructionTask>,
 
@@ -596,6 +603,8 @@ impl BaseDocument {
             pending_resource_deallocations: Vec::new(),
 
             changed_nodes: HashSet::new(),
+            inline_roots: Vec::new(),
+            inline_roots_settled: 0,
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
             dims_only_images: config.dims_only_images,

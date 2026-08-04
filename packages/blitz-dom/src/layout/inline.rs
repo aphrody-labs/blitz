@@ -339,6 +339,7 @@ impl LayoutPassState<'_> {
                 .downcast_element_mut()
                 .unwrap()
                 .inline_layout_data = Some(inline_layout);
+            self.inline_roots.push(node_id);
             return LayoutOutput::from_outer_size(
                 Size::ZERO.maybe_max(container_pb.sum_axes().map(Some)),
             );
@@ -638,6 +639,7 @@ impl LayoutPassState<'_> {
                 .downcast_element_mut()
                 .unwrap()
                 .inline_layout_data = Some(inline_layout);
+            self.inline_roots.push(node_id);
 
             let measured_size = inputs.known_dimensions.unwrap_or(taffy::Size {
                 width: width.ceil() / scale,
@@ -662,6 +664,11 @@ impl LayoutPassState<'_> {
         inline_layout
             .layout
             .set_text_indent(resolved_text_indent * scale, indent_options);
+
+        // Remember the content width these lines were broken
+        // at, in CSS px. A later measure pass can clobber parley, and
+        // resolve re-breaks to this width to put it back.
+        inline_layout.last_break_width = width / scale;
 
         #[cfg(not(feature = "floats"))]
         {
@@ -756,6 +763,7 @@ impl LayoutPassState<'_> {
                             clear,
                             false,
                         );
+                        self.nodes[node_id].placed_floats.set(true);
 
                         let min_y = state.line_y() / scale as f64; //.max(pos.y as f64);
                         let next_slot =
@@ -805,17 +813,7 @@ impl LayoutPassState<'_> {
             breaker.finish();
         }
 
-        // -webkit-box + orient:vertical + line-clamp:N was rewritten to
-        // flow-root at computed-value time; the stylo flag says clamp here.
-        let clamp_lines = self.nodes[node_id].primary_styles().and_then(|s| {
-            use style::computed_value_flags::ComputedValueFlags;
-            if !s.flags.contains(ComputedValueFlags::IS_WEBKIT_LINE_CLAMP_CONTEXT) {
-                return None;
-            }
-            let clamp = s.get_box().clone__webkit_line_clamp();
-            (!clamp.is_none()).then(|| clamp.0.max(1) as usize)
-        });
-        if let Some(max_lines) = clamp_lines {
+        if let Some(max_lines) = self.inline_clamp_lines(node_id) {
             inline_layout.layout.truncate_lines(max_lines);
         }
 
@@ -828,15 +826,7 @@ impl LayoutPassState<'_> {
             container_pb.top + float_height_contribution,
         );
 
-        let (alignment, last_line_alignment) = self.nodes[node_id]
-            .primary_styles()
-            .map(|s| {
-                (
-                    stylo_to_parley::text_align(s.clone_text_align()),
-                    stylo_to_parley::text_align_last(s.clone_text_align_last()),
-                )
-            })
-            .unwrap_or((parley::layout::Alignment::Start, None));
+        let (alignment, last_line_alignment) = self.inline_alignment(node_id);
 
         inline_layout.layout.align(
             alignment,
@@ -933,8 +923,16 @@ impl LayoutPassState<'_> {
         // Store sizes and positions of inline boxes
         let mut ibox_order: u32 = 0;
         let mut span_cb_flags = StyleFlags::empty();
+        // A measure pass must not commit geometry. It runs at
+        // max-content, so writing positions here parks an inline box off
+        // the right edge of the narrower box the container committed to,
+        // and it clips away.
+        let commit_positions = inputs.run_mode == taffy::RunMode::PerformLayout;
         for line in inline_layout.layout.lines() {
             for item in line.items() {
+                if !commit_positions {
+                    break;
+                }
                 if let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item {
                     let order = ibox_order;
                     ibox_order += 1;
@@ -1198,6 +1196,7 @@ impl LayoutPassState<'_> {
             .downcast_element_mut()
             .unwrap()
             .inline_layout_data = Some(inline_layout);
+        self.inline_roots.push(node_id);
 
         let oof_position_inset = taffy::Rect {
             left: border.left,
@@ -1244,4 +1243,64 @@ impl LayoutPassState<'_> {
 #[inline(always)]
 fn f32_max(a: f32, b: f32) -> f32 {
     a.max(b)
+}
+
+impl crate::BaseDocument {
+    // Re-break a container's text to a width it already
+    // committed to, without re-running layout. Repairing at the parley
+    // level is deliberate: replaying `compute_inline_layout` would need
+    // a block context that is gone by now, and passing `None` builds a
+    // fresh BFC whose empty float bands relocate every float to the top.
+    pub(crate) fn rebreak_inline_to_width(&mut self, node_id: NodeId, css_width: f32) {
+        let scale = self.viewport.scale();
+        let clamp_lines = self.inline_clamp_lines(node_id);
+        let (alignment, last_line_alignment) = self.inline_alignment(node_id);
+        let Some(inline_layout) = self.nodes[node_id]
+            .data
+            .downcast_element_mut()
+            .and_then(|el| el.inline_layout_data.as_mut())
+        else {
+            return;
+        };
+        inline_layout.layout.break_all_lines(Some(css_width * scale));
+        if let Some(max_lines) = clamp_lines {
+            inline_layout.layout.truncate_lines(max_lines);
+        }
+        inline_layout.layout.align(
+            alignment,
+            AlignmentOptions {
+                align_when_overflowing: false,
+                last_line_alignment,
+            },
+        );
+        inline_layout.last_break_width = css_width;
+    }
+
+    // -webkit-box + orient:vertical + line-clamp:N was rewritten to
+    // flow-root at computed-value time; the stylo flag says clamp here.
+    fn inline_clamp_lines(&self, node_id: NodeId) -> Option<usize> {
+        self.nodes[node_id].primary_styles().and_then(|s| {
+            use style::computed_value_flags::ComputedValueFlags;
+            if !s.flags.contains(ComputedValueFlags::IS_WEBKIT_LINE_CLAMP_CONTEXT) {
+                return None;
+            }
+            let clamp = s.get_box().clone_line_clamp();
+            clamp.max_lines.lines_value().map(|lines| lines.0.max(1) as usize)
+        })
+    }
+
+    fn inline_alignment(
+        &self,
+        node_id: NodeId,
+    ) -> (parley::layout::Alignment, Option<parley::layout::Alignment>) {
+        self.nodes[node_id]
+            .primary_styles()
+            .map(|s| {
+                (
+                    stylo_to_parley::text_align(s.clone_text_align()),
+                    stylo_to_parley::text_align_last(s.clone_text_align_last()),
+                )
+            })
+            .unwrap_or((parley::layout::Alignment::Start, None))
+    }
 }

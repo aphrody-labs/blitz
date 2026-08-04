@@ -3,14 +3,14 @@ use std::collections::HashSet;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 
-use crate::layout::damage::ALL_DAMAGE;
+use crate::layout::damage::{ALL_DAMAGE, CONSTRUCT_BOX};
 use crate::net::{ImageHandler, ResourceHandler, StylesheetHandler};
 use crate::node::{CanvasData, NodeFlags, ShadowRootMode, SpecialElementData, TextInputData};
 use crate::stylo_device::DeviceChanges;
 use crate::util::ImageType;
 use crate::{
     Attribute, BaseDocument, Document, ElementData, LocalName, Node, NodeData, QualName,
-    local_name, qual_name,
+    local_name, ns, qual_name,
 };
 use blitz_traits::shell::Viewport;
 use style::Atom;
@@ -287,6 +287,44 @@ impl DocumentMutator<'_> {
         }
     }
 
+    /// An inline `<svg>` is serialized to usvg once, at box
+    /// construction (see construct.rs), so nothing inside it re-renders
+    /// unless that root's box is rebuilt. The restyle hint a mutation
+    /// leaves behind does not do that: SVG-internal attributes cascade to
+    /// nothing, so stylo computes no damage and incremental layout skips
+    /// the subtree, leaving a stale snapshot on screen forever.
+    fn mark_enclosing_svg_for_reconstruction(&mut self, node_id: NodeId) {
+        // Only an SVG-namespaced node can be part of a snapshot, so every
+        // HTML write (the overwhelming majority) skips the walk here
+        // rather than paying it to reach the root and find nothing.
+        // (HTML inside <foreignObject> is exempt: usvg drops it.)
+        if !self.doc.nodes[node_id]
+            .data
+            .downcast_element()
+            .is_some_and(|el| el.name.ns == ns!(svg))
+        {
+            return;
+        }
+        // The outermost svg is the one holding the snapshot; nested <svg>
+        // elements are serialized as part of it and never construct a box.
+        let mut svg_root = None;
+        let mut cur = Some(node_id);
+        while let Some(id) = cur {
+            let node = &self.doc.nodes[id];
+            if node
+                .data
+                .downcast_element()
+                .is_some_and(|el| el.name.local == local_name!("svg"))
+            {
+                svg_root = Some(id);
+            }
+            cur = node.parent;
+        }
+        if let Some(id) = svg_root {
+            self.doc.nodes[id].insert_damage(CONSTRUCT_BOX);
+        }
+    }
+
     pub fn set_attribute(&mut self, node_id: NodeId, name: QualName, value: &str) {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
@@ -323,6 +361,8 @@ impl DocumentMutator<'_> {
             // Without this, the traversal may skip nodes with pending RestyleHint/damage
             // because it uses dirty_descendants flags to determine which subtrees to visit.
             self.doc.nodes[node_id].mark_ancestors_dirty();
+
+            self.mark_enclosing_svg_for_reconstruction(node_id);
         }
 
         if name.local == local_name!("id") && node_is_in_document {

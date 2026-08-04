@@ -756,10 +756,13 @@ impl taffy::CacheTree for LayoutPassState<'_> {
         node_id: NodeId,
         inputs: &taffy::LayoutInput,
     ) -> Option<taffy::LayoutOutput> {
-        self.node_from_id_mut(node_id)
-            .try_layout_data_mut()?
-            .cache
-            .get(inputs)
+        let node = self.node_from_id_mut(node_id);
+        // A cached container never re-registers its floats into
+        // the BFC, so later floats see empty bands. Re-run these.
+        if node.placed_floats.get() {
+            return None;
+        }
+        node.try_layout_data_mut()?.cache.get(inputs)
     }
 
     #[inline]

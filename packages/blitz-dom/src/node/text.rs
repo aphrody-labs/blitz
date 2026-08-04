@@ -21,7 +21,7 @@ impl TextBrush {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TextLayout {
     pub text: String,
     pub content_widths: Option<ContentWidths>,
@@ -38,6 +38,27 @@ pub struct TextLayout {
     // (measured committed+pending around each push), consumed by
     // the DOM-selection paint bridge with clamping.
     pub node_ranges: Vec<(NodeId, core::ops::Range<usize>)>,
+    /// Content width `layout` currently holds lines for, or
+    /// NaN when it holds none: a rebuilt tree has no lines until
+    /// something breaks it. resolve compares this against the committed
+    /// box and re-breaks on either mismatch. See restore_clobbered_inline_breaks.
+    pub last_break_width: f32,
+}
+
+impl Default for TextLayout {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            content_widths: None,
+            layout: parley::layout::Layout::default(),
+            block_offset: 0.0,
+            span_cb_flags: stylo_taffy::StyleFlags::empty(),
+            node_ranges: Vec::new(),
+            // NaN = no lines yet; the repair scan gives it some once
+            // the node has a committed box.
+            last_break_width: f32::NAN,
+        }
+    }
 }
 
 impl TextLayout {

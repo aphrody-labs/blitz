@@ -139,6 +139,13 @@ pub struct Node {
     /// paint_parent_override), rebuilt with this node's paint children.
     pub rehomed_paint_children: RefCell<ThinVec<NodeId>>,
 
+    /// This node's inline pass placed a float into the shared
+    /// block formatting context. Floats are registered as a side effect
+    /// of laying the container out, so serving it from the layout cache
+    /// leaves the bands empty and a later float in the same BFC stacks
+    /// at the top instead of below this one (todomvc's quote columns).
+    pub placed_floats: Cell<bool>,
+
     /// Union of re-homed paint boxes reachable through this node, in
     /// this node's own coordinate space (border-box origin), CSS px.
     /// (x0, y0, x1, y1); None = no re-homed content below here.
@@ -452,6 +459,7 @@ impl Node {
             paint_children: RefCell::new(None),
             paint_parent_override: Cell::new(None),
             rehomed_paint_children: RefCell::new(ThinVec::new()),
+            placed_floats: Cell::new(false),
             rehomed_reach: Cell::new(None),
             stacking_context: None,
             sc_contribution_cache: RefCell::new(ThinVec::new()),
