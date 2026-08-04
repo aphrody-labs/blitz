@@ -314,17 +314,10 @@ impl DocumentMutator<'_> {
             }
             node.mark_damaged();
 
-            // TODO: make this fine grained / conditional based on ElementSelectorFlags
-            let parent = node.parent;
-            if let Some(parent_id) = parent {
-                let parent = &mut self.doc.nodes[parent_id];
-                if let Some(mut data) = parent
-                    .try_stylo_element_data_mut()
-                    .and_then(|s| s.get_mut())
-                {
-                    data.hint |= RestyleHint::restyle_subtree();
-                }
-            }
+            // No blanket restyle_subtree() on the parent here: it would
+            // recascade every sibling on every attribute write. `:has()`
+            // anchors invalidate through stylo's relative-selector
+            // invalidator (resolve_stylist).
 
             // Mark ancestors dirty so the style traversal visits this subtree.
             // Without this, the traversal may skip nodes with pending RestyleHint/damage
@@ -646,6 +639,10 @@ impl DocumentMutator<'_> {
     pub fn remove_node(&mut self, node_id: NodeId) {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         self.doc.slot_assignments_dirty = true;
+        // Relative selectors are collected off the still-linked node, so this
+        // has to run before either interaction cleanup or unlinking.
+        self.doc.invalidate_relative_selectors_for_removal(node_id);
+
         // Process the subtree *before* severing the parent link so that
         // interaction state referencing removed nodes can retarget to the
         // nearest surviving ancestor.
@@ -678,6 +675,11 @@ impl DocumentMutator<'_> {
     ) -> Option<Node> {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         self.doc.slot_assignments_dirty = true;
+
+        // Must precede the drop; the invalidator walks the node's
+        // own ancestors and siblings to find `:has()` anchors.
+        self.doc.invalidate_relative_selectors_for_removal(node_id);
+
         self.process_removed_subtree(node_id);
 
         let node = self.doc.drop_node_ignoring_parent_with(node_id, on_drop);
@@ -710,6 +712,13 @@ impl DocumentMutator<'_> {
 
     pub fn remove_and_drop_all_children(&mut self, node_id: NodeId) {
         self.doc.slot_assignments_dirty = true;
+
+        // Same ordering constraint as remove_node, once per child
+        // since each is a separate removal as far as `:has()` is concerned.
+        for child_id in self.doc.nodes[node_id].children.clone() {
+            self.doc.invalidate_relative_selectors_for_removal(child_id);
+        }
+
         let parent = &mut self.doc.nodes[node_id];
         let parent_is_in_doc = parent.flags.is_in_document();
 
@@ -781,6 +790,15 @@ impl DocumentMutator<'_> {
         self.doc.slot_assignments_dirty = true;
         let new_parent_is_in_document = self.doc.nodes[parent_id].flags.is_in_document();
         self.mutations_occurred |= new_parent_is_in_document && !child_ids.is_empty();
+
+        // A reparent is a removal from the old position, so it needs the same
+        // pre-unlink invalidation as remove_node.
+        for &child_id in child_ids {
+            if self.doc.nodes[child_id].parent.is_some() {
+                self.doc.invalidate_relative_selectors_for_removal(child_id);
+            }
+        }
+
         // Detach the children from their old parents *before* inserting them into
         // the new parent (matching DOM `insertBefore` semantics). If a child is
         // being moved within the same parent then detaching it after insertion
@@ -843,6 +861,14 @@ impl DocumentMutator<'_> {
                 self.process_added_subtree(child_id);
             } else if !new_parent_is_in_document && child_was_in_doc {
                 self.process_removed_subtree(child_id);
+            }
+        }
+
+        // Insertions invalidate after linking, since the collector
+        // reads the node's final parent and sibling positions.
+        if new_parent_is_in_document {
+            for &child_id in child_ids.iter() {
+                self.doc.invalidate_relative_selectors_for_insertion(child_id);
             }
         }
 

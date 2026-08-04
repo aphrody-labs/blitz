@@ -2,6 +2,7 @@
 //!
 
 use blitz_traits::node_id::NodeId;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -26,6 +27,11 @@ use style::bloom::each_relevant_element_hash;
 use style::color::AbsoluteColor;
 use style::data::{ElementDataMut, ElementDataRef};
 use style::global_style_data::STYLE_THREAD_POOL;
+use style::invalidation::element::element_wrapper::ElementSnapshot;
+use style::invalidation::element::invalidator::SiblingTraversalMap;
+use style::invalidation::element::relative_selector::{
+    DomMutationOperation, RelativeSelectorInvalidator,
+};
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::ComputedValues;
 use style::properties::{Importance, PropertyDeclaration};
@@ -152,6 +158,8 @@ impl crate::document::BaseDocument {
         }
         drop(sets);
 
+        self.invalidate_relative_selectors();
+
         // Build the style context used by the style traversal
         let context = SharedStyleContext {
             traversal_flags: TraversalFlags::empty(),
@@ -254,6 +262,202 @@ impl crate::document::BaseDocument {
         style::thread_state::exit(ThreadState::LAYOUT);
 
         Some(styles.primary().clone())
+    }
+
+    /// Run stylo's relative-selector invalidator over this pass's snapshots so
+    /// a `:has()` anchor is recascaded when its subject changes. Gecko drives
+    /// this from C++ `RestyleManager`; blitz never did, so the anchor was only
+    /// recascaded when it happened to fall inside the blunt `restyle_subtree()`
+    /// that `set_attribute` stamped on the mutated node's parent.
+    ///
+    /// Must run before `traverse_dom`: `invalidated_self` writes RESTYLE_SELF
+    /// into the anchor's `ElementData`, and the mutation already marked the
+    /// root-to-node spine `dirty_descendants`, so the traversal reaches every
+    /// ancestor and every sibling of an ancestor with no extra marking.
+    fn invalidate_relative_selectors(&self) {
+        if !self.has_relative_selectors() {
+            return;
+        }
+        let quirks_mode = self.stylist.quirks_mode();
+
+        for (opaque, snapshot) in self.snapshots.iter() {
+            let Some(node) = self.nodes.get(NodeId::from_u64(opaque.id() as u64)) else {
+                continue;
+            };
+            let Some(element) = TNode::as_element(&node) else {
+                continue;
+            };
+
+            // The snapshot holds the pre-mutation state, so the XOR is exactly
+            // the bits a `:has(:hover)`-shaped dependency can have flipped.
+            let state_changes = snapshot
+                .state
+                .map_or_else(ElementState::empty, |state| state ^ element.state());
+            let has_attrs = snapshot.has_attrs();
+            let snapshot_id = if has_attrs { snapshot.id_attr() } else { None };
+
+            RelativeSelectorInvalidator {
+                element,
+                quirks_mode,
+                snapshot_table: Some(&self.snapshots),
+                invalidated: |_, _| {},
+                sibling_traversal_map: SiblingTraversalMap::default(),
+                _marker: PhantomData,
+            }
+            .invalidate_relative_selectors_for_this(
+                &self.stylist,
+                |element, scope, data, quirks_mode, collector| {
+                    let map = data.relative_selector_invalidation_map();
+
+                    // A key the mutation removed is already gone from the
+                    // element but still in the snapshot, and vice versa.
+
+                    // Both sides have to be looked up, or the anchor latches on
+                    // and never invalidates back when the subject goes away.
+                    for id in element.id().into_iter().chain(snapshot_id) {
+                        for dep in map.id_to_selector.get(id, quirks_mode).into_iter().flatten() {
+                            collector.add_dependency(dep, *element, scope);
+                        }
+                    }
+
+                    let mut each_class = |class: &AtomIdent| {
+                        for dep in map
+                            .class_to_selector
+                            .get(class, quirks_mode)
+                            .into_iter()
+                            .flatten()
+                        {
+                            collector.add_dependency(dep, *element, scope);
+                        }
+                    };
+                    element.each_class(&mut each_class);
+                    if has_attrs {
+                        snapshot.each_class(&mut each_class);
+                    }
+
+                    let mut each_attr = |name: &GenericAtomIdent<LocalNameStaticSet>| {
+                        for dep in map
+                            .other_attribute_affecting_selectors
+                            .get(name)
+                            .into_iter()
+                            .flatten()
+                        {
+                            collector.add_dependency(dep, *element, scope);
+                        }
+                    };
+                    element.each_attr_name(&mut each_attr);
+
+                    // Unguarded on purpose, unlike id_attr/each_class above:
+                    // those are trait methods whose `get_attr` unwraps
+                    // `attrs` and would panic on a state-only snapshot, while
+                    // this one just walks the `changed_attrs` vec.
+                    snapshot.each_attr_changed(&mut each_attr);
+
+                    if state_changes.is_empty() {
+                        return;
+                    }
+                    map.state_affecting_selectors.lookup_with_additional(
+                        *element,
+                        quirks_mode,
+                        None,
+                        &[],
+                        state_changes,
+                        |dep| {
+                            if dep.state.intersects(state_changes) {
+                                collector.add_dependency(&dep.dep, *element, scope);
+                            }
+                            true
+                        },
+                    );
+                },
+            );
+        }
+    }
+
+    /// Cheap gate for both relative-selector passes: a document with no
+    /// `:has()` anywhere should not pay for the invalidator at all.
+    ///
+    /// `iter_origins` only sees document-level origins, so any shadow root
+    /// forces the slow path rather than risk missing a shadow `:has()`.
+    fn has_relative_selectors(&self) -> bool {
+        !self.shadow_roots.is_empty()
+            || self
+                .stylist
+                .iter_origins()
+                .any(|(data, _)| data.relative_invalidation_map_attributes().used)
+    }
+
+    /// Structural sibling of the pass above, for tree mutations rather than
+    /// attribute and state ones. Snapshots only exist for the latter, so an
+    /// insert or remove has to invalidate at mutation time.
+    ///
+    /// Ordering is forced by the collector reading the node's live parent and
+    /// siblings: insertions invalidate after the node is linked, removals
+    /// before it is unlinked.
+    fn invalidate_relative_selectors_for_dom_mutation(
+        &self,
+        node_id: NodeId,
+        operation: DomMutationOperation,
+    ) {
+        if !self.has_relative_selectors() {
+            return;
+        }
+        let Some(node) = self.nodes.get(node_id) else {
+            return;
+        };
+        let Some(element) = TNode::as_element(&node) else {
+            return;
+        };
+
+        // A node that never took part in selector matching carries no search
+        // direction, and `DomMutationOperation::accept` rejects those outright.
+
+        // Seeding it from the parent is what makes a freshly created element
+        // invalidate at all, and mirrors what matching would have stamped.
+        let inherited_search_path = selectors::Element::parent_element(&element)
+            .map_or_else(ElementSelectorFlags::empty, |parent| {
+                parent.relative_selector_search_direction()
+            });
+
+        RelativeSelectorInvalidator {
+            element,
+            quirks_mode: self.stylist.quirks_mode(),
+            snapshot_table: Some(&self.snapshots),
+            // The invalidator propagates `dirty_descendants` from what it
+            // restyles up to the anchor only. `set_dirty_descendants` does not
+            // mark ancestors, so the anchor's own ancestors stay clean
+            // unless this marks them. A removal runs this before unlinking, and
+            // its own `mark_ancestors_dirty` from the parent then stops at the
+            // already-set anchor, so the traversal never reached the subject.
+            invalidated: |anchor, result| {
+                if result.has_invalidated_self()
+                    || result.has_invalidated_descendants()
+                    || result.has_invalidated_siblings()
+                {
+                    anchor.mark_ancestors_dirty();
+                }
+            },
+            sibling_traversal_map: SiblingTraversalMap::default(),
+            _marker: PhantomData,
+        }
+        // `subtree`: the node may carry a whole subtree containing the
+        // subject, and upstream still gates the walk on the map's own flag.
+        .invalidate_relative_selectors_for_dom_mutation(
+            true,
+            &self.stylist,
+            inherited_search_path,
+            operation,
+        );
+    }
+
+    pub(crate) fn invalidate_relative_selectors_for_removal(&self, node_id: NodeId) {
+        self.invalidate_relative_selectors_for_dom_mutation(node_id, DomMutationOperation::Remove);
+    }
+
+    pub(crate) fn invalidate_relative_selectors_for_insertion(&self, node_id: NodeId) {
+        // `Append` only unlocks an optimization that assumes a later sibling
+        // can take over the match, so `Insert` is the conservative choice.
+        self.invalidate_relative_selectors_for_dom_mutation(node_id, DomMutationOperation::Insert);
     }
 }
 
@@ -1424,11 +1628,12 @@ impl<'a> TElement for BlitzNode<'a> {
         )
     }
 
+    // No CustomStateSet here, matching `has_custom_state` returning false.
+    // The relative-selector collector calls this, so it cannot stay todo!().
     fn each_custom_state<F>(&self, _callback: F)
     where
         F: FnMut(&AtomIdent),
     {
-        todo!()
     }
 
     fn has_selector_flags(&self, flags: ElementSelectorFlags) -> bool {
