@@ -588,10 +588,18 @@ pub(crate) fn style(
         .families
         .list
         .iter()
-        .map(|family| match family {
+        .filter_map(|family| Some(match family {
             stylo::SingleFontFamily::FamilyName(name) => {
                 'ret: {
                     let name = name.name.as_str();
+
+                    // Skip a family still waiting on a face for this style:
+                    // matching would otherwise substitute a loaded sibling
+                    // of the wrong style. Dropping it here falls through to
+                    // the next family, and registration re-shapes the text.
+                    if crate::net::face_pending_for_style(&name.to_lowercase(), font_style) {
+                        return None;
+                    }
 
                     // Legacy web compatibility
                     #[cfg(target_vendor = "apple")]
@@ -613,7 +621,7 @@ pub(crate) fn style(
             stylo::SingleFontFamily::Generic(generic) => {
                 parley::FontFamilyName::Generic(self::generic_font_family(*generic))
             }
-        })
+        }))
         .collect();
 
     // Wrapping and breaking

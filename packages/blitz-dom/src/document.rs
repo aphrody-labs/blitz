@@ -1536,6 +1536,9 @@ impl BaseDocument {
         // page's computed styles actually reference).
         let faces =
             crate::net::collect_font_faces(Some(node_id), &stylesheet.0, &self.guard.read());
+        crate::net::note_unloaded_faces(
+            faces.iter().map(|f| (f.family_lc.clone(), f.overrides.style)),
+        );
         self.pending_font_faces.extend(faces);
 
         // Store data on element
@@ -1693,6 +1696,11 @@ impl BaseDocument {
             DocumentEvent::ResourceLoad(resource) => self.load_resource(resource),
             DocumentEvent::NavigateIframe { node_id, url } => self.navigate_iframe(node_id, url),
             DocumentEvent::PendingFontFaces(faces) => {
+                // An @import'ed sheet's faces bypass add_stylesheet_for_node,
+                // so note them here too or the guard never engages for them.
+                crate::net::note_unloaded_faces(
+                    faces.iter().map(|f| (f.family_lc.clone(), f.overrides.style)),
+                );
                 self.pending_font_faces.extend(faces);
             }
         }
@@ -1873,6 +1881,12 @@ impl BaseDocument {
                 self.apply_iframe_html(node_id, res.request_id, res.resolved_url, &html);
             }
             Resource::Font(bytes, overrides) => {
+                if let Some(family) = overrides.family_name.as_deref() {
+                    crate::net::clear_unloaded_face(
+                        &family.to_lowercase(),
+                        overrides.style,
+                    );
+                }
                 let font = Blob::new(Arc::new(bytes));
 
                 // Build a `FontInfoOverride` from the `@font-face` descriptors
