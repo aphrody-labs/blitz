@@ -466,6 +466,8 @@ impl DocumentMutator<'_> {
             || (tag, attr) == tag_and_attr!("iframe", "srcdoc")
         {
             self.load_iframe(node_id);
+        } else if (tag, attr) == tag_and_attr!("link", "media") {
+            self.update_link_stylesheet_media(node_id);
         }
 
         self.note_possible_slot_reassignment(node_id, &name.local);
@@ -595,6 +597,8 @@ impl DocumentMutator<'_> {
         } else if (tag, attr) == tag_and_attr!("iframe", "srcdoc") && node_is_in_document {
             // Fall back to loading from the `src` attribute (if any)
             self.load_iframe(node_id);
+        } else if (tag, attr) == tag_and_attr!("link", "media") {
+            self.update_link_stylesheet_media(node_id);
         }
 
         self.note_possible_slot_reassignment(node_id, &name.local);
@@ -1312,6 +1316,10 @@ impl<'doc> DocumentMutator<'doc> {
             None => "no-cors",
         };
 
+        // Carry the media attribute to the parse so the built
+        // sheet is scoped to it (print sheets must not apply on screen).
+        let media_attr = node.attr(local_name!("media")).map(ToString::to_string);
+
         let url = self.doc.resolve_url(href);
         let handler = ResourceHandler::new(
             self.doc.tx.clone(),
@@ -1324,6 +1332,7 @@ impl<'doc> DocumentMutator<'doc> {
                 net_provider: self.doc.net_provider.clone(),
                 abort_signal: self.doc.abort_signal.clone(),
                 cors_mode: Some(String::from(cors_mode)),
+                media_attr,
             },
         );
 
@@ -1345,6 +1354,41 @@ impl<'doc> DocumentMutator<'doc> {
         let mut req = self.doc.build_request(url);
         req.content_type = Some(crate::net::css_content_type(Some(cors_mode)));
         self.doc.net_provider.fetch(self.doc.id(), req, Box::new(handler));
+    }
+
+    // A <link media> mutation re-scopes the loaded sheet
+    // in place; the async-CSS pattern (media="print" + onload flipping
+    // to "all") depends on this. Media was only snapshotted at fetch
+    // time before, so the flip never re-cascaded the new scope.
+    fn update_link_stylesheet_media(&mut self, node_id: NodeId) {
+        let node = &self.doc.nodes[node_id];
+        let media_attr = node.attr(local_name!("media")).map(ToString::to_string);
+        let Some((sheet, scope)) = self.doc.nodes_to_stylesheet.get(&node_id).cloned() else {
+            // No installed sheet (fetch in flight or never fired):
+            // re-fire so the handler snapshots the NEW media value.
+            if self.doc.nodes[node_id].flags.is_in_document() {
+                self.load_linked_stylesheet(node_id);
+            }
+            return;
+        };
+        let media_list = crate::net::parse_media_attr(
+            media_attr.as_deref(),
+            &self.doc.url.url_extra_data(),
+            style::stylesheets::Origin::Author,
+        );
+        {
+            let mut guard = self.doc.guard.write();
+            *sheet.0.media.write_with(&mut guard) = media_list;
+        }
+        // Stylo caches media evaluation in cascade data, so a pure
+        // MediaList swap needs a forced origin rebuild to recascade.
+        match scope {
+            Some(shadow_root_id) => self.doc.note_shadow_style_change(shadow_root_id),
+            None => self
+                .doc
+                .stylist
+                .force_stylesheet_origins_dirty(OriginSet::all()),
+        }
     }
 
     fn unload_stylesheet(&mut self, node_id: NodeId) {

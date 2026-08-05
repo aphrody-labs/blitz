@@ -1367,6 +1367,9 @@ impl BaseDocument {
                                             None => "no-cors",
                                         },
                                     )),
+                                    media_attr: element
+                                        .attr(local_name!("media"))
+                                        .map(ToString::to_string),
                                 },
                             ),
                         );
@@ -1474,27 +1477,8 @@ impl BaseDocument {
         let css = rewritten.as_deref().unwrap_or(css);
         // Parse the element's media attribute into a real MediaList (empty
         // list == matches everything, same as no attribute / "all").
-        let media_list = media
-            .map(str::trim)
-            .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("all"))
-            .map(|m| {
-                let url_data = self.url.url_extra_data();
-                let context = style::parser::ParserContext::new(
-                    origin,
-                    &url_data,
-                    Some(style::stylesheets::CssRuleType::Media),
-                    style_traits::ParsingMode::DEFAULT,
-                    QuirksMode::NoQuirks,
-                    Default::default(),
-                    None,
-                    None,
-                    Default::default(),
-                );
-                let mut input = cssparser::ParserInput::new(m);
-                let mut parser = cssparser::Parser::new(&mut input);
-                MediaList::parse(&context, &mut parser)
-            })
-            .unwrap_or_else(MediaList::empty);
+        let media_list =
+            crate::net::parse_media_attr(media, &self.url.url_extra_data(), origin);
 
         let data = Stylesheet::from_str(
             css,

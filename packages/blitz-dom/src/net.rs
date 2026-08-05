@@ -150,6 +150,37 @@ pub struct StylesheetHandler {
     // "cors" or "no-cors". Threaded onto nested @import loads, which
     // inherit the importing sheet's mode per CSSOM.
     pub cors_mode: Option<String>,
+    // The owning <link>'s media attribute, parsed into the
+    // sheet's MediaList so print-only sheets don't cascade on screen.
+    pub media_attr: Option<String>,
+}
+
+// Parse a link/style element's media attribute into a real
+// MediaList (empty == matches everything, same as no attr / "all").
+pub(crate) fn parse_media_attr(
+    media: Option<&str>,
+    url_data: &UrlExtraData,
+    origin: Origin,
+) -> MediaList {
+    media
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("all"))
+        .map(|m| {
+            let mut context = style::parser::ParserContext::new(
+                origin,
+                url_data,
+                Some(style::stylesheets::CssRuleType::Media),
+                style_traits::ParsingMode::DEFAULT,
+                QuirksMode::NoQuirks,
+                Default::default(),
+                None,
+                None,
+                Default::default(),
+            );
+            let mut parser = cssparser::Parser::new(m);
+            MediaList::parse(&mut context, &mut parser)
+        })
+        .unwrap_or_else(MediaList::empty)
 }
 
 /// Stylesheet `content_type` tag, carrying the fetch mode as
@@ -198,11 +229,18 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
         let rewritten = crate::css_compat::rewrite_legacy_widget_pseudo_rules(css);
         let css: &str = rewritten.as_deref().unwrap_or(css);
 
+        // Honor the <link media=…> scope. MediaList::empty()
+        // applied print-only sheets on screen (sigarra.up.pt lost its
+        // whole chrome to a print sheet's `#cabecalho{display:none}`);
+        // stylo re-evaluates the parsed list per device, like <style>.
+        let url_data: UrlExtraData = self.data.source_url.clone().into();
+        let media_list =
+            parse_media_attr(self.data.media_attr.as_deref(), &url_data, Origin::Author);
         let sheet = Stylesheet::from_str(
             css,
-            self.data.source_url.clone().into(),
+            url_data,
             Origin::Author,
-            ServoArc::new(self.data.guard.wrap(MediaList::empty())),
+            ServoArc::new(self.data.guard.wrap(media_list)),
             self.data.guard.clone(),
             Some(&StylesheetLoader {
                 tx: self.tx.clone(),
