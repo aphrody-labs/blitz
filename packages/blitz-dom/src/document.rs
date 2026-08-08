@@ -2185,17 +2185,29 @@ impl BaseDocument {
     /// an attribute mutation, so that the next style traversal can diff selector matches
     /// then-vs-now and invalidate the affected elements.
     pub fn snapshot_node(&mut self, node_id: NodeId) {
-        self.snapshot_node_impl(node_id, true)
+        self.snapshot_node_impl(node_id, true, None)
+    }
+
+    /// `changed` names the attribute about to be written, which the caller
+    /// knows and the snapshot cannot infer: `changed_attrs` is built from the
+    /// pre-mutation attribute list, so a new attribute would otherwise be absent.
+    pub fn snapshot_node_for_attr(&mut self, node_id: NodeId, changed: Option<&LocalName>) {
+        self.snapshot_node_impl(node_id, true, changed)
     }
 
     /// Snapshot only the node's pre-change [`ElementState`] ahead of a state change
     /// (hover/focus/active/etc). Cheaper than [`Self::snapshot_node`] as it does not
     /// copy attributes or trigger attribute/class/id invalidation work.
     pub fn snapshot_node_state_only(&mut self, node_id: NodeId) {
-        self.snapshot_node_impl(node_id, false)
+        self.snapshot_node_impl(node_id, false, None)
     }
 
-    fn snapshot_node_impl(&mut self, node_id: NodeId, capture_attrs: bool) {
+    fn snapshot_node_impl(
+        &mut self,
+        node_id: NodeId,
+        capture_attrs: bool,
+        changed: Option<&LocalName>,
+    ) {
         let node = &mut self.nodes[node_id];
 
         // Do not snapshot nodes that have never been styled. A snapshot records an element's
@@ -2274,18 +2286,24 @@ impl BaseDocument {
                 snapshot.id_changed = true;
                 snapshot.other_attributes_changed = true;
             }
+            // Keep the first captured values, but record every attribute name
+            // written before the next style flush.
+            if let Some(name) = changed {
+                note_changed_attr(snapshot, name);
+            }
         } else {
-            self.snapshots.insert(
-                opaque_node_id,
-                ServoElementSnapshot {
-                    state: Some(*self.nodes[node_id].element_state()),
-                    attrs,
-                    changed_attrs,
-                    class_changed: needs_attrs,
-                    id_changed: needs_attrs,
-                    other_attributes_changed: needs_attrs,
-                },
-            );
+            let mut snapshot = ServoElementSnapshot {
+                state: Some(*self.nodes[node_id].element_state()),
+                attrs,
+                changed_attrs,
+                class_changed: needs_attrs,
+                id_changed: needs_attrs,
+                other_attributes_changed: needs_attrs,
+            };
+            if let Some(name) = changed {
+                note_changed_attr(&mut snapshot, name);
+            }
+            self.snapshots.insert(opaque_node_id, snapshot);
         }
     }
 
@@ -4496,5 +4514,14 @@ impl BaseDocument {
     /// structure-driven render change since the last take".
     pub fn take_damage_summary(&mut self) -> DamageSummary {
         std::mem::take(&mut self.damage_summary)
+    }
+}
+
+/// Note `name` as changed on a snapshot. Deduped because the pre-mutation
+/// attribute list already contributes every attribute the element had.
+fn note_changed_attr(snapshot: &mut ServoElementSnapshot, name: &LocalName) {
+    let ident = GenericAtomIdent(name.clone());
+    if !snapshot.changed_attrs.contains(&ident) {
+        snapshot.changed_attrs.push(ident);
     }
 }

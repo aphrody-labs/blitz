@@ -69,13 +69,11 @@ impl StyloData {
     }
 
     pub fn primary_styles(&self) -> Option<StyleDataRef<'_>> {
-        let stylo_element_data = self.get();
-        if stylo_element_data
-            .as_ref()
-            .and_then(|d| d.styles.get_primary())
-            .is_some()
-        {
-            Some(StyleDataRef(self.get().unwrap()))
+        // One borrow, not two: paint calls this per element and per glyph
+        // run, and the discarded first borrow was an atomic round trip.
+        let data = self.get()?;
+        if data.styles.get_primary().is_some() {
+            Some(StyleDataRef(data))
         } else {
             None
         }

@@ -20,7 +20,7 @@ pub use custom_widget::{
 pub use element::{
     CanvasData, DocumentData, ElementData, ImageData, ImageResourceData, LayoutData,
     ListItemLayout, ListItemLayoutPosition, Marker, RasterImageData, SpecialElementData,
-    SpecialElementType, Status,
+    SpecialElementType, Status, parse_class_list,
 };
 pub use node::*;
 pub use scrollbar::{ScrollbarColor, ScrollbarRef, ScrollbarWidth};

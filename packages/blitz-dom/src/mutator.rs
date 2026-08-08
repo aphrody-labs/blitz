@@ -328,17 +328,21 @@ impl DocumentMutator<'_> {
     pub fn set_attribute(&mut self, node_id: NodeId, name: QualName, value: &str) {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
-            self.doc.snapshot_node(node_id);
+            self.doc.snapshot_node_for_attr(node_id, Some(&name.local));
 
             let node = &mut self.doc.nodes[node_id];
             if let Some(mut data) = node.try_stylo_element_data_mut().and_then(|s| s.get_mut()) {
-                data.hint |= RestyleHint::restyle_subtree();
-                // Do NOT eagerly stamp ALL_DAMAGE here.
-                // The restyle hint above makes the next resolve
-
-                // recascade this subtree, and stylo's
-                // compute_style_difference then computes the REAL
-
+                data.hint |= RestyleHint::RESTYLE_SELF;
+                // Recascade only the element. Everything the
+                // write can reach beyond it (descendants, later
+                // siblings) comes from the snapshot above, which stylo
+                // diffs against the invalidation map in
+                // invalidate_style_if_needed. A blanket restyle_subtree
+                // here recascaded the whole subtree for a write that
+                // matches no selector at all (7.8 ms against 0.34 ms per
+                // attribute write on a heavy page).
+                // Do not eagerly stamp ALL_DAMAGE here.
+                // stylo's compute_style_difference computes the real
                 // per-node damage (REPAINT vs RELAYOUT vs box
                 // rebuild) from old-vs-new computed values. Eagerly
                 // OR-ing ALL_DAMAGE drowned that out, so a render-
@@ -415,6 +419,10 @@ impl DocumentMutator<'_> {
 
         if *attr == local_name!("id") {
             element.id = Some(Atom::from(value))
+        }
+
+        if *attr == local_name!("class") {
+            element.classes = crate::node::parse_class_list(value);
         }
 
         if *attr == local_name!("value") {
@@ -532,7 +540,7 @@ impl DocumentMutator<'_> {
     pub fn clear_attribute(&mut self, node_id: NodeId, name: QualName) {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
-            self.doc.snapshot_node(node_id);
+            self.doc.snapshot_node_for_attr(node_id, Some(&name.local));
 
             let node = &mut self.doc.nodes[node_id];
 
@@ -593,6 +601,10 @@ impl DocumentMutator<'_> {
 
         if name.local == local_name!("href") {
             element.flush_link_state();
+        }
+
+        if name.local == local_name!("class") {
+            element.classes.clear();
         }
 
         // Update text input value

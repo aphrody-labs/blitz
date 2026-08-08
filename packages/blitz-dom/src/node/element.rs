@@ -49,6 +49,10 @@ pub struct ElementData {
     /// The elements id attribute parsed as an atom (if it has one)
     pub id: Option<Atom>,
 
+    /// The element's class attribute pre-split and interned. Selector
+    /// matching hits this per candidate, so it must not re-parse per call.
+    pub classes: Vec<Atom>,
+
     /// The element's attributes
     pub attrs: Attributes,
 
@@ -305,6 +309,7 @@ impl Clone for ElementData {
             name: self.name.clone(),
             id: self.id.clone(),
             attrs: self.attrs.clone(),
+            classes: self.classes.clone(),
             is_focussable: self.is_focussable,
             style_attribute: self.style_attribute.clone(),
             special_data: self.special_data.clone(),
@@ -409,6 +414,12 @@ impl SpecialElementData {
     }
 }
 
+/// Split a `class` attribute into interned atoms. The single place that
+/// decides tokenisation, so the cached list can't drift from the attribute.
+pub fn parse_class_list(value: &str) -> Vec<Atom> {
+    value.split_ascii_whitespace().map(Atom::from).collect()
+}
+
 impl ElementData {
     pub fn new(name: QualName, attrs: Vec<Attribute>) -> Self {
         let id_attr_atom = attrs
@@ -417,9 +428,16 @@ impl ElementData {
             .map(|attr| attr.value.as_ref())
             .map(|value: &str| Atom::from(value));
 
+        let class_atoms = attrs
+            .iter()
+            .find(|attr| &attr.name.local == "class")
+            .map(|attr| parse_class_list(attr.value.as_ref()))
+            .unwrap_or_default();
+
         let mut data = ElementData {
             name,
             id: id_attr_atom,
+            classes: class_atoms,
             attrs: Attributes::new(attrs),
             is_focussable: false,
             style_attribute: Default::default(),
