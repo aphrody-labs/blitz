@@ -349,7 +349,18 @@ impl BaseDocument {
         };
         let is_anonymous = node.is_anonymous();
         let has_damage = node.damage().is_some_and(|d| !d.is_empty());
-        if !has_damage && !node.has_damaged_descendants() && !is_anonymous {
+        // Shadow roots carry no damaged-descendants flag and live
+        // outside the host's `children`, so walk through them and always hop
+        // from a host into its shadow tree: the clear has to reach every node
+        // the propagate walk can damage, or shadow content stays damaged.
+        let is_shadow_root = node.is_shadow_root();
+        let shadow_root = node.attached_shadow_root_id();
+        if !has_damage
+            && !node.has_damaged_descendants()
+            && !is_anonymous
+            && !is_shadow_root
+            && shadow_root.is_none()
+        {
             return;
         }
         let anonymous_blocks = std::mem::take(&mut node.anonymous_blocks);
@@ -369,6 +380,9 @@ impl BaseDocument {
         }
         if let Some(after_id) = after {
             self.clear_damage_and_dirty_flags(after_id);
+        }
+        if let Some(shadow_root_id) = shadow_root {
+            self.clear_damage_and_dirty_flags(shadow_root_id);
         }
 
         let node = &mut self.nodes[node_id];
@@ -471,6 +485,17 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
         }
 
         if new.is_pseudo_style() && old.get_counters().content != new.get_counters().content {
+            return true;
+        }
+
+        // Counter-* feeds resolve_counters, which gates on
+        // CONSTRUCT damage: without this a counter write is invisible.
+        let old_counters = old.get_counters();
+        let new_counters = new.get_counters();
+        if old_counters.counter_increment != new_counters.counter_increment
+            || old_counters.counter_reset != new_counters.counter_reset
+            || old_counters.counter_set != new_counters.counter_set
+        {
             return true;
         }
 

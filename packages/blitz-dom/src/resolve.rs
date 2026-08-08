@@ -92,18 +92,19 @@ impl BaseDocument {
         self.flush_needed_font_faces();
         timer.record_time("fontface");
 
+        // Fold this resolve's per-node damage (mutations +
+        // restyle diffs) into the cross-resolve summary before anyone
+        // consumes or clears it (and before non-incremental mode marks
+        // everything damaged), and record the construct-damage bit the
+        // counters gate below reads. Consumed by the embedder via
+        // take_damage_summary (partial-frame gating).
+        self.accumulate_damage_summary();
+        timer.record_time("dmgsummary");
+
         // CSS counters: list-item values + counter()/attr() pseudo content.
         // Needs computed styles; box construction consumes the side tables.
         self.resolve_counters();
         timer.record_time("counters");
-
-        // Fold this resolve's per-node damage (mutations +
-        // restyle diffs) into the cross-resolve summary BEFORE anyone
-        // consumes or clears it (and before non-incremental mode marks
-        // everything damaged). Cheap slab walk; consumed by the
-        // embedder via take_damage_summary (partial-frame gating).
-        self.accumulate_damage_summary();
-        timer.record_time("dmgsummary");
 
         // Non-incremental mode is "every node is damaged every frame": mark the
         // whole tree and let the same damage pipeline reconstruct and relayout
@@ -150,6 +151,7 @@ impl BaseDocument {
         // by. Must run AFTER taffy layout (the one geometry pass in resolve
         // that is never stale) and after the paint tree records re-homes.
         self.compute_rehomed_reach();
+        timer.record_time("rehomed");
 
         // Clear all damage and dirty flags, walking only subtrees which are
         // marked as (potentially) containing damage.
@@ -289,17 +291,23 @@ impl BaseDocument {
     /// heavy pages the flag reaches the root, culling effectively turns
     /// off, and the recorded scene grows until the renderer's wasm aborts.
     pub fn compute_rehomed_reach(&mut self) {
-        // Reach is rebuilt from fresh layout every resolve.
-        for (_, node) in self.nodes.iter_mut() {
-            node.rehomed_reach.set(None);
+        // Reach is rebuilt from fresh layout every resolve, but only the
+        // chains we actually set last time can be holding a stale value.
+        for id in std::mem::take(&mut self.rehomed_reach_touched) {
+            if let Some(node) = self.nodes.get(id) {
+                node.rehomed_reach.set(None);
+            }
         }
 
-        let host_ids: Vec<NodeId> = self
-            .nodes
-            .iter()
-            .filter(|(_, n)| !n.rehomed_paint_children.borrow().is_empty())
-            .map(|(id, _)| id)
-            .collect();
+        // rehomed_hosts is a superset appended at the single push site, so
+        // prune it here rather than rescanning every node to find hosts.
+        let mut host_ids = std::mem::take(&mut self.rehomed_hosts);
+        host_ids.sort_unstable_by_key(|id| id.as_u64());
+        host_ids.dedup();
+        host_ids.retain(|&id| {
+            self.nodes.contains_key(id)
+                && !self.nodes[id].rehomed_paint_children.borrow().is_empty()
+        });
 
         let union =
             |acc: Option<(f32, f32, f32, f32)>, r: (f32, f32, f32, f32)| match acc {
@@ -312,7 +320,7 @@ impl BaseDocument {
                 )),
             };
 
-        for host_id in host_ids {
+        for host_id in host_ids.iter().copied() {
             let mut rect: Option<(f32, f32, f32, f32)> = None;
             let rehomed: Vec<NodeId> = self.nodes[host_id]
                 .rehomed_paint_children
@@ -344,6 +352,7 @@ impl BaseDocument {
                 let node = &self.nodes[cur];
                 node.rehomed_reach
                     .set(union(node.rehomed_reach.get(), rect));
+                self.rehomed_reach_touched.push(cur);
                 let mut loc = node.final_layout().location;
                 let parent = match node.paint_parent_override.get() {
                     Some(paint_parent) => {
@@ -370,6 +379,8 @@ impl BaseDocument {
                 cur = parent;
             }
         }
+
+        self.rehomed_hosts = host_ids;
     }
 
     pub fn resolve_layout_children(&mut self) {
@@ -380,6 +391,26 @@ impl BaseDocument {
             // between render passes. Bail out rather than panicking on a stale key.
             if doc.nodes.get(node_id).is_none() {
                 return;
+            }
+
+            // Nothing under here changed, so the walk is dead work. The gate
+            // mirrors propagate_damage_flags' skip: damage marking walks the
+            // DOM parent chain, which bypasses anonymous boxes, so those are
+            // never skipped, and a shadow host is always entered because its
+            // shadow tree is not on that chain either. Anonymous blocks and
+            // pseudo-elements created during this walk have no cached
+            // children to skip to, which is the same fact-42 escape hatch.
+            {
+                let node = &doc.nodes[node_id];
+                if doc.incremental_layout
+                    && node.damage().is_some_and(|d| d.is_empty())
+                    && !node.has_damaged_descendants()
+                    && !node.is_anonymous()
+                    && node.attached_shadow_root_id().is_none()
+                    && node.layout_children.borrow().is_some()
+                {
+                    return;
+                }
             }
 
             let mut damage = doc.nodes[node_id].damage().unwrap_or(ALL_DAMAGE);
@@ -596,6 +627,7 @@ impl BaseDocument {
 
         // println!("\n\nRESOLVE LAYOUT\n===========\n");
 
+        self.layout_changed = false;
         let mut state = LayoutPassState::new(self);
         #[cfg(feature = "writing-mode")]
         let available_space = {
@@ -607,10 +639,17 @@ impl BaseDocument {
             }
         };
         taffy::compute_root_layout(&mut state, root_element_id, available_space);
-        #[cfg(feature = "writing-mode")]
-        state.physicalise_and_round_layout(root_element_id);
-        #[cfg(not(feature = "writing-mode"))]
-        taffy::round_layout(&mut state, root_element_id);
+        // Rounding derives entirely from the unrounded layouts, so when taffy's
+        // cache answered every node last resolve's final_layout still holds.
+        //
+        // Except a rebuilt inline tree has no lines, and the restore pass below
+        // re-breaks it against final_layout, which must not be a stale box.
+        if state.layout_changed || state.inline_roots.len() != state.inline_roots_settled {
+            #[cfg(feature = "writing-mode")]
+            state.physicalise_and_round_layout(root_element_id);
+            #[cfg(not(feature = "writing-mode"))]
+            taffy::round_layout(&mut state, root_element_id);
+        }
 
         self.restore_clobbered_inline_breaks();
 
@@ -630,12 +669,17 @@ impl BaseDocument {
     /// if an ancestor relaid out: so construct damage under a warm
     /// ancestor left todomvc's quote paragraph correctly sized and blank.
     ///
-    /// This walks every node on every resolve, deliberately: the whole
-    /// reason it exists is that nothing is left dirty to key off, so a
-
-    /// damage gate would skip exactly the passes it has to run on.
+    /// Both triggers have exactly one writer, so the walk is skippable:
+    /// content_w moves only when round_layout wrote a final_layout, and a
+    /// break width is clobbered only where the rebuild also pushes the root.
     /// Non-inline nodes bail on the downcast, well under the cascade above.
     fn restore_clobbered_inline_breaks(&mut self) {
+        // Debug builds run the walk anyway and assert it finds nothing, so
+        // every test exercises the skip predicate rather than trusting it.
+        let skip = !self.layout_changed && self.inline_roots.len() == self.inline_roots_settled;
+        if skip && !cfg!(debug_assertions) {
+            return;
+        }
         let mut stale: Vec<(NodeId, f32)> = Vec::new();
         let mut roots = std::mem::take(&mut self.inline_roots);
         // Only the push sites can add duplicates or unsorted ids; if none ran
@@ -679,6 +723,11 @@ impl BaseDocument {
         });
         self.inline_roots_settled = roots.len();
         self.inline_roots = roots;
+        debug_assert!(
+            !skip || stale.is_empty(),
+            "skipped a resolve with {} stale inline roots: {stale:?}",
+            stale.len()
+        );
         for (id, content_w) in stale {
             self.rebreak_inline_to_width(id, content_w);
         }

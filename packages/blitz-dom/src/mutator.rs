@@ -382,6 +382,18 @@ impl DocumentMutator<'_> {
         }
 
         let node = &mut self.doc.nodes[node_id];
+        let counter_input_changed = name.ns == ns!()
+            && node.element_data().is_some_and(|element| {
+                (element.name.local == local_name!("ol")
+                    && (name.local == local_name!("start")
+                        || name.local == local_name!("reversed")))
+                    || (element.name.local == local_name!("li")
+                        && name.local == local_name!("value"))
+            });
+        if node_is_in_document && counter_input_changed {
+            // Counter resolution reads these attributes outside Stylo's style diff.
+            node.insert_damage(CONSTRUCT_BOX);
+        }
 
         let NodeData::Element(ref mut element) = node.data else {
             return;

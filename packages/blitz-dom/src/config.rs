@@ -57,7 +57,7 @@ pub struct DocumentConfig {
     /// Defaults to [`MediaType::screen`].
     pub media_type: Option<MediaType>,
     /// Strategy for Stylo's style traversal.
-    /// Defaults to [`StyleThreading::Parallel`].
+    /// Defaults to [`StyleThreading::Sequential`].
     pub style_threading: StyleThreading,
     /// Whether incremental layout is enabled. Defaults to `true`.
     ///

@@ -135,6 +135,8 @@ pub struct LayoutData {
     pub cache: Cache,
     pub unrounded_layout: Layout,
     pub final_layout: Layout,
+    /// Post-layout shift currently baked into `final_layout.location`.
+    pub pin_offset: taffy::Point<f32>,
     pub scroll_offset: crate::Point<f64>,
     pub scrollable_overflow: KurboRect,
     /// The writing mode this node's layout algorithm ran in (the root takes it from `<body>`),
@@ -149,6 +151,7 @@ impl LayoutData {
             cache: Cache::new(),
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
+            pin_offset: taffy::Point { x: 0.0, y: 0.0 },
             scroll_offset: crate::Point::ZERO,
             scrollable_overflow: KurboRect::ZERO,
             #[cfg(feature = "writing-mode")]

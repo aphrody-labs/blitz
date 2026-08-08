@@ -694,6 +694,11 @@ impl LayoutPartialTree for LayoutPassState<'_> {
     }
 
     fn set_unrounded_layout(&mut self, node_id: NodeId, layout: &Layout) {
+        // round_layout is a pure function of these, so noting whether any of
+        // them actually moved lets resolve skip the whole rounding walk.
+        if !self.layout_changed {
+            self.layout_changed = *self.node_from_id(node_id).unrounded_layout() != *layout;
+        }
         *self.node_from_id_mut(node_id).unrounded_layout_mut() = *layout;
     }
 
@@ -958,7 +963,11 @@ impl RoundTree for LayoutPassState<'_> {
     }
 
     fn set_final_layout(&mut self, node_id: NodeId, layout: &Layout) {
-        *self.node_from_id_mut(node_id).final_layout_mut() = *layout;
+        let layout_data = self.node_from_id_mut(node_id).layout_data_mut();
+        layout_data.final_layout = *layout;
+        // This is the only wholesale write of a location, so it is also the
+        // only place a baked sticky shift can silently disappear.
+        layout_data.pin_offset = taffy::Point { x: 0.0, y: 0.0 };
     }
 
     fn is_out_of_flow(&self, node_id: NodeId) -> bool {

@@ -459,6 +459,15 @@ impl BaseDocument {
             }
             self.counters_seen = true;
         }
+        // The output is a pure function of tree shape and computed styles,
+        // so a resolve that damaged nothing cannot have changed it. A page
+        // that trips counters_seen once would otherwise rebuild the whole
+        // thing every resolve, damaged or not.
+        if self.counters_built_once && !self.any_node_construct_damaged() {
+            return;
+        }
+        self.counters_built_once = true;
+
         let mut out = CounterOutput::default();
         let mut state = CounterState::default();
         let root = self.root_element().id;
@@ -477,7 +486,7 @@ impl BaseDocument {
     /// string. Only a real mismatch stamps, so a steady document pays
     /// two map lookups per entry and nothing else.
     fn damage_moved_counters(&mut self, new: &CounterOutput) {
-        let mut dirty: Vec<usize> = Vec::new();
+        let mut dirty: Vec<NodeId> = Vec::new();
         let old = &self.counters;
 
         // ::before/::after text reaches the pseudo via flush_pseudo_elements,
@@ -512,11 +521,25 @@ impl BaseDocument {
             dirty.extend(self.nodes.get(id).and_then(|node| node.parent));
         }
 
-        for id in dirty {
-            if let Some(node) = self.nodes.get_mut(id) {
-                node.insert_damage(CONSTRUCT_BOX);
-            }
+        dirty.retain(|&id| self.nodes.get(id).is_some());
+        for &id in &dirty {
+            self.nodes[id].insert_damage(CONSTRUCT_BOX);
         }
+        // This damage lands after the summary was taken, so hand it over
+        // explicitly instead of leaving the walks blind to it.
+        self.note_late_layout_damage(&dirty);
+    }
+
+    /// Flat slab scan, no recursion: cheaper than the pass it guards.
+    ///
+    /// Counter output depends on tree shape and the counter-affecting
+    /// styles, and every one of those stamps CONSTRUCT damage: structural
+    /// mutations stamp ALL_DAMAGE, and display / list-style / content /
+    /// counter-* diffs rebuild the box tree (compute_layout_damage).
+    /// Plain RELAYOUT damage (a colour or background write) cannot move
+    /// a counter, so it must not drag the whole document through a rebuild.
+    fn any_node_construct_damaged(&self) -> bool {
+        self.any_construct_damage
     }
 
     fn document_uses_counters(&self) -> bool {

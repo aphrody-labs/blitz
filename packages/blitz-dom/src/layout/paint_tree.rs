@@ -350,6 +350,7 @@ impl BaseDocument {
                         .rehomed_paint_children
                         .borrow_mut()
                         .push(child_id);
+                    self.rehomed_hosts.push(node_id);
                     let is_sc_root = self.nodes[child_id].is_stacking_context_root(false);
                     self.build_paint_tree_impl(
                         child_id,

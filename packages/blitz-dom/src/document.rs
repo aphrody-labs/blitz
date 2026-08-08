@@ -1,7 +1,7 @@
 use crate::NodeTree;
 use crate::events::{DragMode, handle_dom_event};
 use crate::layout::construct::ConstructionTask;
-use crate::layout::damage::ALL_DAMAGE;
+use crate::layout::damage::{ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC};
 use crate::mutator::ViewportMut;
 use crate::net::{
     Resource, ResourceHandler, ResourceLoadResponse, StylesheetHandler, StylesheetLoader,
@@ -265,6 +265,7 @@ pub struct BaseDocument {
     /// Sticky positive gate: set once a resolve pass finds any counter
     /// usage, so later passes skip the flat usage scan (see counters.rs).
     pub(crate) counters_seen: bool,
+    pub(crate) counters_built_once: bool,
     /// CSS media type used to evaluate `@media` rules.
     pub(crate) media_type: MediaType,
     /// Changes to the stylist [`Device`] that have been requested since the
@@ -414,6 +415,18 @@ pub struct BaseDocument {
     /// Length of `inline_roots` when it was last left sorted+deduped, so a
     /// frame that pushed nothing new can skip re-sorting 80k+ entries.
     pub(crate) inline_roots_settled: usize,
+    /// Nodes holding rehomed paint children, and the ancestor chains whose
+    /// rehomed_reach we set last resolve. Both replace a full-tree scan in
+    /// compute_rehomed_reach; the host list is a self-pruning superset.
+    pub(crate) rehomed_hosts: Vec<NodeId>,
+    /// Whether any node carried CONSTRUCT damage when the summary was
+    /// taken, so counters need not run their own full slab scan to prove
+    /// a negative on a paint-only frame.
+    pub(crate) any_construct_damage: bool,
+    /// Set by set_unrounded_layout when a node's box actually moved. Clear
+    /// means every rounded layout from last resolve is still correct.
+    pub(crate) layout_changed: bool,
+    pub(crate) rehomed_reach_touched: Vec<NodeId>,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) deferred_construction_nodes: Vec<ConstructionTask>,
 
@@ -572,6 +585,7 @@ impl BaseDocument {
             counters: Default::default(),
             author_font_registrations: Vec::new(),
             counters_seen: false,
+            counters_built_once: false,
             url: base_url,
             author_sheet_cache: HashMap::new(),
             dirty_shadow_style_roots: Vec::new(),
@@ -605,6 +619,10 @@ impl BaseDocument {
             changed_nodes: HashSet::new(),
             inline_roots: Vec::new(),
             inline_roots_settled: 0,
+            rehomed_hosts: Vec::new(),
+            any_construct_damage: false,
+            layout_changed: true,
+            rehomed_reach_touched: Vec::new(),
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
             dims_only_images: config.dims_only_images,
@@ -4480,6 +4498,7 @@ impl BaseDocument {
         use style::selector_parser::RestyleDamage;
         let repaint_bits = RestyleDamage::REPAINT.bits();
         let mut found: Vec<(NodeId, bool)> = Vec::new();
+        let mut any_construct = false;
         for (id, node) in self.nodes.iter() {
             if !node.flags.contains(NodeFlags::IS_IN_DOCUMENT) {
                 continue;
@@ -4488,9 +4507,13 @@ impl BaseDocument {
             if damage.is_empty() {
                 continue;
             }
+            if damage.intersects(CONSTRUCT_BOX | CONSTRUCT_FC | CONSTRUCT_DESCENDENT) {
+                any_construct = true;
+            }
             let layout_class = (damage.bits() & !repaint_bits) != 0;
             found.push((id, layout_class));
         }
+        self.any_construct_damage = any_construct;
         let s = &mut self.damage_summary;
         for (id, layout_class) in found {
             let (list, overflow) = if layout_class {
@@ -4505,6 +4528,36 @@ impl BaseDocument {
                 *overflow = true;
             } else {
                 list.push(id);
+            }
+        }
+    }
+
+    /// A box that moved with no damage of its own (a sticky pin written through
+    /// `Node::set_pin_offset` after layout). Values memoised against the
+    /// geometry generation (hoisted paint positions) must be recomputed.
+    pub fn note_boxes_moved(&mut self, ids: &[NodeId]) {
+        if !ids.is_empty() {
+            self.nodes.bump_geometry_generation();
+        }
+    }
+
+    /// Fold damage raised after accumulate_damage_summary into the summary.
+    /// Only resolve_counters does that, and only for the counters it saw
+    /// move, so the set is explicit rather than rescanned.
+    pub(crate) fn note_late_layout_damage(&mut self, ids: &[NodeId]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.any_construct_damage = true;
+        let s = &mut self.damage_summary;
+        for &id in ids {
+            if s.layout_nodes.contains(&id) {
+                continue;
+            }
+            if s.layout_nodes.len() >= DAMAGE_SUMMARY_CAP {
+                s.layout_overflow = true;
+            } else {
+                s.layout_nodes.push(id);
             }
         }
     }
