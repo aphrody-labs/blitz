@@ -90,10 +90,12 @@ impl BaseDocument {
         // @font-face whose family just became used (lazy web-font
         // loading; see flush_needed_font_faces).
         self.flush_needed_font_faces();
+        timer.record_time("fontface");
 
         // CSS counters: list-item values + counter()/attr() pseudo content.
         // Needs computed styles; box construction consumes the side tables.
         self.resolve_counters();
+        timer.record_time("counters");
 
         // Fold this resolve's per-node damage (mutations +
         // restyle diffs) into the cross-resolve summary BEFORE anyone
@@ -101,6 +103,7 @@ impl BaseDocument {
         // everything damaged). Cheap slab walk; consumed by the
         // embedder via take_damage_summary (partial-frame gating).
         self.accumulate_damage_summary();
+        timer.record_time("dmgsummary");
 
         // Non-incremental mode is "every node is damaged every frame": mark the
         // whole tree and let the same damage pipeline reconstruct and relayout
