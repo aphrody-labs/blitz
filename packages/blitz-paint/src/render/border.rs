@@ -147,6 +147,11 @@ fn sample_points_along_path(path: &BezPath, spacing: f64, count: usize) -> Vec<P
 impl ElementCx<'_, '_> {
     /// Draw all borders for a node
     pub(crate) fn draw_border(&self, scene: &mut impl PaintScene) {
+        let widths = self.frame.border_width;
+        if widths.x0 == 0.0 && widths.y0 == 0.0 && widths.x1 == 0.0 && widths.y1 == 0.0 {
+            return;
+        }
+
         let style = &*self.style;
         let border = style.get_border();
         let current_color = style.clone_color();
@@ -601,12 +606,6 @@ impl ElementCx<'_, '_> {
     pub(crate) fn draw_outline(&self, scene: &mut impl PaintScene) {
         let outline = self.style.get_outline();
 
-        let current_color = self.style.clone_color();
-        let color = outline
-            .outline_color
-            .resolve_to_absolute(&current_color)
-            .as_srgb_color();
-
         let style = match outline.outline_style {
             OutlineStyle::Auto => return,
             OutlineStyle::BorderStyle(style) => style,
@@ -626,6 +625,11 @@ impl ElementCx<'_, '_> {
             | BorderStyle::Double => self.frame.outline(),
         };
 
+        let current_color = self.style.clone_color();
+        let color = outline
+            .outline_color
+            .resolve_to_absolute(&current_color)
+            .as_srgb_color();
         scene.fill(Fill::NonZero, self.transform, color, None, &path);
     }
 }

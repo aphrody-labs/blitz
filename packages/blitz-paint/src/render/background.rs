@@ -144,8 +144,7 @@ impl ElementCx<'_, '_> {
         // The background color is clipped by the clip of the last layer in the list
         let last_clip = *get_cyclic(&bg_styles.background_clip.0, layer_count - 1);
         if last_clip != StyloBackgroundClip::Text {
-            let background_clip_path = self.box_path(last_clip.into());
-            self.draw_solid_bg(scene, &background_clip_path);
+            self.draw_solid_bg(scene, last_clip.into());
         }
 
         for idx in (0..layer_count).rev() {
@@ -335,17 +334,18 @@ impl ElementCx<'_, '_> {
         }
     }
 
-    fn draw_solid_bg(&self, scene: &mut impl PaintScene, shape: &BezPath) {
+    fn draw_solid_bg(&self, scene: &mut impl PaintScene, css_box: BoxModelBox) {
         let current_color = self.style.clone_color();
         let background_color = &self.style.get_background().background_color;
         let bg_color = background_color
             .resolve_to_absolute(&current_color)
             .as_srgb_color();
 
-        if bg_color != Color::TRANSPARENT {
-            // Fill the color
-            scene.fill(Fill::NonZero, self.transform, bg_color, None, shape);
+        if bg_color == Color::TRANSPARENT {
+            return;
         }
+        let shape = self.box_path(css_box);
+        scene.fill(Fill::NonZero, self.transform, bg_color, None, &shape);
     }
 
     /// Whether the layer is positioned against the viewport
