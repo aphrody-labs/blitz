@@ -695,6 +695,17 @@ impl DocumentMutator<'_> {
             self.mutations_occurred |= node_is_in_document;
             let parent = &mut self.doc.nodes[parent_id];
             parent.insert_damage(ALL_DAMAGE);
+
+            // Marking ancestors dirty without stamping a hint leaves
+            // nothing to recascade the parent.
+
+            // Any selector reading the parent's child list (`:empty`,
+            // `:nth-child`, `:has`) would keep stale style after removeChild.
+            if parent.flags.is_in_document() {
+                if let Some(mut data) = parent.try_stylo_element_data_mut().and_then(|s| s.get_mut()) {
+                    data.hint |= RestyleHint::restyle_subtree();
+                }
+            }
             // Mark ancestors dirty so the style traversal visits this subtree.
             parent.mark_ancestors_dirty();
             parent.children.retain(|id| *id != node_id);
@@ -886,6 +897,7 @@ impl DocumentMutator<'_> {
             {
                 data.hint |= RestyleHint::restyle_subtree();
             }
+            new_parent.set_dirty_descendants();
             // Mark ancestors dirty so the style traversal visits this subtree.
             new_parent.mark_ancestors_dirty();
         }

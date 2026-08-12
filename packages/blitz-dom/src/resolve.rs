@@ -406,6 +406,11 @@ impl BaseDocument {
                 collect_layout_children(doc, node_id, &mut collected);
                 let layout_children = collected.children;
                 doc.nodes[node_id].anonymous_blocks = collected.anonymous_blocks;
+                // Float registration is a product of this node's boxes, so
+                // a rebuild retires the cache bust its last inline pass
+                // left behind: otherwise a block that ever held a float
+                // is locked out of taffy's cache for the document's life.
+                doc.nodes[node_id].placed_floats.set(false);
 
                 // Recurse into newly collected layout children
                 for child_id in layout_children.iter().copied() {

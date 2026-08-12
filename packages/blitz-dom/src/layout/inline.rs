@@ -728,10 +728,12 @@ impl LayoutPassState<'_> {
                     }
                     YieldData::InlineBoxBreak(box_break_data) => {
                         let state = breaker.state_mut();
-                        let node_id = NodeId::from_u64(box_break_data.inline_box_id);
+                        // Not the container: naming it node_id
+                        // shadowed the container and sent its cache bust here.
+                        let float_id = NodeId::from_u64(box_break_data.inline_box_id);
 
                         let (direction, clear, margin) = {
-                            let style = self.child_layout_style(&self.nodes[node_id]);
+                            let style = self.child_layout_style(&self.nodes[float_id]);
                             // We can assume that the box is a float because we only set `break_on_box: true` for floats
                             let direction = match style.float() {
                                 Float::Left => taffy::FloatDirection::Left,
@@ -750,7 +752,7 @@ impl LayoutPassState<'_> {
                         let margin_sum = margin.sum_axes();
 
                         let mut output = self.compute_child_layout(
-                            crate::taffy_node_id(node_id),
+                            crate::taffy_node_id(float_id),
                             float_child_inputs,
                         );
                         let min_y = state.line_y() as f32 / scale;
@@ -778,7 +780,7 @@ impl LayoutPassState<'_> {
                             x: pos.x + margin.left + container_pb.left,
                             y: pos.y + margin.top + container_pb.top,
                         };
-                        let layout = self.nodes[node_id].unrounded_layout_mut();
+                        let layout = self.nodes[float_id].unrounded_layout_mut();
                         layout.size = output.size;
                         layout.location = location;
                         layout.margin = margin;

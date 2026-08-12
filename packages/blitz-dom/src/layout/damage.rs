@@ -113,6 +113,18 @@ impl BaseDocument {
             damage.insert(RestyleDamage::RELAYOUT);
         }
 
+        // Table roots cache a TableContext during box construction
+        // that includes the table's style (min-height, border-spacing, etc.).
+        // Under incremental layout, RELAYOUT damage does not re-collect, so the
+        // TableContext stays stale and taffy reads old styles. Force box
+        // reconstruction for table roots whenever their layout styles change.
+        if damage.contains(RestyleDamage::RELAYOUT)
+            && !damage.contains(CONSTRUCT_BOX)
+            && self.nodes[node_id].flags.is_table_root()
+        {
+            damage.insert(CONSTRUCT_BOX);
+        }
+
         // Compute damage to propagate to parent
         let mut damage_for_parent = damage; // & RestyleDamage::RELAYOUT;
 
@@ -144,8 +156,15 @@ impl BaseDocument {
 
         // If the node or any of it's children have been mutated or their layout styles
         // have changed, then we should clear it's layout cache.
+        //
+        // Stylo's damage levels are cumulative masks (REPAINT is a subset of
+        // RELAYOUT), so only `contains` means relayout. `intersects` cleared
+        // every ancestor's cache for a transform or opacity change, and each
+        // CSS animation tick re-ran grid track sizing up the tree.
         let mut invalidate_anonymous_ancestors = false;
-        if damage.intersects(ONLY_RELAYOUT | CONSTRUCT_BOX) {
+        if damage.intersects(ONLY_RELAYOUT | CONSTRUCT_BOX)
+            || damage.contains(RestyleDamage::RELAYOUT)
+        {
             node.invalidate_layout_cache();
             invalidate_anonymous_ancestors = true;
             damage.remove(ONLY_RELAYOUT);
@@ -398,11 +417,25 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
             || old_box.position != new_box.position
             || old_box.contain != new_box.contain
             || old.clone_visibility() != new.clone_visibility()
+            // An atomic inline's vertical-align becomes its parley
+            // InlineBox::vertical_align when the box is constructed, so a change
+            // has to reconstruct it or the box keeps its old shift.
+            || old.clone_baseline_shift() != new.clone_baseline_shift()
+            || old.clone_alignment_baseline() != new.clone_alignment_baseline()
         {
             return true;
         }
 
         if old.get_font() != new.get_font() {
+            return true;
+        }
+
+        // border-spacing/-collapse/caption-side/empty-cells are inherited, and reach an
+        // anonymous table wrapper only via style_for_anonymous at box-construction time.
+
+        // Stylo declares them servo_restyle_damage="rebuild_box"; without a rebuild here the
+        // parent never re-collects, so the wrapper keeps the values it was created with.
+        if old.get_inherited_table() != new.get_inherited_table() {
             return true;
         }
 
@@ -527,10 +560,14 @@ impl BaseDocument {
             };
 
             if element.inline_layout_data.is_some() {
+                // A pseudo-element is anonymous too, but its parent's
+                // re-collect reuses it instead of rebuilding it like a wrapper
+                // block, so it must carry the damage itself. Without this, a
+                // block whose only text is its own ::before kept the glyphs it
+                // shaped before the webfont arrived (for example an icon font).
+                node.insert_damage(ALL_DAMAGE);
                 if node.is_anonymous() {
                     anon_nodes.push(node.id);
-                } else {
-                    node.insert_damage(ALL_DAMAGE);
                 }
             } else if let Some(input) = element.text_input_data_mut() {
                 input.editor.set_scale(scale);
