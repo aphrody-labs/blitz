@@ -14,6 +14,7 @@ use style::counter_style::CounterStyle;
 use style::values::computed::{Content, ContentItem};
 
 use crate::BaseDocument;
+use crate::layout::damage::CONSTRUCT_BOX;
 
 /// Side tables produced by `resolve_counters`, keyed by node id.
 #[derive(Default)]
@@ -462,7 +463,60 @@ impl BaseDocument {
         let mut state = CounterState::default();
         let root = self.root_element().id;
         self.resolve_counters_for(root, 0, &mut state, &mut out);
+        self.damage_moved_counters(&out);
         self.counters = out;
+    }
+
+    /// Stamp construction damage where a counter moved since the last pass.
+    ///
+    /// These side tables are only read during box construction, which
+    /// incremental layout runs for damaged nodes alone. A counter value
+    /// changes the text on a node whose own cascade did not change (a new
+    /// sibling renumbers the ones after it), so without this the gate stays
+    /// shut and the pseudo/marker keeps rendering the previous pass's
+    /// string. Only a real mismatch stamps, so a steady document pays
+    /// two map lookups per entry and nothing else.
+    fn damage_moved_counters(&mut self, new: &CounterOutput) {
+        let mut dirty: Vec<usize> = Vec::new();
+        let old = &self.counters;
+
+        // ::before/::after text reaches the pseudo via flush_pseudo_elements,
+        // which runs inside the owning element's box construction.
+        for (fresh, stale) in [
+            (&new.before_text, &old.before_text),
+            (&new.after_text, &old.after_text),
+        ] {
+            dirty.extend(
+                fresh
+                    .iter()
+                    .filter(|(id, text)| stale.get(id) != Some(*text))
+                    .map(|(&id, _)| id),
+            );
+            dirty.extend(stale.keys().filter(|id| !fresh.contains_key(id)).copied());
+        }
+
+        // A marker ordinal is written by collect_list_item_children, which
+        // walks from the list item's parent: damage the child and it never runs.
+        let ordinals = new
+            .list_item_values
+            .iter()
+            .filter(|(id, value)| old.list_item_values.get(id) != Some(*value))
+            .map(|(&id, _)| id)
+            .chain(
+                old.list_item_values
+                    .keys()
+                    .filter(|id| !new.list_item_values.contains_key(id))
+                    .copied(),
+            );
+        for id in ordinals {
+            dirty.extend(self.nodes.get(id).and_then(|node| node.parent));
+        }
+
+        for id in dirty {
+            if let Some(node) = self.nodes.get_mut(id) {
+                node.insert_damage(CONSTRUCT_BOX);
+            }
+        }
     }
 
     fn document_uses_counters(&self) -> bool {
