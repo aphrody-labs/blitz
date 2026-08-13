@@ -54,6 +54,19 @@ impl BaseDocument {
     /// without revisiting their DOM children. Damage inside an anonymous box
     /// also invalidates its cache by walking `layout_parent` upward.
     pub(crate) fn propagate_damage_flags(&mut self, node_id: NodeId) -> RestyleDamage {
+        // Shadow roots are transparent flat-tree boundaries, not layout nodes.
+        // Walk their real children and bubble that damage to the host without
+        // touching the element-only layout accessors.
+        if self.nodes[node_id].is_shadow_root() {
+            let children = std::mem::take(&mut self.nodes[node_id].children);
+            let mut damage = RestyleDamage::empty();
+            for child in children.iter() {
+                damage |= self.propagate_damage_flags(*child);
+            }
+            self.nodes[node_id].children = children;
+            return damage;
+        }
+
         let own_damage = if let Some(data) = self.nodes[node_id]
             .try_stylo_element_data_mut()
             .and_then(|s| s.get_mut())
