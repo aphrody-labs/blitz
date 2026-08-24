@@ -650,9 +650,14 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 cx.draw_text_input_text(scene, content_position);
                                 cx.draw_inline_layout(scene, content_position);
                                 cx.draw_marker(scene, content_position);
-                                cx.draw_children(scene, cx.transform, child_clip_rect);
+                                cx.draw_children(scene, cx.transform, child_clip_rect, should_clip);
                             },
                         );
+
+                        if should_clip {
+                            cx.transform = unscrolled_transform;
+                            cx.draw_rehomed_children(scene, cx.transform, clip_rect);
+                        }
 
                         // Overlay scrollbars, drawn unscrolled above the
                         // clipped content.
@@ -1128,6 +1133,7 @@ impl ElementCx<'_, '_> {
         scene: &mut impl PaintScene,
         parent_style_transform: Affine,
         clip_rect: Rect,
+        skip_rehomed: bool,
     ) {
         // Negative z_index hoisted nodes
 
@@ -1153,6 +1159,9 @@ impl ElementCx<'_, '_> {
                 let child = &self.context.dom.as_ref().tree()[*child_id];
                 let child_transform = match child.paint_parent_override.get() {
                     Some(parent) if parent == self.node.id => {
+                        if skip_rehomed {
+                            continue;
+                        }
                         let translation = child.rehomed_paint_translate(parent);
                         parent_style_transform.pre_translate(kurbo::Vec2 {
                             x: translation.x as f64 * self.scale,
@@ -1195,6 +1204,30 @@ impl ElementCx<'_, '_> {
                     clip_rect,
                 );
             }
+        }
+    }
+
+    /// Paint re-homed abspos children outside this flow parent's overflow clip.
+    fn draw_rehomed_children(
+        &self,
+        scene: &mut impl PaintScene,
+        parent_style_transform: Affine,
+        clip_rect: Rect,
+    ) {
+        let Some(children) = &*self.node.paint_children.borrow() else {
+            return;
+        };
+        for child_id in children {
+            let child = &self.context.dom.as_ref().tree()[*child_id];
+            if child.paint_parent_override.get() != Some(self.node.id) {
+                continue;
+            }
+            let translation = child.rehomed_paint_translate(self.node.id);
+            let transform = parent_style_transform.pre_translate(kurbo::Vec2 {
+                x: translation.x as f64 * self.scale,
+                y: translation.y as f64 * self.scale,
+            });
+            self.render_node(scene, *child_id, transform, clip_rect);
         }
     }
 
