@@ -581,9 +581,11 @@ pub(crate) fn stroke_text<'a>(
                 let metrics = run.font_metrics();
                 let style = glyph_run.style();
                 let synthesis = run.synthesis();
+                // Font-space y points up but device-space y points down, so a
+                // positive font slant needs a negative device-space shear.
                 let glyph_xform = synthesis
                     .skew()
-                    .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+                    .map(|angle| Affine::skew(-angle.to_radians().tan() as f64, 0.0));
 
                 let css_font_size = font_size as f64 / scale;
 
