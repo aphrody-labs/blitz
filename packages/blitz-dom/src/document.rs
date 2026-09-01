@@ -306,6 +306,10 @@ pub struct BaseDocument {
     pub(crate) devtool_settings: DevtoolSettings,
     // Viewport details such as the dimensions, HiDPI scale, and zoom factor,
     pub(crate) viewport: Viewport,
+    /// The step `taffy::round_layout` snaps this document's
+    /// boxes to, as (x, y). One pixel until a character-cell backend
+    /// sets the cell size.
+    pub(crate) round_grid: (f32, f32),
     /// CSS counter side tables (list-item values + resolved pseudo
     /// content), rebuilt by resolve_counters on every resolve pass.
     pub(crate) counters: crate::layout::counters::CounterOutput,
@@ -556,6 +560,12 @@ pub struct BaseDocument {
 }
 
 impl BaseDocument {
+    /// Snap layout to a `w` x `h` grid instead of whole pixels.
+    pub fn set_round_grid(&mut self, w: f32, h: f32) {
+        let ok = |v: f32| v.is_finite() && v >= 1.0;
+        self.round_grid = if ok(w) && ok(h) { (w, h) } else { (1.0, 1.0) };
+    }
+
     /// Create a new (empty) [`BaseDocument`] with the specified configuration
     pub fn new(config: DocumentConfig) -> Self {
         static ID_GENERATOR: AtomicUsize = AtomicUsize::new(1);
@@ -656,6 +666,7 @@ impl BaseDocument {
             subdocument_depth: config.subdocument_depth,
             damage_summary: DamageSummary::default(),
             devtool_settings: DevtoolSettings::default(),
+            round_grid: (1.0, 1.0),
             counters: Default::default(),
             author_font_registrations: Vec::new(),
             counters_seen: false,

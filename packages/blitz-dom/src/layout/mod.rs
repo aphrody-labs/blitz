@@ -983,6 +983,10 @@ impl RoundTree for LayoutPassState<'_> {
     fn get_hoisted_child_id(&self, node_id: NodeId, index: usize) -> NodeId {
         taffy_node_id(self.node_from_id(node_id).hoisted_children.borrow()[index])
     }
+
+    fn round_grid(&self) -> (f32, f32) {
+        self.round_grid
+    }
 }
 
 pub(crate) struct TaffyDebugTree<'doc>(pub(crate) &'doc BaseDocument);

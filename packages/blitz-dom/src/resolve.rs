@@ -31,8 +31,25 @@ use crate::{
         },
         damage::{ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC},
     },
-    node::TextBrush,
+    node::{SpecialElementData, TextBrush},
 };
+
+fn snap_table_tracks(
+    tracks: &mut taffy::DetailedGridTracksInfo<style::Atom>,
+    raw_origin: f32,
+    paint_origin: f32,
+    step: f32,
+) {
+    if step <= 1.0 || tracks.positions.is_empty() {
+        return;
+    }
+
+    let snap = |value: f32| (value / step).round() * step;
+    for position in &mut tracks.positions {
+        position.start = snap(raw_origin + position.start) - paint_origin;
+        position.end = snap(raw_origin + position.end) - paint_origin;
+    }
+}
 
 /// A query container, i.e. an element `@container` rules inside it
 /// size themselves against. `container-type: normal` elements are not one.
@@ -755,6 +772,44 @@ impl BaseDocument {
             taffy::round_layout(&mut state, root_element_id);
         }
 
+        // Paint reads table tracks rather than the cell layouts rounded above.
+        let (grid_x, grid_y) = self.round_grid;
+        if grid_x > 1.0 || grid_y > 1.0 {
+            for (node_id, node) in self.nodes.iter() {
+                let Some(element) = node.element_data() else {
+                    continue;
+                };
+                let SpecialElementData::TableRoot(table) = &element.special_data else {
+                    continue;
+                };
+                let Some(mut grid_info) = table.computed_grid_info.borrow().clone() else {
+                    continue;
+                };
+                let mut table_x = 0.0;
+                let mut table_y = 0.0;
+                let mut ancestor_id = Some(node_id);
+                while let Some(id) = ancestor_id {
+                    let ancestor = &self.nodes[id];
+                    table_x += ancestor.unrounded_layout().location.x;
+                    table_y += ancestor.unrounded_layout().location.y;
+                    ancestor_id = ancestor.containing_block();
+                }
+                snap_table_tracks(
+                    &mut grid_info.columns,
+                    table_x,
+                    (table_x / grid_x).round() * grid_x,
+                    grid_x,
+                );
+                snap_table_tracks(
+                    &mut grid_info.rows,
+                    table_y,
+                    (table_y / grid_y).round() * grid_y,
+                    grid_y,
+                );
+                *table.paint_grid_info.borrow_mut() = Some(grid_info);
+            }
+        }
+
         self.restore_clobbered_inline_breaks();
 
         // println!("\n\n");
@@ -784,6 +839,9 @@ impl BaseDocument {
         if skip && !cfg!(debug_assertions) {
             return;
         }
+        // Rounding runs after line breaking and rounds both box edges.
+        // On a cell grid, a sub-cell width change cannot move a glyph.
+        let width_tol = self.round_grid.0.max(0.5);
         let mut stale: Vec<(NodeId, f32)> = Vec::new();
         let mut roots = std::mem::take(&mut self.inline_roots);
         // Only the push sites can add duplicates or unsorted ids; if none ran
@@ -819,7 +877,7 @@ impl BaseDocument {
                 l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right;
             if content_w > 0.0 {
                 let unbroken = !inline.last_break_width.is_finite();
-                if unbroken || (content_w - inline.last_break_width).abs() > 0.5 {
+                if unbroken || (content_w - inline.last_break_width).abs() > width_tol {
                     stale.push((id, content_w));
                 }
             }

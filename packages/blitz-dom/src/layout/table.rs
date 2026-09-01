@@ -47,7 +47,10 @@ pub struct TableContext {
     pub oof_children: Vec<(NodeId, taffy::Position)>,
     pub rows: Vec<TableRow>,
     pub columns: Vec<TableColumn>,
+    /// Raw Taffy tracks, retained so a changed terminal-grid phase can re-snap them.
     pub computed_grid_info: AtomicRefCell<Option<DetailedGridInfo<Atom>>>,
+    /// Tracks consumed by paint; identical to computed_grid_info outside tty mode.
+    pub paint_grid_info: AtomicRefCell<Option<DetailedGridInfo<Atom>>>,
     pub border_style: Option<ServoArc<Border>>,
     pub border_collapse: BorderCollapse,
     /// Backing storage for `calc()` track sizes synthesised by the table layout code.
@@ -522,6 +525,7 @@ pub(crate) fn build_table_context(
             rows,
             columns,
             computed_grid_info: AtomicRefCell::new(None),
+            paint_grid_info: AtomicRefCell::new(None),
             border_collapse,
             border_style: first_cell_border,
             calc_values,
@@ -1022,6 +1026,7 @@ impl taffy::LayoutGridContainer for TableTreeWrapper<'_, '_> {
         _node_id: taffy::NodeId,
         detailed_grid_info: DetailedGridInfo<Atom>,
     ) {
+        *self.ctx.paint_grid_info.borrow_mut() = Some(detailed_grid_info.clone());
         *self.ctx.computed_grid_info.borrow_mut() = Some(detailed_grid_info);
     }
 }
