@@ -134,9 +134,13 @@ impl BaseDocument {
             DocumentSrcHandler,
         );
         let signal = self.new_iframe_generation(node_id, Some(handler.request_id()));
+        let mut request = stamped_request(url, Some(&signal));
+        // The embedder cannot recover the erased DocumentSrcHandler type.
+        // Stamp the MIME kind here so extensionless iframe URLs stay Documents.
+        request.content_type = Some("text/html".to_string());
         self.net_provider.fetch(
             self.id(),
-            stamped_request(url, Some(&signal)),
+            request,
             Box::new(handler),
         );
     }
