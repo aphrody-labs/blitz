@@ -245,6 +245,8 @@ impl DocumentMutator<'_> {
                 parent.insert_damage(ALL_DAMAGE);
             }
 
+            self.doc
+                .note_text_codepoints(value, node_is_in_document);
             self.maybe_record_node(parent_id);
         }
     }
@@ -262,6 +264,8 @@ impl DocumentMutator<'_> {
             Some(data) => {
                 data.content += text;
                 self.mutations_occurred |= node_is_in_document;
+                self.doc
+                    .note_text_codepoints(text, node_is_in_document);
                 Ok(())
             }
             None => Err(AppendTextErr::NotTextNode),
@@ -1236,6 +1240,13 @@ impl<'doc> DocumentMutator<'doc> {
 
     fn process_added_subtree(&mut self, node_id: NodeId) {
         self.doc.iter_subtree_mut(node_id, |node_id, doc| {
+            if let Some(text) = doc.nodes[node_id].text_data() {
+                crate::document::note_connected_text_codepoints(
+                    &mut doc.used_codepoints,
+                    &mut doc.non_latin_text_writes,
+                    &text.content,
+                );
+            }
             let node = &mut doc.nodes[node_id];
             node.flags.set(NodeFlags::IS_IN_DOCUMENT, true);
             node.insert_damage(ALL_DAMAGE);

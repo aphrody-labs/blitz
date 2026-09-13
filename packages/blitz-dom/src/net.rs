@@ -493,6 +493,45 @@ pub struct PendingFontFace {
     pub format: FontFaceSourceFormatKeyword,
     pub overrides: FontFaceOverrides,
     pub node_id: Option<NodeId>,
+    /// `unicode-range` descriptor as inclusive (start, end) pairs;
+    /// `None` = the whole codepoint space (the descriptor's default).
+    /// Gates the fetch on the document's text: see
+    /// BaseDocument::flush_needed_font_faces.
+    pub unicode_range: Option<Vec<(u32, u32)>>,
+}
+
+/// The descriptors that identify a queued `@font-face` source.
+#[derive(PartialEq, Eq, Hash)]
+pub(crate) struct FontFaceKey {
+    pub(crate) family_lc: String,
+    pub(crate) url: Url,
+    weight: Option<u32>,
+    style: (u8, Option<u32>),
+    pub(crate) unicode_range: Option<Vec<(u32, u32)>>,
+}
+
+impl FontFaceKey {
+    pub(crate) fn new(
+        family_lc: String,
+        url: Url,
+        overrides: &FontFaceOverrides,
+        unicode_range: Option<Vec<(u32, u32)>>,
+    ) -> Self {
+        use parley::fontique::FontStyle;
+        let style = match overrides.style {
+            None => (0, None),
+            Some(FontStyle::Normal) => (1, None),
+            Some(FontStyle::Italic) => (2, None),
+            Some(FontStyle::Oblique(angle)) => (3, angle.map(f32::to_bits)),
+        };
+        Self {
+            family_lc,
+            url,
+            weight: overrides.weight.map(f32::to_bits),
+            style,
+            unicode_range,
+        }
+    }
 }
 
 thread_local! {
@@ -597,11 +636,15 @@ pub(crate) fn collect_font_face_rules<'a>(
                     style: descriptor.font_style.as_ref().map(stylo_to_fontique_style),
                 };
                 let family_lc = family.name.to_string().to_lowercase();
-                Some((family_lc, src, overrides))
+                let unicode_range = descriptor
+                    .unicode_range
+                    .as_ref()
+                    .map(|ranges| ranges.iter().map(|r| (r.start, r.end)).collect());
+                Some((family_lc, src, overrides, unicode_range))
             }
             _ => None,
         })
-        .filter_map(|(family_lc, source_list, overrides)| {
+        .filter_map(|(family_lc, source_list, overrides, unicode_range)| {
             // Find the first font source in the source list that specifies a font of a type
             // that we support.
             let preferred_source = source_list
@@ -684,6 +727,7 @@ pub(crate) fn collect_font_face_rules<'a>(
                 format,
                 overrides,
                 node_id,
+                unicode_range,
             })
         })
         .collect()

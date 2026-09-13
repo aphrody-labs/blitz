@@ -377,19 +377,14 @@ pub struct BaseDocument {
     /// added, replaced or removed), so that CSSOM wrappers can detect that
     /// their cached rule data is stale.
     pub(crate) stylesheet_generation: u64,
-    /// Cache of author-origin stylesheets keyed by FxHash of the CSS
-    /// source text. Real pages (and Astro/Vite/SSR-driven fixtures)
-    /// frequently inline the same companion stylesheet 3+ times when
-    /// the same code-block / island appears multiple times. Without
-    /// this cache, stylo re-parses identical CSS bytes from scratch
-    /// for every <style> node. The cache reuses the already-parsed
-    /// ServoArc<StylesheetContents> via DocumentStyleSheet::clone
-    /// (an Arc bump), while each <style> node still registers
-    /// individually with the stylist (so cascade order is unchanged).
-    pub(crate) author_sheet_cache: HashMap<u64, DocumentStyleSheet>,
-    /// The cache key currently registered for each style node. Replacing a
-    /// CSS-in-JS sheet must release the previous parse when no node shares it.
-    pub(crate) author_sheet_keys: HashMap<NodeId, u64>,
+    /// Parsed author sheets keyed by exact CSS text, then media text.
+    pub(crate) author_sheet_cache: HashMap<Arc<str>, AuthorSheetCacheEntry>,
+    /// Cache keys currently registered for style nodes, kept alive until no node
+    /// shares the parsed sheet.
+    pub(crate) author_sheet_keys: HashMap<NodeId, AuthorSheetCacheKey>,
+    /// `@font-face` descriptors (family, url, weight, style) already queued or fetched, so a
+    /// `<style>` re-registered on every mutation does not fetch its faces again.
+    pub(crate) seen_font_faces: std::collections::HashSet<crate::net::FontFaceKey>,
 
     /// Shadow roots whose scoped author styles changed since the last
     /// resolve; drained (and flushed into CascadeData) by the stylist.
@@ -453,6 +448,25 @@ pub struct BaseDocument {
     /// Sticky, so newly-declared faces for known-used families
     /// fetch on the next flush without a rescan hit.
     pub(crate) used_font_families: std::collections::HashSet<String>,
+    /// Every codepoint that appears in an in-document text node, as a
+    /// bitset over U+0000..=U+10FFFF (136 KiB, allocated on first use).
+    /// A `unicode-range`-subsetted face fetches only once the document
+    /// contains a codepoint it covers: Chrome's rule, at document
+    /// granularity rather than per styled text run. Google Fonts and
+    /// next/font split every family into 5-7 script subsets; without
+    /// this a Portuguese page pulled cyrillic, vietnamese and
+    /// latin-ext for every weight and style it declared (26 files where
+    /// Chrome loads 10).
+    ///
+    /// Built by one full scan the first time a range-gated face needs
+    /// checking; from then on connected text writes and inserted subtrees
+    /// fold their codepoints in. Removed text does not remove its codepoints.
+    /// Empty = not built yet, so a page with no range-gated faces pays nothing.
+    pub(crate) used_codepoints: Vec<u64>,
+    /// Text writes that held a codepoint past Cyrillic. The
+    /// embedder loads fallback faces for scripts it finds in the navigate
+    /// HTML; a bump here tells it script-written text may need more.
+    pub(crate) non_latin_text_writes: u32,
 
     /// Tracks in-flight image requests. When an image is being fetched, additional
     /// requests for the same URL are queued here instead of starting new fetches.
@@ -592,6 +606,7 @@ impl BaseDocument {
             url: base_url,
             author_sheet_cache: HashMap::new(),
             author_sheet_keys: HashMap::new(),
+            seen_font_faces: std::collections::HashSet::new(),
             dirty_shadow_style_roots: Vec::new(),
             shadow_roots: HashSet::new(),
             slot_assignments_dirty: true,
@@ -632,6 +647,8 @@ impl BaseDocument {
             dims_only_images: config.dims_only_images,
             pending_font_faces: Vec::new(),
             used_font_families: std::collections::HashSet::new(),
+            used_codepoints: Vec::new(),
+            non_latin_text_writes: 0,
             pending_images: HashMap::new(),
             pending_style_image_nodes: Vec::new(),
             pending_critical_resources: HashSet::new(),
@@ -1280,6 +1297,7 @@ impl BaseDocument {
     }
 
     pub fn create_text_node(&mut self, text: &str) -> NodeId {
+        self.note_text_codepoints(text, false);
         let content = text.to_string();
         let data = NodeData::Text(TextNodeData::new(content));
         self.create_node(data)
@@ -1594,10 +1612,7 @@ impl BaseDocument {
         // page's computed styles actually reference).
         let faces =
             crate::net::collect_font_faces(Some(node_id), &stylesheet.0, &self.guard.read());
-        crate::net::note_unloaded_faces(
-            faces.iter().map(|f| (f.family_lc.clone(), f.overrides.style)),
-        );
-        self.pending_font_faces.extend(faces);
+        self.queue_font_faces(faces);
 
         // Store data on element
         let element = &mut self.nodes[node_id].element_data_mut().unwrap();
@@ -1692,6 +1707,121 @@ impl BaseDocument {
         host.mark_ancestors_dirty();
     }
 
+    /// Queue freshly parsed `@font-face` rules for lazy fetch
+    /// (see flush_needed_font_faces), noting each as not-yet-loaded so
+    /// its family blocks the matching style until delivery.
+    ///
+    /// Deduplicated on the full descriptor: a `<style>` whose text is
+    /// rewritten per rule (CSSOM mirror, JSS) re-registers its sheet on
+    /// every mutation, and each registration re-parsed the same
+    /// `@font-face` rules: N copies pending, N fetches, N decompressed
+    /// blobs in the fontique collection, and N UNLOADED entries of which
+    /// only one ever cleared, so the family stayed blocked. Chrome's
+    /// font cache fetches a source once per document.
+    pub(crate) fn queue_font_faces(&mut self, faces: Vec<crate::net::PendingFontFace>) {
+        for face in faces {
+            let crate::net::PendingFontFace {
+                family_lc,
+                url,
+                format,
+                overrides,
+                node_id,
+                unicode_range,
+            } = face;
+            // Most faces repeat on re-registration, so clone only new keys.
+            let key = crate::net::FontFaceKey::new(family_lc, url, &overrides, unicode_range);
+            if self.seen_font_faces.contains(&key) {
+                continue;
+            }
+            self.pending_font_faces.push(crate::net::PendingFontFace {
+                family_lc: key.family_lc.clone(),
+                url: key.url.clone(),
+                format,
+                overrides,
+                node_id,
+                unicode_range: key.unicode_range.clone(),
+            });
+            self.seen_font_faces.insert(key);
+        }
+    }
+
+    /// Build the used-codepoint bitset from in-document text nodes, unless built.
+    /// O(text), once per document: the first time a range-gated face
+    /// needs checking. Later connected text writes and subtree insertions
+    /// update it incrementally; removals do not subtract codepoints.
+    fn ensure_used_codepoints(&mut self) {
+        if !self.used_codepoints.is_empty() {
+            return;
+        }
+        let mut bits = vec![0u64; (0x110000 + 63) / 64];
+        for (_, node) in self.nodes.iter() {
+            if !node.flags.is_in_document() {
+                continue;
+            }
+            if let Some(text) = node.text_data() {
+                set_codepoint_bits(&mut bits, &text.content);
+            }
+        }
+        self.used_codepoints = bits;
+    }
+
+    /// Record text creation or a text write, indexing connected text.
+    pub(crate) fn note_text_codepoints(&mut self, text: &str, in_document: bool) {
+        if in_document {
+            self.note_document_codepoints(text);
+        } else {
+            note_non_latin_text_write(&mut self.non_latin_text_writes, text);
+        }
+    }
+
+    /// Fold connected text into the range index and advance the script-text probe.
+    pub(crate) fn note_document_codepoints(&mut self, text: &str) {
+        note_connected_text_codepoints(
+            &mut self.used_codepoints,
+            &mut self.non_latin_text_writes,
+            text,
+        );
+    }
+
+    /// See `non_latin_text_writes`.
+    pub fn non_latin_text_writes(&self) -> u32 {
+        self.non_latin_text_writes
+    }
+
+    /// Whether some in-document text node holds a codepoint inside one of the
+    /// inclusive `ranges`. Builds the codepoint bitset on first use.
+    pub fn text_uses_codepoints(&mut self, ranges: &[(u32, u32)]) -> bool {
+        self.ensure_used_codepoints();
+        self.face_covers_used_text(Some(ranges))
+    }
+
+    /// True when some in-document text node holds a codepoint inside one of the
+    /// face's `unicode-range`s. A face without the descriptor covers
+    /// everything and is always needed.
+    fn face_covers_used_text(&self, ranges: Option<&[(u32, u32)]>) -> bool {
+        let Some(ranges) = ranges else {
+            return true;
+        };
+        let bits = &self.used_codepoints;
+        if bits.is_empty() {
+            return false;
+        }
+        ranges.iter().any(|&(start, end)| {
+            let end = end.min(0x10FFFF);
+            if start > end {
+                return false;
+            }
+            let (first, last) = ((start >> 6) as usize, (end >> 6) as usize);
+            (first..=last).any(|w| {
+                let lo = if w == first { start & 63 } else { 0 };
+                let hi = if w == last { end & 63 } else { 63 };
+                // Bits lo..=hi of this word.
+                let mask = (u64::MAX >> (63 - hi)) & (u64::MAX << lo);
+                bits[w] & mask != 0
+            })
+        })
+    }
+
     /// Fetch pending @font-face sources whose family is
     /// referenced by some element's computed font-family. Runs
     /// after every style resolve; O(nodes) only while faces are
@@ -1711,6 +1841,9 @@ impl BaseDocument {
         if !self.pending_font_faces.is_empty() {
             let mut used = std::mem::take(&mut self.used_font_families);
             for (_, node) in self.nodes.iter() {
+                if !node.flags.is_in_document() {
+                    continue;
+                }
                 let Some(styles) = node.primary_styles() else {
                     continue;
                 };
@@ -1724,7 +1857,31 @@ impl BaseDocument {
                 .retain(|f| !used.contains(&f.family_lc) || { ready.push(f.clone()); false });
             self.used_font_families = used;
         }
+        // unicode-range gate. A face whose ranges cover none of the
+        // document's text goes back on the queue and is re-tested on the
+        // next flush: a bitset probe per range, no text walk, since
+        // connected text writes and inserted subtrees keep used_codepoints
+        // current (a later
+        // script-inserted Cyrillic string fetches the cyrillic subset
+        // then, as in Chrome). Its family is in the sticky used set, so
+        // it rides the fast path above, not the O(nodes) scan. Faces are
+        // marked UNLOADED here, at fetch time, not at declaration: a face
+        // this gate never releases must not block its family's style
+        // forever in face_pending_for_style.
+        let needs_range_check = ready.iter().any(|f| f.unicode_range.is_some());
+        if needs_range_check {
+            self.ensure_used_codepoints();
+        }
+        let mut deferred: Vec<crate::net::PendingFontFace> = Vec::new();
         for face in ready {
+            if !self.face_covers_used_text(face.unicode_range.as_deref()) {
+                deferred.push(face);
+                continue;
+            }
+            crate::net::note_unloaded_faces(std::iter::once((
+                face.family_lc.clone(),
+                face.overrides.style,
+            )));
             crate::net::fetch_pending_font_face(
                 self.tx.clone(),
                 self.id,
@@ -1734,6 +1891,7 @@ impl BaseDocument {
                 face,
             );
         }
+        self.pending_font_faces.extend(deferred);
     }
 
     pub fn handle_messages(&mut self) {
@@ -1755,11 +1913,8 @@ impl BaseDocument {
             DocumentEvent::NavigateIframe { node_id, url } => self.navigate_iframe(node_id, url),
             DocumentEvent::PendingFontFaces(faces) => {
                 // An @import'ed sheet's faces bypass add_stylesheet_for_node,
-                // so note them here too or the guard never engages for them.
-                crate::net::note_unloaded_faces(
-                    faces.iter().map(|f| (f.family_lc.clone(), f.overrides.style)),
-                );
-                self.pending_font_faces.extend(faces);
+                // so queue them here too or the guard never engages for them.
+                self.queue_font_faces(faces);
             }
         }
     }
@@ -3921,6 +4076,28 @@ mod zoom_tests {
         assert!(shell_provider.redraw_count.load(Ordering::SeqCst) > base);
     }
 }
+#[cfg(test)]
+mod codepoint_probe_tests {
+    use super::*;
+
+    #[test]
+    fn inserting_detached_non_latin_text_advances_the_probe_counter() {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        let root_id = doc.root_node().id;
+        let text_id = doc.mutate().create_text_node("漢");
+        let writes_seen = doc.non_latin_text_writes();
+        let cjk = &[(0x4E00, 0x9FFF)];
+
+        assert!(!doc.text_uses_codepoints(cjk));
+        assert_eq!(doc.non_latin_text_writes(), writes_seen);
+
+        doc.mutate().append_children(root_id, &[text_id]);
+
+        assert_eq!(doc.non_latin_text_writes(), writes_seen.wrapping_add(1));
+        assert!(doc.text_uses_codepoints(cjk));
+    }
+}
+
 
 #[cfg(test)]
 mod author_sheet_cache_tests {
@@ -4668,5 +4845,30 @@ fn note_changed_attr(snapshot: &mut ServoElementSnapshot, name: &LocalName) {
     let ident = GenericAtomIdent(name.clone());
     if !snapshot.changed_attrs.contains(&ident) {
         snapshot.changed_attrs.push(ident);
+    }
+}
+fn note_non_latin_text_write(counter: &mut u32, text: &str) {
+    if !text.is_ascii() && text.chars().any(|c| c >= '\u{0530}') {
+        *counter = counter.wrapping_add(1);
+    }
+}
+
+pub(crate) fn note_connected_text_codepoints(
+    used_codepoints: &mut Vec<u64>,
+    non_latin_text_writes: &mut u32,
+    text: &str,
+) {
+    note_non_latin_text_write(non_latin_text_writes, text);
+    if !used_codepoints.is_empty() {
+        set_codepoint_bits(used_codepoints, text);
+    }
+}
+
+
+/// Set the bit for every codepoint in `text`.
+fn set_codepoint_bits(bits: &mut [u64], text: &str) {
+    for ch in text.chars() {
+        let cp = ch as usize;
+        bits[cp >> 6] |= 1u64 << (cp & 63);
     }
 }

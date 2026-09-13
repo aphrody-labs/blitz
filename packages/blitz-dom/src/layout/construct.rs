@@ -1301,6 +1301,12 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
                 let text_node_id = doc.create_text_node(&text);
                 doc.nodes[text_node_id].parent = Some(new_node_id);
                 doc.nodes[new_node_id].children.push(text_node_id);
+                if doc.nodes[node_id].flags.is_in_document() {
+                    doc.nodes[text_node_id]
+                        .flags
+                        .insert(NodeFlags::IS_IN_DOCUMENT);
+                    doc.note_document_codepoints(&text);
+                }
             }
 
             let mut element_data = StyloElementData::default();
@@ -1337,14 +1343,25 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
                 (Some(text_node_id), Some(new_text)) => {
                     let text_data = doc.nodes[text_node_id].text_data_mut().unwrap();
                     if text_data.content != new_text {
+                        // Generated content needs glyphs too.
+                        let in_document = doc.nodes[node_id].flags.is_in_document();
+                        doc.note_text_codepoints(&new_text, in_document);
+                        let text_data = doc.nodes[text_node_id].text_data_mut().unwrap();
                         text_data.content = new_text;
                         doc.nodes[node_id].insert_damage(ALL_DAMAGE);
                     }
                 }
                 (None, Some(new_text)) => {
+                    let in_document = doc.nodes[node_id].flags.is_in_document();
                     let text_node_id = doc.create_text_node(&new_text);
                     doc.nodes[text_node_id].parent = Some(pe_node_id);
                     doc.nodes[pe_node_id].children.push(text_node_id);
+                    if in_document {
+                        doc.nodes[text_node_id]
+                            .flags
+                            .insert(NodeFlags::IS_IN_DOCUMENT);
+                        doc.note_document_codepoints(&new_text);
+                    }
                     doc.nodes[node_id].insert_damage(ALL_DAMAGE);
                 }
                 (Some(text_node_id), None) => {
