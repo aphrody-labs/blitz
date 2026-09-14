@@ -1762,8 +1762,17 @@ impl BaseDocument {
         self.pending_images.len()
     }
 
+    /// How many nodes are still queued for a style-image flush
+    /// (background/mask layers staged by the last style traversal). The
+    /// settle loop for @container sizes drains this queue each pass, so
+    /// after a resolve it must be zero; a rule that started matching in
+    /// that loop must reach the node's layer storage in the same resolve.
+    pub fn pending_style_image_count(&self) -> usize {
+        self.pending_style_image_nodes.len()
+    }
+
     /// Node ids of `<img>` elements (ImageType::Image
-    /// entries only; background-image / mask-image layers are
+    /// entries only: background-image / mask-image layers are
     /// excluded) currently waiting on `url`. The JS side snapshots
     /// this right before deliverResource / deliverResourceError
     /// (delivery drains the entry via apply_loaded_image) so it can

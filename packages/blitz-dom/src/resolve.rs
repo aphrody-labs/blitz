@@ -34,6 +34,32 @@ use crate::{
     node::TextBrush,
 };
 
+/// A query container, i.e. an element `@container` rules inside it
+/// size themselves against. `container-type: normal` elements are not one.
+fn is_size_container(node: &crate::node::Node) -> bool {
+    node.primary_styles()
+        .is_some_and(|styles| !styles.get_box().clone_container_type().is_normal())
+}
+
+/// Every query container's laid-out size, keyed by node id. Slab ids
+/// ascend in iteration order, so this is sorted and the pass after layout can
+/// binary-search it for the size a container was styled against.
+fn container_sizes(doc: &BaseDocument) -> Vec<(NodeId, taffy::Size<f32>)> {
+    doc.nodes
+        .iter()
+        .filter(|(_, node)| is_size_container(node))
+        .map(|(id, node)| (id, node.final_layout().size))
+        .collect()
+}
+
+/// How many style + layout passes one resolve spends settling
+/// `@container` sizes. Size containment keeps a container's own contents from
+/// feeding its size back, so only an ancestor's restyle can resize it and
+/// nesting depth is the real bound: one level per pass. Eight is far past
+/// anything we render, and it stops a sheet that oscillates through an axis no
+/// query reads from wedging the resolve.
+const CONTAINER_QUERY_SETTLE_PASSES: usize = 8;
+
 impl BaseDocument {
     /// Restyle the tree and then relayout it
     pub fn resolve(&mut self, current_time_for_animations: f64) {
@@ -101,6 +127,12 @@ impl BaseDocument {
         self.accumulate_damage_summary();
         timer.record_time("dmgsummary");
 
+        // @container rules resolve against the container's laid-out
+        // size, which the cascade below can only read from last resolve's box.
+        // Snapshot the sizes it styles against, so the pass after layout can
+        // spot the containers whose answer is now stale.
+        let container_sizes_before = container_sizes(self);
+
         // CSS counters: list-item values + counter()/attr() pseudo content.
         // Needs computed styles; box construction consumes the side tables.
         self.resolve_counters();
@@ -134,6 +166,61 @@ impl BaseDocument {
         // Next we resolve layout with the data resolved by stlist
         self.resolve_layout();
         timer.record_time("layout");
+
+        // A resolve that moved no box and constructed nothing styled every
+        // container against the size it still has, so steady state pays for
+        // the snapshot above and nothing else. Construction alone is enough
+        // to need the scan: a container built this pass is not in the
+        // snapshot, and its @container rules cascaded against no size at all.
+        if self.any_construct_damage || (self.layout_changed && !container_sizes_before.is_empty()) {
+            // One pass is not enough: an outer query can resize a nested container,
+            // whose own rules just cascaded against its pre-pass box. Settle instead
+            // (restyle what moved, lay out, and look again) until every container
+            // matches the size it was styled against.
+            let mut sizes_styled_against = container_sizes_before;
+            for _ in 0..CONTAINER_QUERY_SETTLE_PASSES {
+                let changed_containers: Vec<_> = self
+                    .nodes
+                    .iter()
+                    .filter(|(id, node)| {
+                        is_size_container(node)
+                            && sizes_styled_against
+                                .binary_search_by_key(id, |(before_id, _)| *before_id)
+                                .map_or(true, |i| {
+                                    sizes_styled_against[i].1 != node.final_layout().size
+                                })
+                    })
+                    .map(|(id, _)| id)
+                    .collect();
+                if changed_containers.is_empty() {
+                    break;
+                }
+                // The cascade below reads the boxes the layout above produced.
+                sizes_styled_against = container_sizes(self);
+                for id in &changed_containers {
+                    self.nodes[*id].set_restyle_hint(
+                        style::invalidation::element::restyle_hints::RestyleHint::restyle_subtree(),
+                    );
+                }
+                self.resolve_stylist(current_time_for_animations);
+                self.accumulate_damage_summary();
+                self.resolve_counters();
+                if !self.incremental_layout {
+                    self.mark_all_damaged();
+                }
+                self.propagate_damage_flags(root_node_id);
+                self.resolve_layout_children();
+                self.resolve_deferred_tasks();
+                // The corrective cascade can change a node's background/mask
+                // image style, so drain the style-image queue like the main
+                // resolve path does; skipping it keeps the old layer (or
+                // defers the fetch) until another resolve.
+                self.flush_pending_style_images();
+                self.resolve_layout();
+                timer.record_time("container");
+            }
+        }
+
         self.nodes.bump_geometry_generation();
 
         // Resolve transforms
