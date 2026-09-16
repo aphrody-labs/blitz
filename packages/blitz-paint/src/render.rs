@@ -754,6 +754,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 fn to_image_quality(image_rendering: ImageRendering) -> peniko::ImageQuality {
     match image_rendering {
         ImageRendering::Auto => peniko::ImageQuality::Medium,
+        // smooth and high-quality are spec-defined to behave identically
+        // (both request the best available sampling).
+        ImageRendering::Smooth | ImageRendering::HighQuality => peniko::ImageQuality::High,
         ImageRendering::CrispEdges => peniko::ImageQuality::Low,
         ImageRendering::Pixelated => peniko::ImageQuality::Low,
     }
