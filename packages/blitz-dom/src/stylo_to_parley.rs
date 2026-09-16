@@ -174,9 +174,23 @@ pub(crate) fn font_variant_ligatures(
 
 /// Map the `font-variant-caps` property to OpenType features.
 pub(crate) fn font_variant_caps(input: stylo::FontVariantCaps, out: &mut Vec<parley::FontFeature>) {
+    // OpenType feature mapping per css-fonts-3/#font-variant-caps-prop's
+    // "Corresponding OpenType Feature(s)" column: the same table gecko
+    // implements natively; small-caps already used it here.
     match input {
         stylo::FontVariantCaps::Normal => {}
         stylo::FontVariantCaps::SmallCaps => out.push(feature(b"smcp", 1)),
+        stylo::FontVariantCaps::AllSmallCaps => {
+            out.push(feature(b"smcp", 1));
+            out.push(feature(b"c2sc", 1));
+        }
+        stylo::FontVariantCaps::PetiteCaps => out.push(feature(b"pcap", 1)),
+        stylo::FontVariantCaps::AllPetiteCaps => {
+            out.push(feature(b"pcap", 1));
+            out.push(feature(b"c2pc", 1));
+        }
+        stylo::FontVariantCaps::Unicase => out.push(feature(b"unic", 1)),
+        stylo::FontVariantCaps::TitlingCaps => out.push(feature(b"titl", 1)),
     }
 }
 
@@ -282,10 +296,31 @@ pub(crate) fn font_features(font_styles: &stylo::Font) -> Vec<parley::FontFeatur
 
     self::font_feature_settings(&font_styles.font_feature_settings, &mut features);
 
-    features.sort_by_key(|feature| feature.tag);
-    features.dedup_by_key(|feature| feature.tag);
+    dedup_features_keep_last(features)
+}
 
-    features
+/// Collapse duplicate OpenType tags, keeping the last occurrence of each:
+/// not the first. `font_features` appends `font-feature-settings` after the
+/// `font-variant-*`-derived entries specifically so an explicit author
+/// feature wins per css-fonts/#feature-precedence (e.g.
+/// `font-variant-caps: all-small-caps; font-feature-settings: "smcp" 0`
+/// must turn `smcp` back off, even though all-small-caps also emits it).
+/// `Vec::dedup_by_key` on a plain ascending sort keeps the first of a
+/// run, which silently discarded that override: the existing
+/// `feature_settings_override_variant_features` test below only checked
+/// the two sub-functions' raw output, never this merge step, so it never
+/// caught it. Scan from the end so the first tag we see per key is the
+/// author's (or the highest-precedence variant-derived one), then
+/// restore ascending tag order.
+fn dedup_features_keep_last(features: Vec<parley::FontFeature>) -> Vec<parley::FontFeature> {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<_> = features
+        .into_iter()
+        .rev()
+        .filter(|feature| seen.insert(feature.tag))
+        .collect();
+    kept.sort_by_key(|feature| feature.tag);
+    kept
 }
 
 pub(crate) fn base_direction(
@@ -625,8 +660,13 @@ pub(crate) fn style(
         .collect();
 
     // Wrapping and breaking
+    // `word-break: break-word` is a legacy compat value (css-text-3):
+    // it behaves as `word-break: normal` together with
+    // `overflow-wrap: anywhere`, regardless of the actual overflow-wrap
+    // value. Fold that here rather than threading a third bit through
+    // parley's own WordBreak, which has no break-word variant of its own.
     let word_break = match itext_styles.word_break {
-        stylo::WordBreak::Normal => parley::WordBreak::Normal,
+        stylo::WordBreak::Normal | stylo::WordBreak::BreakWord => parley::WordBreak::Normal,
         stylo::WordBreak::BreakAll => parley::WordBreak::BreakAll,
         stylo::WordBreak::KeepAll => parley::WordBreak::KeepAll,
     };
@@ -636,12 +676,27 @@ pub(crate) fn style(
         stylo::LineBreak::Auto | stylo::LineBreak::Strict => parley::LineBreak::Strict,
         stylo::LineBreak::Anywhere => parley::LineBreak::Anywhere,
     };
-    let overflow_wrap = match itext_styles.overflow_wrap {
-        stylo::OverflowWrap::Normal => parley::OverflowWrap::Normal,
-        stylo::OverflowWrap::BreakWord => parley::OverflowWrap::BreakWord,
-        stylo::OverflowWrap::Anywhere => parley::OverflowWrap::Anywhere,
+    let overflow_wrap = if itext_styles.word_break == stylo::WordBreak::BreakWord {
+        parley::OverflowWrap::Anywhere
+    } else {
+        match itext_styles.overflow_wrap {
+            stylo::OverflowWrap::Normal => parley::OverflowWrap::Normal,
+            stylo::OverflowWrap::BreakWord => parley::OverflowWrap::BreakWord,
+            stylo::OverflowWrap::Anywhere => parley::OverflowWrap::Anywhere,
+        }
     };
     let text_wrap_mode = text_wrap_mode(itext_styles.text_wrap_mode);
+
+    // CSS `tab-size`: a <number> is a count of space-advances per tab
+    // (the CSS initial, 8); a <length> is an absolute advance.
+    let tab_size = match itext_styles.tab_size {
+        style::values::computed::NonNegativeLengthOrNumber::Number(n) => {
+            parley::TabSize::Chars(n.0)
+        }
+        style::values::computed::NonNegativeLengthOrNumber::Length(l) => {
+            parley::TabSize::Px(l.px())
+        }
+    };
 
     parley::TextStyle {
         // font_family: parley::FontFamily::Single(FontFamilyName::Generic(GenericFamily::SystemUi)),
@@ -662,6 +717,7 @@ pub(crate) fn style(
         overflow_wrap,
         word_break,
         line_break,
+        tab_size,
 
         // Contains NodeId
         brush: TextBrush::from_id(span_id),
@@ -820,5 +876,24 @@ mod tests {
         assert_eq!(flat, vec![(*b"tnum", 1), (*b"tnum", 0)]);
         let last_tnum = flat.iter().rev().find(|(tag, _)| tag == b"tnum").unwrap();
         assert_eq!(last_tnum.1, 0);
+    }
+
+    /// Regression for the actual merge step (`font_features`'s dedup), not
+    /// just the raw sub-function output above: an author's explicit
+    /// `font-feature-settings` must survive the dedup and win over a
+    /// `font-variant-caps`-derived feature with the same OpenType tag, even
+    /// when the variant-derived feature emits multiple tags (all-small-caps
+    /// emits both smcp and c2sc) so the override only targets one of them.
+    #[test]
+    fn dedup_keeps_author_override_over_variant_caps() {
+        let mut out = Vec::new();
+        // font-variant-caps: all-small-caps => smcp=1, c2sc=1
+        font_variant_caps(stylo::FontVariantCaps::AllSmallCaps, &mut out);
+        // font-feature-settings: "smcp" 0 (author turns smcp back off;
+        // c2sc is untouched and must survive)
+        font_feature_settings(&feature_settings(&[(b"smcp", 0)]), &mut out);
+
+        let merged = dedup_features_keep_last(out);
+        assert_eq!(pairs(&merged), vec![(*b"c2sc", 1), (*b"smcp", 0)]);
     }
 }
