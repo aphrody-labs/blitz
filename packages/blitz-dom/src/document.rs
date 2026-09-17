@@ -387,6 +387,9 @@ pub struct BaseDocument {
     /// (an Arc bump), while each <style> node still registers
     /// individually with the stylist (so cascade order is unchanged).
     pub(crate) author_sheet_cache: HashMap<u64, DocumentStyleSheet>,
+    /// The cache key currently registered for each style node. Replacing a
+    /// CSS-in-JS sheet must release the previous parse when no node shares it.
+    pub(crate) author_sheet_keys: HashMap<NodeId, u64>,
 
     /// Shadow roots whose scoped author styles changed since the last
     /// resolve; drained (and flushed into CascadeData) by the stylist.
@@ -588,6 +591,7 @@ impl BaseDocument {
             counters_built_once: false,
             url: base_url,
             author_sheet_cache: HashMap::new(),
+            author_sheet_keys: HashMap::new(),
             dirty_shadow_style_roots: Vec::new(),
             shadow_roots: HashSet::new(),
             slot_assignments_dirty: true,
@@ -1242,7 +1246,7 @@ impl BaseDocument {
             // Shadow trees hang off ElementData::shadow_root rather than
             // children, so drop them explicitly or their slots leak.
             if let Some(shadow_root_id) = node.attached_shadow_root_id() {
-                self.drop_node_ignoring_parent(shadow_root_id);
+                self.drop_node_ignoring_parent_with(shadow_root_id, on_drop);
             }
 
             if node.is_shadow_root() {
@@ -1445,7 +1449,17 @@ impl BaseDocument {
         }
         let cache_key = h;
         let sheet = if let Some(cached) = self.author_sheet_cache.get(&cache_key) {
-            cached.clone()
+            // Stylo identifies document sheets by the outer Arc and rejects
+            // registering the same one twice. Reuse the parsed contents while
+            // giving each <style> node its own registration identity.
+            let guard = self.guard.read();
+            let contents = cached.0.contents.read_with(&guard).clone();
+            DocumentStyleSheet(ServoArc::new(Stylesheet {
+                contents: self.guard.wrap(contents),
+                shared_lock: self.guard.clone(),
+                media: cached.0.media.clone(),
+                disabled: Default::default(),
+            }))
         } else {
             let decoded = html_escape::decode_html_entities(&css);
             let s = self.make_stylesheet_with_media(&decoded, Origin::Author, media_attr.as_deref());
@@ -1453,6 +1467,23 @@ impl BaseDocument {
             s
         };
         self.add_stylesheet_for_node(sheet, target_id);
+        let previous_key = self.author_sheet_keys.insert(target_id, cache_key);
+        if let Some(previous) = previous_key {
+            if previous != cache_key
+                && !self.author_sheet_keys.values().any(|&key| key == previous)
+            {
+                self.author_sheet_cache.remove(&previous);
+            }
+        }
+    }
+
+    pub(crate) fn remove_author_stylesheet(&mut self, target_id: NodeId) {
+        let Some(previous) = self.author_sheet_keys.remove(&target_id) else {
+            return;
+        };
+        if !self.author_sheet_keys.values().any(|&key| key == previous) {
+            self.author_sheet_cache.remove(&previous);
+        }
     }
 
     pub fn remove_user_agent_stylesheet(&mut self, sheet: &UserAgentStylesheet) {
@@ -3888,6 +3919,58 @@ mod zoom_tests {
         let base = shell_provider.redraw_count.load(Ordering::SeqCst);
         doc.zoom_to(1.0);
         assert!(shell_provider.redraw_count.load(Ordering::SeqCst) > base);
+    }
+}
+
+#[cfg(test)]
+mod author_sheet_cache_tests {
+    use super::*;
+    use crate::qual_name;
+
+    #[test]
+    fn removing_style_nodes_releases_their_shared_cache_entry() {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        let root_id = doc.root_node().id;
+        let (first, second, body) = {
+            let mut mutator = doc.mutate();
+            let html = mutator.create_element(qual_name!("html"), vec![]);
+            let first = mutator.create_element(qual_name!("style"), vec![]);
+            let second = mutator.create_element(qual_name!("style"), vec![]);
+            let body = mutator.create_element(qual_name!("body"), vec![]);
+            let first_text = mutator.create_text_node("body { color: red; }");
+            let second_text = mutator.create_text_node("body { color: red; }");
+            mutator.append_children(first, &[first_text]);
+            mutator.append_children(second, &[second_text]);
+            mutator.append_children(html, &[first, second, body]);
+            mutator.append_children(root_id, &[html]);
+            (first, second, body)
+        };
+
+        assert_eq!(doc.author_sheet_keys.len(), 2);
+        assert_eq!(doc.author_sheet_cache.len(), 1);
+        assert_ne!(
+            &doc.nodes_to_stylesheet[&first].0,
+            &doc.nodes_to_stylesheet[&second].0,
+        );
+
+        doc.resolve(0.0);
+        assert_eq!(
+            doc.nodes[body].primary_styles().unwrap().clone_color(),
+            style::color::AbsoluteColor::srgb_legacy(255, 0, 0, 1.0),
+        );
+
+        doc.mutate().remove_and_drop_node(first);
+        assert_eq!(doc.author_sheet_keys.len(), 1);
+        assert_eq!(doc.author_sheet_cache.len(), 1);
+        doc.resolve(0.0);
+        assert_eq!(
+            doc.nodes[body].primary_styles().unwrap().clone_color(),
+            style::color::AbsoluteColor::srgb_legacy(255, 0, 0, 1.0),
+        );
+
+        doc.mutate().remove_and_drop_node(second);
+        assert!(doc.author_sheet_keys.is_empty());
+        assert!(doc.author_sheet_cache.is_empty());
     }
 }
 

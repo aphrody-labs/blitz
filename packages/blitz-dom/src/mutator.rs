@@ -1177,7 +1177,13 @@ impl<'doc> DocumentMutator<'doc> {
     }
 
     pub fn set_inner_html(&mut self, node_id: NodeId, html: &str) {
-        self.remove_and_drop_all_children(node_id);
+        // The embedder may still hold wrappers for replaced children. Detach
+        // them here; the DOM shim drops only subtrees it can prove are
+        // unwrapped after this operation returns.
+        let old_children = self.doc.nodes[node_id].children.clone();
+        for child_id in old_children {
+            self.remove_node(child_id);
+        }
 
         // html5ever's fragment parser needs an element context (its
         // elem_name callback panics otherwise). Shadow roots parse
@@ -1302,6 +1308,13 @@ impl<'doc> DocumentMutator<'doc> {
             // the usual teardown steps (unhover/unactive the surviving
             // ancestor chain, IME disable on blur of a focused input).
             doc.clear_interaction_state_for_removed_node(node_id);
+
+            let is_style = doc.nodes[node_id]
+                .data
+                .is_element_with_tag_name(&local_name!("style"));
+            if is_style {
+                doc.remove_author_stylesheet(node_id);
+            }
 
             let node = &mut doc.nodes[node_id];
             // Stale flat-tree edges must not outlive removal: slab ids
@@ -1827,7 +1840,7 @@ impl<'doc> DocumentMutator<'doc> {
         match (existing_label, normalized) {
             (Some(text_id), Some(s)) => self.set_node_text(text_id, s),
             (Some(text_id), None) => {
-                self.remove_and_drop_node(text_id);
+                self.remove_node(text_id);
             }
             (None, Some(s)) => {
                 let text_id = self.create_text_node(s);
