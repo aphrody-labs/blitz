@@ -1770,6 +1770,10 @@ impl Node {
         let mut y = y - self.final_layout().location.y + self.scroll_offset().y as f32;
 
         if let Some(t) = self.transform().as_deref() {
+            // Only a singular matrix has no inverse; small nonzero scales still map points.
+            if t.determinant() == 0.0 {
+                return None;
+            }
             let p = t.inverse() * kurbo::Point::new(x as f64 * scale, y as f64 * scale);
             x = (p.x / scale) as f32;
             y = (p.y / scale) as f32;
@@ -1834,15 +1838,6 @@ impl Node {
             *scrollbar = Some(sb);
         }
 
-        let content_box_offset = taffy::Point {
-            x: self.final_layout().padding.left + self.final_layout().border.left,
-            y: self.final_layout().padding.top + self.final_layout().border.top,
-        };
-        if self.flags.is_inline_root() {
-            x -= content_box_offset.x;
-            y -= content_box_offset.y;
-        }
-
         // Positive z_index hoisted children
         if matches_hoisted_content {
             if let Some(hoisted) = &self.stacking_context {
@@ -1867,12 +1862,6 @@ impl Node {
             let mut child_x = x;
             let mut child_y = y;
             if child_position.is_out_of_flow() {
-                // Out-of-flow children's layout location is relative to this node's
-                // border box, so undo the inline-root content-box offset applied above
-                if self.flags.is_inline_root() {
-                    child_x += content_box_offset.x;
-                    child_y += content_box_offset.y;
-                }
                 // Fixed-position children of the root element are positioned
                 // against the viewport and do not scroll with it. (A fixed box
                 // whose containing block is a transformed ancestor scrolls with
@@ -1927,10 +1916,30 @@ impl Node {
             if let Some(ild) = element_data.inline_layout_data.as_ref() {
                 let layout = &ild.layout;
                 let scale = layout.scale();
-                let y = y - ild.block_offset;
+                let content_box_offset = taffy::Point {
+                    x: self.final_layout().padding.left + self.final_layout().border.left,
+                    y: self.final_layout().padding.top + self.final_layout().border.top,
+                };
+                let text_x = x - content_box_offset.x;
+                let text_y = y - content_box_offset.y - ild.block_offset;
 
+                // Parley's `from_point_exact` is exact in the inline axis
+                // only: `line_for_offset` clamps a block offset above the
+                // first line or below the last one onto that line. The
+                // descent above reaches nodes whose box does not contain
+                // the point (matches_content / matches_overflow /
+                // matches_rehomed exist for that), so without a block-axis
+                // check a pointer 17,000px above a long reference list
+                // hits the reference text whose x-range it shares, and
+                // every drag in the lead paragraph selects the article.
                 if let Some((cluster, _side)) =
-                    Cluster::from_point_exact(layout, x * scale, y * scale)
+                    Cluster::from_point_exact(layout, text_x * scale, text_y * scale)
+                    && {
+                        let line = cluster.line();
+                        let m = line.metrics();
+                        let by = text_y * scale;
+                        by >= m.block_min_coord && by < m.block_max_coord
+                    }
                 {
                     let node_id = cluster.style().brush.id;
                     let text_pointer_events_none = self
@@ -1940,8 +1949,8 @@ impl Node {
                     if !text_pointer_events_none {
                         return Some(HitResult {
                             node_id,
-                            x,
-                            y,
+                            x: text_x,
+                            y: text_y,
                             is_text: true,
                         });
                     }
@@ -1951,10 +1960,18 @@ impl Node {
 
         // Self (this node)
         if matches_self && !pointer_events_none {
+            let (hit_x, hit_y) = if self.flags.is_inline_root() {
+                (
+                    x - self.final_layout().padding.left - self.final_layout().border.left,
+                    y - self.final_layout().padding.top - self.final_layout().border.top,
+                )
+            } else {
+                (x, y)
+            };
             return Some(HitResult {
                 node_id: self.id,
-                x,
-                y,
+                x: hit_x,
+                y: hit_y,
                 is_text: false,
             });
         }
