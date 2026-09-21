@@ -1,6 +1,6 @@
 use super::ElementCx;
 use crate::color::{Color, ToColorColor as _};
-use anyrender::PaintScene;
+use anyrender::{PaintScene, ScenePart};
 use blitz_dom::local_name;
 use kurbo::{Affine, BezPath, Cap, Circle, Join, Point, RoundedRect, Stroke, Vec2};
 use peniko::Fill;
@@ -94,11 +94,15 @@ impl ElementCx<'_, '_> {
 
         match type_attr {
             Some("checkbox") => {
+                scene.begin_part(self.node.id.as_u64(), ScenePart::Checkbox { checked });
                 draw_checkbox(scene, checked, frame, self.transform, accent_color, scale);
+                scene.end_part();
             }
             Some("radio") => {
+                scene.begin_part(self.node.id.as_u64(), ScenePart::Radio { checked });
                 let center = frame.center();
                 draw_radio_button(scene, checked, center, self.transform, accent_color, scale);
+                scene.end_part();
             }
             _ => {}
         }

@@ -264,6 +264,7 @@ fn decoration_size(
 #[allow(clippy::too_many_arguments)]
 fn draw_decoration_line(
     scene: &mut impl PaintScene,
+    node_id: u64,
     transform: Affine,
     scale: f64,
     x0: f64,
@@ -284,6 +285,7 @@ fn draw_decoration_line(
     if w <= 0.0 {
         return;
     }
+    scene.begin_part(node_id, anyrender::ScenePart::TextDecoration);
     let y = (baseline - offset + size / 2.0) as f64;
     let size = size as f64;
     let butt_stroke = Stroke::new(size).with_caps(Cap::Butt);
@@ -365,6 +367,7 @@ fn draw_decoration_line(
             scene.stroke(&stroke, transform, brush, None, &path);
         }
     }
+    scene.end_part();
 }
 
 /// Paint the decorations accumulated for one line, one line per decorating box.
@@ -454,6 +457,7 @@ fn flush_line_decorations(
             // A `double` underline extends downward, away from the text.
             draw_decoration_line(
                 scene,
+                acc.node_id.as_u64(),
                 transform,
                 scale,
                 acc.min_x,
@@ -490,6 +494,7 @@ fn flush_line_decorations(
             // A `double` overline extends upward, away from the text.
             draw_decoration_line(
                 scene,
+                acc.node_id.as_u64(),
                 transform,
                 scale,
                 acc.min_x,
@@ -522,6 +527,7 @@ fn flush_line_decorations(
 
             draw_decoration_line(
                 scene,
+                acc.node_id.as_u64(),
                 transform,
                 scale,
                 acc.min_x,

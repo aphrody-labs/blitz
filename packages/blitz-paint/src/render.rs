@@ -18,7 +18,7 @@ use crate::layers::LayerManager;
 use crate::sizing::compute_object_fit;
 use crate::text::DrawTextContext;
 use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
-use anyrender::{PaintScene, Scene};
+use anyrender::{PaintScene, Scene, ScenePart};
 use blitz_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
     TextNodeData,
@@ -505,7 +505,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // by the layer that wraps it, so the whole traversal below is dead work.
         let clipped_away = is_empty_clip_region(clip_path_shape.as_ref());
 
+        scene.begin_part(node_id.as_u64(), ScenePart::Outline);
         cx.draw_outline(scene);
+        scene.end_part();
         cx.draw_outset_box_shadow(scene);
 
         // Outline and outset shadow paint outside the clip-path layer here, so they
@@ -600,11 +602,20 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     filter,
                     backdrop_filter,
                     |scene| {
+                        let part_id = node_id.as_u64();
+                        scene.begin_part(part_id, ScenePart::Background);
                         cx.draw_background(scene);
+                        scene.end_part();
                         cx.draw_inset_box_shadow(scene);
+                        scene.begin_part(part_id, ScenePart::TableRowBackground);
                         cx.draw_table_row_backgrounds(scene);
+                        scene.end_part();
+                        scene.begin_part(part_id, ScenePart::TableBorder);
                         cx.draw_table_borders(scene);
+                        scene.end_part();
+                        scene.begin_part(part_id, ScenePart::Border);
                         cx.draw_border(scene);
+                        scene.end_part();
                         cx.stroke_devtools(scene);
 
                         // TODO: allow layers with opacity to be unclipped (overflow: visible)
@@ -649,7 +660,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 cx.draw_input(scene);
                                 cx.draw_text_input_text(scene, content_position);
                                 cx.draw_inline_layout(scene, content_position);
+                                scene.begin_part(node_id.as_u64(), ScenePart::Marker);
                                 cx.draw_marker(scene, content_position);
+                                scene.end_part();
                                 cx.draw_children(scene, cx.transform, child_clip_rect, should_clip);
                             },
                         );
