@@ -1842,7 +1842,14 @@ impl Node {
                 // against the viewport and do not scroll with it. (A fixed box
                 // whose containing block is a transformed ancestor scrolls with
                 // that ancestor like any other out-of-flow box.)
-                if child_position == taffy::Position::Fixed && self.containing_block().is_none() {
+                // The root element is a layout child of the Document
+                // node, so recognise it by that, not by a `None` containing block.
+                if child_position == taffy::Position::Fixed
+                    && self
+                        .containing_block()
+                        .map(|id| self.with(id))
+                        .is_none_or(|parent| matches!(parent.data, NodeData::Document(_)))
+                {
                     child_x -= self.scroll_offset().x as f32;
                     child_y -= self.scroll_offset().y as f32;
                     let viewport_scroll = self.tree().viewport_scroll();

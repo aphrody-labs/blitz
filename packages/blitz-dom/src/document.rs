@@ -3028,6 +3028,17 @@ impl BaseDocument {
         self.nodes.set_viewport_scroll(scroll);
     }
 
+    /// Paint at `scroll` while keeping fixed boxes anchored at `anchor`.
+    /// Clipped paints change translation, not page scroll. The next
+    /// `set_viewport_scroll` drops the anchor.
+    pub fn set_viewport_scroll_with_fixed_anchor(
+        &mut self,
+        scroll: crate::Point<f64>,
+        anchor: crate::Point<f64>,
+    ) {
+        self.nodes.set_viewport_scroll_with_fixed_anchor(scroll, anchor);
+    }
+
     /// Find the node targeted by a URL fragment (the `#...` part of a URL).
     ///
     /// Per the HTML spec, this is the element whose `id` matches the fragment, falling
@@ -3059,6 +3070,22 @@ impl BaseDocument {
             pos.x += node.unrounded_layout().location.x - node.scroll_offset().x as f32;
             pos.y += node.unrounded_layout().location.y - node.scroll_offset().y as f32;
             current = node.containing_block();
+            // A fixed box contained by the root element is positioned against
+            // the viewport and does not scroll with it: cancel the root and viewport
+            // scroll the walk (and the caller's viewport-relative conversion) applies,
+            // as paint and hit-testing do (`hoisted_child_position`). Otherwise
+            // getBoundingClientRect on a fixed header drifts up by the page scroll.
+            if node.taffy_position() == taffy::Position::Fixed
+                && let Some(cb) = current.and_then(|cb| self.nodes.get(cb))
+                && cb
+                    .containing_block()
+                    .and_then(|id| self.nodes.get(id))
+                    .is_none_or(|parent| matches!(parent.data, NodeData::Document(_)))
+            {
+                let viewport_scroll = self.viewport_scroll();
+                pos.x += cb.scroll_offset().x as f32 + viewport_scroll.x as f32;
+                pos.y += cb.scroll_offset().y as f32 + viewport_scroll.y as f32;
+            }
         }
         (pos, *self.nodes[node_id].unrounded_layout())
     }

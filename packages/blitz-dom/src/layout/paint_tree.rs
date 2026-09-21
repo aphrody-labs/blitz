@@ -15,7 +15,7 @@ use thin_vec::ThinVec;
 
 use crate::layout::damage::ALL_DAMAGE;
 use crate::tree::NodeTree;
-use crate::{BaseDocument, Node};
+use crate::{BaseDocument, Node, NodeData};
 use style::properties::generated::longhands::position::computed_value::T as Position;
 use style::selector_parser::RestyleDamage;
 use style::values::computed::Float;
@@ -39,12 +39,17 @@ pub fn hoisted_child_position(tree: &NodeTree, sc_root_id: NodeId, child_id: Nod
     // positioned against the viewport and does not scroll with it: cancel the
     // scroll the walk below (or the stacking-context root itself) applies.
     // A fixed box contained by a transformed ancestor scrolls with it.
+    // The root element is a layout child of the Document node, so it is
+    // recognised by its containing block being the Document, not `None`.
     if child.taffy_position() == taffy::Position::Fixed
         && let Some(cb) = current.and_then(|id| tree.get(id))
-        && cb.containing_block().is_none()
+        && cb
+            .containing_block()
+            .and_then(|id| tree.get(id))
+            .is_none_or(|parent| matches!(parent.data, NodeData::Document(_)))
     {
         let scroll_offset = *cb.scroll_offset();
-        let viewport_scroll = tree.viewport_scroll();
+        let viewport_scroll = tree.fixed_anchor_scroll();
         position.x += scroll_offset.x as f32 + viewport_scroll.x as f32;
         position.y += scroll_offset.y as f32 + viewport_scroll.y as f32;
     }

@@ -41,6 +41,10 @@ pub struct NodeTree {
     /// Scroll offset of the viewport (the root element scrolls the viewport,
     /// so its offset lives here rather than on the node).
     viewport_scroll: crate::Point<f64>,
+    /// The page scroll fixed boxes stay anchored at while a clipped
+    /// paint moves `viewport_scroll` to translate the scene. `None` means the
+    /// fixed boxes follow `viewport_scroll` as usual.
+    fixed_anchor: Option<crate::Point<f64>>,
 }
 
 impl NodeTree {
@@ -49,6 +53,7 @@ impl NodeTree {
             map: SlotMap::with_key(),
             geometry_generation: AtomicU64::new(1),
             viewport_scroll: crate::Point::ZERO,
+            fixed_anchor: None,
         }
     }
 
@@ -60,6 +65,24 @@ impl NodeTree {
     /// bumps the geometry generation like any other scroll write.
     pub(crate) fn set_viewport_scroll(&mut self, scroll: crate::Point<f64>) {
         self.viewport_scroll = scroll;
+        self.fixed_anchor = None;
+        self.bump_geometry_generation();
+    }
+
+    /// The scroll that viewport-fixed boxes cancel when painted:
+    /// the anchor set by `set_viewport_scroll_with_fixed_anchor`, else the
+    /// viewport scroll.
+    pub fn fixed_anchor_scroll(&self) -> crate::Point<f64> {
+        self.fixed_anchor.unwrap_or(self.viewport_scroll)
+    }
+
+    pub(crate) fn set_viewport_scroll_with_fixed_anchor(
+        &mut self,
+        scroll: crate::Point<f64>,
+        anchor: crate::Point<f64>,
+    ) {
+        self.viewport_scroll = scroll;
+        self.fixed_anchor = Some(anchor);
         self.bump_geometry_generation();
     }
 
