@@ -1059,6 +1059,13 @@ fn collect_layout_children_with_wrap(
         },
     );
 
+    // Display:table on a replaced element still yields a replaced box;
+    // building a table here overwrote its image/canvas data and layout panicked.
+    let is_replaced = doc.nodes[container_node_id]
+        .data
+        .downcast_element()
+        .is_some_and(|el| super::replaced::is_replaced_element(&el.name.local));
+
     match container_display.inside() {
         DisplayInside::None => {}
         DisplayInside::Contents => {
@@ -1105,7 +1112,7 @@ fn collect_layout_children_with_wrap(
             sort_layout_children_by_order(&doc.nodes, &mut out.children);
         }
 
-        DisplayInside::Table => {
+        DisplayInside::Table if !is_replaced => {
             let (table_context, tlayout_children) = build_table_context(doc, container_node_id);
             #[allow(clippy::arc_with_non_send_sync)]
             let data = SpecialElementData::TableRoot(Arc::new(table_context));

@@ -487,7 +487,9 @@ impl LayoutPassState<'_> {
                                 default_object_size,
                             )
                         }
-                        _ => unreachable!(),
+                        // Any other payload is a construction bug; panicking here
+                        // repeats on every layout query and wedges the page, so size by tag.
+                        _ => tag_intrinsic_sizes(&element_data.name.local, attr_size),
                     };
 
                     #[cfg(feature = "writing-mode")]
