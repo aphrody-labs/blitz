@@ -928,7 +928,8 @@ fn collect_layout_children_with_wrap(
 
         #[cfg(feature = "svg")]
         if matches!(tag_name, "svg") {
-            let mut outer_html = doc.get_node(container_node_id).unwrap().svg_source();
+            let (mut outer_html, snapshot_prefix) =
+                doc.get_node(container_node_id).unwrap().svg_source();
 
             // Stamp the element's computed `color` on the serialized
             // root so usvg resolves any surviving `currentColor` by inheritance.
@@ -1007,12 +1008,10 @@ fn collect_layout_children_with_wrap(
             });
 
             match crate::util::parse_svg_image(outer_html.as_bytes()) {
-                Ok(svg) => {
-                    doc.get_node_mut(container_node_id)
-                        .unwrap()
-                        .element_data_mut()
-                        .unwrap()
-                        .special_data =
+                Ok(mut svg) => {
+                    svg.snapshot_prefix = Some(snapshot_prefix);
+                    let node = doc.get_node_mut(container_node_id).unwrap();
+                    node.element_data_mut().unwrap().special_data =
                         SpecialElementData::Image(Box::new(crate::node::ImageData::Svg(svg)));
                 }
                 Err(err) => {

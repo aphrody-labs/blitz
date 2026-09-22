@@ -92,6 +92,8 @@ pub struct SvgImageData {
     pub tree: Arc<usvg::Tree>,
     /// The dimensions declared on the root `<svg>` element.
     pub intrinsic_dimensions: SvgIntrinsicDimensions,
+    /// The `ks-svg-internal-<k>-` prefix number of an inline SVG snapshot.
+    pub(crate) snapshot_prefix: Option<u32>,
 }
 
 impl SvgImageData {
@@ -144,6 +146,7 @@ impl SvgImageData {
         let mut image = Self {
             tree: Arc::new(tree),
             intrinsic_dimensions,
+            snapshot_prefix: None,
         };
 
         // Keep usvg's viewport aligned with the CSS natural dimensions. usvg
