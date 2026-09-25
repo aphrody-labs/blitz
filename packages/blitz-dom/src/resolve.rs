@@ -72,6 +72,8 @@ impl BaseDocument {
             return;
         }
 
+        self.process_pending_style_elements();
+
         // Process messages that have been sent to our message channel (e.g. loaded resource)
         self.handle_messages();
 

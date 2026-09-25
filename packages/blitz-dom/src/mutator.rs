@@ -1125,8 +1125,14 @@ impl<'doc> DocumentMutator<'doc> {
         }
 
         // Add/Update inline stylesheets (<style> elements)
+        // A first sheet is parsed now so its @import and @font-face loads start
+        // early; replacing an already registered one waits for resolve.
         for id in self.style_nodes.drain() {
-            self.doc.process_style_element(id);
+            if self.doc.nodes_to_stylesheet.contains_key(&id) {
+                self.doc.pending_style_nodes.insert(id);
+            } else {
+                self.doc.process_style_element(id);
+            }
         }
 
         // Snapshot form_nodes so we can both reset_form_owner
@@ -1324,6 +1330,7 @@ impl<'doc> DocumentMutator<'doc> {
                 .data
                 .is_element_with_tag_name(&local_name!("style"));
             if is_style {
+                doc.pending_style_nodes.remove(&node_id);
                 doc.remove_author_stylesheet(node_id);
             }
 
