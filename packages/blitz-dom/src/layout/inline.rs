@@ -351,9 +351,20 @@ impl LayoutPassState<'_> {
         let suppresses_baseline = style.contain().suppresses_baseline();
         drop(style);
 
+        // An inline with `unicode-bidi: isolate` (UA style for `[dir]`) or
+        // `embed` wraps its content in bidi controls at construction, and
+        // those are text to parley: a lone `<span dir=ltr>` became a 19px
+        // line of nothing. They render nothing, so the text is empty for
+        // the line-box rules below. tldraw's canvas sits in Radix's
+        // `<span dir="ltr">` and every panel below it slid down a line.
+        let text_is_only_bidi_controls = inline_layout
+            .text
+            .chars()
+            .all(|c| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'));
+
         // Short circuit if inline context contains no text or inline boxes
         if !has_styles_preventing_being_collapsed_through
-            && inline_layout.text.is_empty()
+            && text_is_only_bidi_controls
             && inline_layout.layout.inline_boxes().len() == 0
         {
             // Put layout back
@@ -916,8 +927,18 @@ impl LayoutPassState<'_> {
         // Parley lays out empty text as a single strut-height line (text-editor semantics),
         // but a line box containing no text, inline boxes or other in-flow content is a
         // zero-height line box in CSS (CSS2 §9.4.2).
-        let has_inline_content =
-            !inline_layout.text.is_empty() || inline_layout.layout.inline_boxes().len() > 0;
+        let has_inline_content = if !text_is_only_bidi_controls {
+            true
+        } else if inline_layout.text.is_empty() {
+            inline_layout.layout.inline_boxes().len() > 0
+        } else {
+            // On a line of bidi controls an out-of-flow box (tldraw's abspos
+            // canvas) is no content either, but parley sizes the line.
+            inline_layout
+                .layout
+                .inline_boxes()
+                .any(|inline_box| inline_box.kind == parley::InlineBoxKind::InFlow)
+        };
 
         let mut height = if has_inline_content {
             inline_layout.layout.height()
