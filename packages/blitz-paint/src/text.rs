@@ -95,6 +95,15 @@ struct DecorationStackEntry {
     text_fill_color: Color,
     /// The decoration this node introduces as a decorating box, if any.
     decoration: Option<ResolvedDecoration>,
+    /// `opacity` of this node times every inline ancestor's, up to
+    /// but excluding the inline root. The root's own opacity is a paint
+    /// layer in render.rs, but a non-atomic inline box paints no layer of its
+    /// own, so its opacity has to reach its glyphs and decorations here.
+    /// Without it `<span style="opacity:0">` paints fully opaque, so text that
+    /// fades by animating per-character span opacity shows every frame at
+    /// once. Multiplying per run matches group
+    /// opacity everywhere except where glyphs of one span overlap.
+    opacity: f32,
 }
 
 /// Resolve the cached style values for a single node into a [`DecorationStackEntry`].
@@ -104,6 +113,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
             node_id,
             text_fill_color: Color::BLACK,
             decoration: None,
+            opacity: 1.0,
         };
     };
 
@@ -179,6 +189,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
         node_id,
         text_fill_color,
         decoration,
+        opacity: styles.get_effects().opacity,
     }
 }
 
@@ -545,6 +556,21 @@ fn flush_line_decorations(
     }
 }
 
+/// The combined `opacity` of `node_id` and its inline ancestors, excluding
+/// `inline_root_id` (see `DecorationStackEntry::opacity`).
+pub(crate) fn inline_opacity(doc: &BaseDocument, node_id: NodeId, inline_root_id: NodeId) -> f32 {
+    let mut opacity = 1.0;
+    let mut walk_id = Some(node_id);
+    while let Some(id) = walk_id.filter(|&id| id != inline_root_id) {
+        let Some(node) = doc.get_node(id) else { break };
+        if let Some(styles) = node.primary_styles() {
+            opacity *= styles.get_effects().opacity;
+        }
+        walk_id = node.parent;
+    }
+    opacity
+}
+
 pub(crate) fn stroke_text<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
@@ -616,14 +642,23 @@ pub(crate) fn stroke_text<'a>(
                     .count();
                 stack.truncate(shared);
                 for &node_id in &path_scratch[shared..] {
-                    stack.push(resolve_decoration_entry(doc, node_id));
+                    let mut entry = resolve_decoration_entry(doc, node_id);
+                    entry.opacity = match stack.last() {
+                        _ if node_id == inline_root_id => 1.0,
+                        Some(parent) => parent.opacity * entry.opacity,
+                        None => entry.opacity,
+                    };
+                    if let Some(deco) = entry.decoration.as_mut() {
+                        deco.color = deco.color.multiply_alpha(entry.opacity);
+                    }
+                    stack.push(entry);
                 }
 
                 // The glyph colour comes from the run's own node (the stack top): `color`
                 // inherits, so the innermost inline element already carries the right value.
                 let text_fill_color = stack
                     .last()
-                    .map(|entry| entry.text_fill_color)
+                    .map(|entry| entry.text_fill_color.multiply_alpha(entry.opacity))
                     .unwrap_or(Color::BLACK);
 
                 let embolden = if FONT_EMBOLDEN_ENABLED {

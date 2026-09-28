@@ -48,6 +48,7 @@ pub(crate) fn paint_span_fragment_backgrounds(
     layout: &Layout<TextBrush>,
     doc: &BaseDocument,
     transform: Affine,
+    inline_root_id: blitz_dom::NodeId,
 ) {
     let fragments = layout.span_fragments();
     if fragments.is_empty() {
@@ -97,7 +98,8 @@ pub(crate) fn paint_span_fragment_backgrounds(
             .get_background()
             .background_color
             .resolve_to_absolute(&current_color)
-            .as_srgb_color();
+            .as_srgb_color()
+            .multiply_alpha(crate::text::inline_opacity(doc, node.id, inline_root_id));
         if bg.components[3] == 0.0 {
             continue;
         }
@@ -122,6 +124,7 @@ pub(crate) fn paint_span_fragment_borders(
     layout: &Layout<TextBrush>,
     doc: &BaseDocument,
     transform: Affine,
+    inline_root_id: blitz_dom::NodeId,
 ) {
     let fragments = layout.span_fragments();
     if fragments.is_empty() {
@@ -159,23 +162,28 @@ pub(crate) fn paint_span_fragment_borders(
             None => continue,
         };
         let current_color = primary.clone_color();
+        let opacity = crate::text::inline_opacity(doc, node.id, inline_root_id);
         let border = primary.get_border();
         let top_color = border
             .border_top_color
             .resolve_to_absolute(&current_color)
-            .as_srgb_color();
+            .as_srgb_color()
+            .multiply_alpha(opacity);
         let right_color = border
             .border_right_color
             .resolve_to_absolute(&current_color)
-            .as_srgb_color();
+            .as_srgb_color()
+            .multiply_alpha(opacity);
         let bottom_color = border
             .border_bottom_color
             .resolve_to_absolute(&current_color)
-            .as_srgb_color();
+            .as_srgb_color()
+            .multiply_alpha(opacity);
         let left_color = border
             .border_left_color
             .resolve_to_absolute(&current_color)
-            .as_srgb_color();
+            .as_srgb_color()
+            .multiply_alpha(opacity);
 
         let outer = fragment_rect(fragment, line);
 
