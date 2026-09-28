@@ -1,6 +1,7 @@
 use kurbo::{Arc, BezPath, Insets, PathEl, Point, Rect, Shape as _, Vec2};
 use std::{f64::consts::FRAC_PI_2, f64::consts::PI};
 
+use super::corner_shape::{CornerShapes, contour};
 use super::non_uniform_radii::NonUniformRoundedRectRadii;
 use super::{Corner, CssBoxKind, Direction, Edge, add_insets, get_corner_insets};
 
@@ -40,6 +41,7 @@ pub struct CssBox {
     pub outline_width: f64,
 
     pub border_radii: NonUniformRoundedRectRadii,
+    pub corner_shapes: CornerShapes,
 }
 
 impl CssBox {
@@ -83,7 +85,39 @@ impl CssBox {
             padding_width: padding,
             border_width: border,
             border_radii,
+            corner_shapes: CornerShapes::ROUND,
         }
+    }
+
+    pub fn with_corner_shapes(mut self, corner_shapes: CornerShapes) -> Self {
+        self.corner_shapes = corner_shapes;
+        self
+    }
+
+    /// Whether a visible corner has a `corner-shape` other than `round`, so the box's paths
+    /// must come from [`contour`] rather than elliptical arcs.
+    pub fn has_corner_shape(&self) -> bool {
+        let r = &self.border_radii;
+        let s = &self.corner_shapes;
+        [
+            (r.top_left, s.top_left),
+            (r.top_right, s.top_right),
+            (r.bottom_right, s.bottom_right),
+            (r.bottom_left, s.bottom_left),
+        ]
+        .iter()
+        .any(|(radius, k)| radius.x > 0.0 && radius.y > 0.0 && *k != 1.0)
+    }
+
+    /// The corner-shaped contour of the border box moved in by `insets`: the border widths
+    /// give the padding edge, and a negative spread gives an outset shadow's shape.
+    pub fn shaped_contour(&self, insets: Insets) -> BezPath {
+        contour(
+            self.border_box,
+            &self.border_radii,
+            &self.corner_shapes,
+            insets,
+        )
     }
 
     /// Construct a BezPath representing one edge of a box's border.
@@ -211,6 +245,9 @@ impl CssBox {
 
     /// Construct a bezpath drawing the frame border
     pub fn border_box_path(&self) -> BezPath {
+        if self.has_corner_shape() {
+            return self.shaped_contour(Insets::ZERO);
+        }
         let mut path = BezPath::new();
         self.shape(&mut path, CssBoxKind::BorderBox, Direction::Clockwise);
         path
@@ -218,6 +255,9 @@ impl CssBox {
 
     /// Construct a bezpath drawing the frame padding
     pub fn padding_box_path(&self) -> BezPath {
+        if self.has_corner_shape() {
+            return self.shaped_contour(self.border_width);
+        }
         let mut path = BezPath::new();
         self.shape(&mut path, CssBoxKind::PaddingBox, Direction::Clockwise);
         path
@@ -225,6 +265,9 @@ impl CssBox {
 
     /// Construct a bezpath drawing the frame content
     pub fn content_box_path(&self) -> BezPath {
+        if self.has_corner_shape() {
+            return self.shaped_contour(add_insets(self.border_width, self.padding_width));
+        }
         let mut path = BezPath::new();
         self.shape(&mut path, CssBoxKind::ContentBox, Direction::Clockwise);
         path
@@ -298,6 +341,18 @@ impl CssBox {
 
         for corner in [TopLeft, TopRight, BottomRight, BottomLeft] {
             path.insert_point(self.shadow_clip_corner(corner, shadow_rect));
+        }
+
+        if self.has_corner_shape() {
+            path.close_path();
+            path.extend(
+                self.shaped_contour(Insets::ZERO)
+                    .reverse_subpaths()
+                    .elements()
+                    .iter()
+                    .copied(),
+            );
+            return;
         }
 
         if self.is_sharp(TopLeft, CssBoxKind::BorderBox) {

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::kurbo_css::CssBox;
+use super::kurbo_css::{CornerShapes, CssBox};
 use crate::color::{Color, ToColorColor};
 use crate::debug_overlay::render_debug_overlay;
 use crate::filters::convert_filters;
@@ -1520,5 +1520,13 @@ fn create_css_rect(style: &ComputedValues, layout: &Layout, scale: f64) -> CssBo
         bottom_left: resolve_radii(&s_border.border_bottom_left_radius),
     };
 
+    let corner_shapes = CornerShapes {
+        top_left: s_border.corner_top_left_shape.k as f64,
+        top_right: s_border.corner_top_right_shape.k as f64,
+        bottom_right: s_border.corner_bottom_right_shape.k as f64,
+        bottom_left: s_border.corner_bottom_left_shape.k as f64,
+    };
+
     CssBox::new(border_box, border, padding, outline_width, border_radii)
+        .with_corner_shapes(corner_shapes)
 }
