@@ -45,7 +45,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 use std::task::{Context as TaskContext, Waker};
 use style::Atom;
-use style::animation::DocumentAnimationSet;
+use style::animation::{AnimationSetKey, DocumentAnimationSet};
 use style::attr::{AttrIdentifier, AttrValue};
 use style::computed_value_flags::ComputedValueFlags;
 use style::data::{ElementData as StyloElementData, ElementStyles};
@@ -60,9 +60,9 @@ use style::values::computed::UserSelect;
 use style::values::computed::ui::CursorKind;
 use style::{
     device::Device,
-    dom::{TDocument, TNode},
+    dom::{OpaqueNode, TDocument, TNode},
     media_queries::MediaList,
-    selector_parser::SnapshotMap,
+    selector_parser::{PseudoElement, SnapshotMap},
     shared_lock::{SharedRwLock, StylesheetGuards},
     stylesheets::{AllowImportRules, DocumentStyleSheet, Origin, Stylesheet},
     stylist::Stylist,
@@ -1232,7 +1232,36 @@ impl BaseDocument {
                 }
             }
         }
+        if self.nodes.get(node_id).is_some_and(|node| node.is_element()) {
+            self.remove_animation_sets_for_dropped_node(node_id);
+        }
         self.nodes.remove(node_id)
+    }
+
+    fn remove_animation_sets_for_dropped_node(&self, node_id: NodeId) {
+        let mut sets = self.animations.sets.write();
+        if sets.is_empty() {
+            return;
+        }
+        // OpaqueNode keeps only the slot on wasm32, so clear both key forms before reuse.
+        let full_id = node_id.as_u64() as usize;
+        let slot_id = node_id.as_u64() as u32 as usize;
+        let opaque_ids: &[usize] = if full_id == slot_id {
+            &[full_id]
+        } else {
+            &[full_id, slot_id]
+        };
+        for &opaque_id in opaque_ids {
+            sets.remove(&AnimationSetKey::new_for_non_pseudo(OpaqueNode(opaque_id)));
+            sets.remove(&AnimationSetKey::new_for_pseudo(
+                OpaqueNode(opaque_id),
+                PseudoElement::Before,
+            ));
+            sets.remove(&AnimationSetKey::new_for_pseudo(
+                OpaqueNode(opaque_id),
+                PseudoElement::After,
+            ));
+        }
     }
 
     /// The nearest element ancestor of `node_id` that is still in the
@@ -2054,9 +2083,8 @@ impl BaseDocument {
     // triggered it queued, and every retry re-panics (livelock).
     pub fn clear_style_snapshots(&mut self) {
         for opaque in self.snapshots.keys() {
-            let id = NodeId::from_u64(opaque.id() as u64);
-            if let Some(node) = self.nodes.get_mut(id) {
-                node.set_has_snapshot(false);
+            if let Some(id) = self.nodes.id_from_opaque(opaque.id()) {
+                self.nodes[id].set_has_snapshot(false);
             }
         }
         self.snapshots.clear();

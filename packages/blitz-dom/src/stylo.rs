@@ -109,7 +109,7 @@ impl crate::document::BaseDocument {
         // Mark actively animating nodes as dirty
         let mut sets = self.animations.sets.write();
         for (key, set) in sets.iter_mut() {
-            let node_id = NodeId::from_u64(key.node.id() as u64);
+            let node_id = self.nodes.id_from_opaque(key.node.id());
 
             // Drop animations belonging to nodes that are no longer in the
             // document. A removed element is never restyled, so it would never
@@ -117,15 +117,14 @@ impl crate::document::BaseDocument {
             // would then keep `has_active_animations` set forever and force a
             // redraw every frame. Emptying the set here lets the `retain` below
             // discard it so the flag can clear on this same pass.
-            let in_document = self
-                .nodes
-                .get(node_id)
+            let in_document = node_id
+                .and_then(|id| self.nodes.get(id))
                 .is_some_and(|node| node.flags.is_in_document());
-            if !in_document {
+            let Some(node_id) = node_id.filter(|_| in_document) else {
                 set.animations.clear();
                 set.transitions.clear();
                 continue;
-            }
+            };
 
             // Only a set with something left to tick can change what it
             // contributes; a finished fill or a paused animation cannot.
@@ -194,9 +193,8 @@ impl crate::document::BaseDocument {
             .extend(nodes_needing_style_image_flush);
 
         for opaque in self.snapshots.keys() {
-            let id = NodeId::from_u64(opaque.id() as u64);
-            if let Some(node) = self.nodes.get_mut(id) {
-                node.set_has_snapshot(false);
+            if let Some(id) = self.nodes.id_from_opaque(opaque.id()) {
+                self.nodes[id].set_has_snapshot(false);
             }
         }
         self.snapshots.clear();
@@ -281,7 +279,7 @@ impl crate::document::BaseDocument {
         let quirks_mode = self.stylist.quirks_mode();
 
         for (opaque, snapshot) in self.snapshots.iter() {
-            let Some(node) = self.nodes.get(NodeId::from_u64(opaque.id() as u64)) else {
+            let Some(node) = self.nodes.id_from_opaque(opaque.id()).map(|id| &self.nodes[id]) else {
                 continue;
             };
             let Some(element) = TNode::as_element(&node) else {

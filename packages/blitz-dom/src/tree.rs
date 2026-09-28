@@ -45,6 +45,16 @@ pub struct NodeTree {
     /// paint moves `viewport_scroll` to translate the scene. `None` means the
     /// fixed boxes follow `viewport_scroll` as usual.
     fixed_anchor: Option<crate::Point<f64>>,
+    /// Each slot index's current id (raw `NodeId`), 0 for a free
+    /// slot. Backs `id_from_opaque`.
+    slot_ids: Vec<u64>,
+}
+
+/// The slot index of an id: the low half of the slotmap FFI encoding, which
+/// keeps the version in the high half.
+#[inline(always)]
+fn slot_index(raw: u64) -> usize {
+    (raw & 0xffff_ffff) as usize
 }
 
 impl NodeTree {
@@ -54,7 +64,26 @@ impl NodeTree {
             geometry_generation: AtomicU64::new(1),
             viewport_scroll: crate::Point::ZERO,
             fixed_anchor: None,
+            slot_ids: Vec::new(),
         }
+    }
+
+    /// The live node behind a stylo `OpaqueNode` (`BlitzNode::opaque`).
+    ///
+    /// `OpaqueNode` wraps a `usize`, so on wasm32 it keeps only the slot
+    /// index and loses the version. `NodeId::from_u64(opaque)` then rebuilt
+    /// the key at version 1, which misses every node living in a reused slot.
+    /// Stylo's animation sweep took that miss for "not in the document" and
+    /// cleared the node's transitions on every resolve, so they never
+    /// advanced: a span that lands in the slot a previous innerHTML's
+    /// fragment root freed stayed at its start opacity. `slot_ids` maps each slot index to its current id,
+    /// so the lookup works whatever the pointer width.
+    pub fn id_from_opaque(&self, opaque: usize) -> Option<NodeId> {
+        let raw = opaque as u64;
+        let id = NodeId::from_u64(*self.slot_ids.get(slot_index(raw))?);
+        // A 64-bit opaque still has its version: reject a stale one.
+        let stale = raw >> 32 != 0 && raw != id.as_u64();
+        (!stale && self.contains_key(id)).then_some(id)
     }
 
     pub fn viewport_scroll(&self) -> crate::Point<f64> {
@@ -127,12 +156,20 @@ impl NodeTree {
 
     /// Insert a node constructed with knowledge of its own id.
     pub(crate) fn insert_with_key(&mut self, f: impl FnOnce(NodeId) -> Node) -> NodeId {
-        to_id(self.map.insert_with_key(|key| f(to_id(key))))
+        let id = to_id(self.map.insert_with_key(|key| f(to_id(key))));
+        let index = slot_index(id.as_u64());
+        if self.slot_ids.len() <= index {
+            self.slot_ids.resize(index + 1, 0);
+        }
+        self.slot_ids[index] = id.as_u64();
+        id
     }
 
     /// Remove the node with the given id, returning it if it was still live.
     pub(crate) fn remove(&mut self, id: NodeId) -> Option<Node> {
-        self.map.remove(to_key(id))
+        let node = self.map.remove(to_key(id))?;
+        self.slot_ids[slot_index(id.as_u64())] = 0;
+        Some(node)
     }
 
     /// Iterate over all live `(NodeId, &Node)` pairs.
