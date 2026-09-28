@@ -171,6 +171,10 @@ impl ElementCx<'_, '_> {
             && border.border_right_style == BorderStyle::Solid
             && border.border_bottom_style == BorderStyle::Solid
             && border.border_left_style == BorderStyle::Solid;
+        if all_solid && self.frame.has_corner_shape() {
+            self.draw_corner_shaped_border(scene);
+            return;
+        }
         if all_solid {
             let color = border
                 .border_top_color
@@ -343,6 +347,91 @@ impl ElementCx<'_, '_> {
             scene.fill(Fill::NonZero, self.transform, color, None, &path);
             start = next;
         }
+    }
+
+    /// A solid border on a box with `corner-shape` fills the ring between the shaped border
+    /// and padding edges; the arc-based edge shapes can't follow a superellipse.
+    fn draw_corner_shaped_border(&self, scene: &mut impl PaintScene) {
+        let border = self.style.get_border();
+        let current_color = self.style.clone_color();
+        let mut ring = self.frame.shaped_contour(Insets::ZERO);
+        ring.extend(&self.frame.shaped_contour(self.frame.border_width));
+
+        let colors = [
+            (Edge::Top, &border.border_top_color),
+            (Edge::Right, &border.border_right_color),
+            (Edge::Bottom, &border.border_bottom_color),
+            (Edge::Left, &border.border_left_color),
+        ]
+        .map(|(edge, color)| {
+            (
+                edge,
+                color.resolve_to_absolute(&current_color).as_srgb_color(),
+            )
+        });
+        if colors.iter().all(|(_, color)| *color == colors[0].1) {
+            scene.fill(Fill::EvenOdd, self.transform, colors[0].1, None, &ring);
+            return;
+        }
+        for (edge, color) in colors {
+            if color.components[3] <= 0.0 || self.edge_width(edge) <= 0.0 {
+                continue;
+            }
+            self.context.layer_manager.maybe_with_layer(
+                scene,
+                true,
+                1.0,
+                self.transform,
+                &self.corner_shaped_edge_wedge(edge),
+                None,
+                None,
+                |scene| scene.fill(Fill::EvenOdd, self.transform, color, None, &ring),
+            );
+        }
+    }
+
+    /// The part of a corner-shaped ring that takes `edge`'s colour, split along each corner's
+    /// outer-to-inner ray; rays stop at the centre lines, or a thick side's ray crossed the box.
+    fn corner_shaped_edge_wedge(&self, edge: Edge) -> BezPath {
+        let (bb, bw, r) = (
+            self.frame.border_box,
+            self.frame.border_width,
+            self.frame.border_radii,
+        );
+        let inner = |outer: Point, inward: Vec2, radius: Vec2| {
+            let reach = |r: f64, w: f64| if w != 0.0 { r / w.abs() } else { 0.0 };
+            let to_centre = |side: f64, w: f64| {
+                if w != 0.0 {
+                    side / 2.0 / w.abs()
+                } else {
+                    f64::INFINITY
+                }
+            };
+            let scale = (1.0 + reach(radius.x, inward.x).max(reach(radius.y, inward.y)))
+                .min(to_centre(bb.width(), inward.x))
+                .min(to_centre(bb.height(), inward.y))
+                .max(1.0);
+            outer + inward * scale
+        };
+        let (tl, tr) = (Point::new(bb.x0, bb.y0), Point::new(bb.x1, bb.y0));
+        let (br, bl) = (Point::new(bb.x1, bb.y1), Point::new(bb.x0, bb.y1));
+        let tl_in = inner(tl, Vec2::new(bw.x0, bw.y0), r.top_left);
+        let tr_in = inner(tr, Vec2::new(-bw.x1, bw.y0), r.top_right);
+        let br_in = inner(br, Vec2::new(-bw.x1, -bw.y1), r.bottom_right);
+        let bl_in = inner(bl, Vec2::new(bw.x0, -bw.y1), r.bottom_left);
+        let [a, b, b_in, a_in] = match edge {
+            Edge::Top => [tl, tr, tr_in, tl_in],
+            Edge::Right => [tr, br, br_in, tr_in],
+            Edge::Bottom => [br, bl, bl_in, br_in],
+            Edge::Left => [bl, tl, tl_in, bl_in],
+        };
+        BezPath::from_vec(vec![
+            PathEl::MoveTo(a),
+            PathEl::LineTo(b),
+            PathEl::LineTo(b_in),
+            PathEl::LineTo(a_in),
+            PathEl::ClosePath,
+        ])
     }
 
     /// The border width (in device pixels) of a single edge.
