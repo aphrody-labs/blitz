@@ -1334,6 +1334,18 @@ impl<'doc> DocumentMutator<'doc> {
                 doc.remove_author_stylesheet(node_id);
             }
 
+            // A removed slot's assignees live outside this subtree, and the flat-tree
+            // dirty walks follow assigned_slot: a freed slot would be a dead key.
+            if let Some(assignees) = doc.nodes[node_id].assigned_nodes.take() {
+                for assignee in assignees {
+                    if let Some(slotted) = doc.nodes.get_mut(assignee) {
+                        if slotted.assigned_slot == Some(node_id) {
+                            slotted.assigned_slot = None;
+                        }
+                    }
+                }
+            }
+
             let node = &mut doc.nodes[node_id];
             // Stale flat-tree edges must not outlive removal: slab ids
             // recycle, so a dangling slot pointer would mislead.

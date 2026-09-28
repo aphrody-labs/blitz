@@ -99,6 +99,13 @@ impl BaseDocument {
         if let Some(after_id) = self.nodes[node_id].after() {
             damage_from_children |= self.propagate_damage_flags(after_id);
         }
+        // Assigned nodes are the host's DOM children, so without this walk their
+        // damage never reaches the slot's box parent and its layout stays cached.
+        if let Some(assigned) = self.nodes[node_id].assigned_nodes.clone() {
+            for slotted in assigned.iter() {
+                damage_from_children |= self.propagate_damage_flags(*slotted);
+            }
+        }
         // Shadow trees live outside `children`; without this hop a
         // shadow mutation never bubbles CONSTRUCT damage to the host.
         if let Some(shadow_root_id) = self.nodes[node_id].attached_shadow_root_id() {

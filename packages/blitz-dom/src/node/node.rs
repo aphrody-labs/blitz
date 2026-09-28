@@ -666,7 +666,7 @@ impl Node {
     /// This propagates the dirty flag up the tree so that the style traversal
     /// knows to visit the subtree containing this node.
     pub fn mark_ancestors_dirty(&self) {
-        let mut current_id = self.parent;
+        let mut current_id = self.flat_tree_parent();
         while let Some(parent_id) = current_id {
             let parent = &self.tree()[parent_id];
             // If this ancestor already has dirty_descendants set, we can stop
@@ -676,8 +676,20 @@ impl Node {
                     break;
                 }
             }
-            current_id = parent.parent;
+            current_id = parent.flat_tree_parent();
         }
+    }
+
+    /// Style, damage and construct walks all follow the flat tree: a slotted
+    /// node sits under its slot, and a shadow root's content under the host.
+    pub(crate) fn flat_tree_parent(&self) -> Option<NodeId> {
+        if let Some(slot_id) = self.assigned_slot {
+            return Some(slot_id);
+        }
+        if let Some(host) = self.shadow_root_data().map(|data| data.host) {
+            return Some(host);
+        }
+        self.parent
     }
 
     /// Returns whether this node or any of its descendants may carry damage.
@@ -705,7 +717,7 @@ impl Node {
                 return;
             }
         }
-        let mut current_id = self.parent;
+        let mut current_id = self.flat_tree_parent();
         while let Some(parent_id) = current_id {
             let parent = &self.tree()[parent_id];
             // If this ancestor already has damaged_descendants set, we can stop
@@ -715,7 +727,7 @@ impl Node {
                     break;
                 }
             }
-            current_id = parent.parent;
+            current_id = parent.flat_tree_parent();
         }
     }
 
