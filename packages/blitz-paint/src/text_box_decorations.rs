@@ -90,8 +90,8 @@ pub(crate) fn paint_span_fragment_backgrounds(
             None => continue,
         };
         let primary = match node.primary_styles() {
-            Some(p) => p,
-            None => continue,
+            Some(p) if crate::text::is_visible(&p) => p,
+            _ => continue,
         };
         let current_color = primary.clone_color();
         let bg = primary
@@ -158,8 +158,8 @@ pub(crate) fn paint_span_fragment_borders(
             None => continue,
         };
         let primary = match node.primary_styles() {
-            Some(p) => p,
-            None => continue,
+            Some(p) if crate::text::is_visible(&p) => p,
+            _ => continue,
         };
         let current_color = primary.clone_color();
         let opacity = crate::text::inline_opacity(doc, node.id, inline_root_id);

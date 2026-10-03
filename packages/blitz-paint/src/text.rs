@@ -104,6 +104,17 @@ struct DecorationStackEntry {
     /// once. Multiplying per run matches group
     /// opacity everywhere except where glyphs of one span overlap.
     opacity: f32,
+    /// `visibility` is inherited, so the run's own node decides whether its
+    /// glyphs paint. render.rs only checks it per box, so without this a
+    /// hidden inline span or ::before still paints its text.
+    visible: bool,
+}
+
+/// Whether a node's inline content paints. Anything but `visible`
+/// (`hidden`, `collapse`) hides it.
+pub(crate) fn is_visible(styles: &style::properties::ComputedValues) -> bool {
+    use style::properties::generated::longhands::visibility::computed_value::T as Visibility;
+    styles.get_inherited_box().visibility == Visibility::Visible
 }
 
 /// Resolve the cached style values for a single node into a [`DecorationStackEntry`].
@@ -114,6 +125,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
             text_fill_color: Color::BLACK,
             decoration: None,
             opacity: 1.0,
+            visible: true,
         };
     };
 
@@ -190,6 +202,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
         text_fill_color,
         decoration,
         opacity: styles.get_effects().opacity,
+        visible: is_visible(&styles),
     }
 }
 
@@ -656,6 +669,12 @@ pub(crate) fn stroke_text<'a>(
 
                 // The glyph colour comes from the run's own node (the stack top): `color`
                 // inherits, so the innermost inline element already carries the right value.
+                // A hidden run keeps its advance but paints neither its glyphs
+                // nor the decorations it would carry.
+                if !stack.last().is_none_or(|entry| entry.visible) {
+                    continue;
+                }
+
                 let text_fill_color = stack
                     .last()
                     .map(|entry| entry.text_fill_color.multiply_alpha(entry.opacity))
