@@ -572,7 +572,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 // corner radii only round inward, so no path is built here.
                 let mut effect_layer_clip = cx.frame.border_box;
                 effect_layer_clip = effect_layer_clip.union(*cx.node.scrollable_overflow());
-                if let Some((x0, y0, x1, y1)) = cx.node.live_rehomed_reach() {
+                if let Some((x0, y0, x1, y1)) = cx.node.live_rehomed_reach(self.scale) {
                     effect_layer_clip = effect_layer_clip.union(Rect::new(
                         x0 as f64 * self.scale,
                         y0 as f64 * self.scale,
