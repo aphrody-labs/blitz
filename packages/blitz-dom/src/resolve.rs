@@ -269,8 +269,10 @@ impl BaseDocument {
 
         // Re-homed paint boxes live outside their flow parent's taffy
         // bounds; compute the reach rects paint-cull and hit-prune widen
-        // by. Must run AFTER taffy layout (the one geometry pass in resolve
-        // that is never stale) and after the paint tree records re-homes.
+        // by. Must run after taffy layout (the one geometry pass in resolve
+        // that is never stale), after the transform pass, whose transforms
+        // and overflow it maps each re-homed box through, and after the
+        // paint tree records re-homes.
         self.compute_rehomed_reach();
         timer.record_time("rehomed");
 
@@ -441,6 +443,7 @@ impl BaseDocument {
                 )),
             };
 
+        let scale = self.viewport.scale_f64();
         for host_id in host_ids.iter().copied() {
             let mut rect: Option<(f32, f32, f32, f32)> = None;
             let rehomed: Vec<NodeId> = self.nodes[host_id]
@@ -451,16 +454,7 @@ impl BaseDocument {
                 .filter(|id| self.nodes.contains_key(*id))
                 .collect();
             for child_id in rehomed {
-                let child = &self.nodes[child_id];
-                let t = child.rehomed_paint_translate(host_id);
-                let loc = child.final_layout().location;
-                let size = child.final_layout().size;
-                let overflow = child.final_layout().scrollable_overflow_rect;
-                let x0 = t.x + loc.x;
-                let y0 = t.y + loc.y;
-                let w = size.width.max(overflow.right);
-                let h = size.height.max(overflow.bottom);
-                rect = union(rect, (x0, y0, x0 + w, y0 + h));
+                rect = union(rect, self.nodes[child_id].rehomed_paint_rect(host_id, scale));
             }
             let Some(mut rect) = rect else { continue };
 

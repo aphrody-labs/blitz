@@ -1631,12 +1631,40 @@ impl Node {
         taffy::Point { x: 0.0, y: 0.0 }
     }
 
+    /// This re-homed paint child's painted extent in `host`'s CSS-px space:
+    /// its layout box and overflow, mapped through its own transform.
+    /// Floating UI parks every popup at `left:0;top:0` and moves it with
+    /// `transform: translate(...)`, so a reach built from layout alone sat
+    /// at the origin and the hit descent pruned the popup at its paint
+    /// parent. `scrollable_overflow` is device px and already unions the
+    /// transformed boxes below this one, so read it once transforms resolve.
+    pub fn rehomed_paint_rect(&self, host: NodeId, scale: f64) -> (f32, f32, f32, f32) {
+        let t = self.rehomed_paint_translate(host);
+        let layout = self.final_layout();
+        let w = layout.size.width.max(layout.scrollable_overflow_rect.right) as f64 * scale;
+        let h = layout.size.height.max(layout.scrollable_overflow_rect.bottom) as f64 * scale;
+        let local = KurboRect::new(0.0, 0.0, w, h).union(*self.scrollable_overflow());
+        let mut full = Affine::translate((
+            (t.x + layout.location.x) as f64 * scale,
+            (t.y + layout.location.y) as f64 * scale,
+        ));
+        if let Some(transform) = self.transform().as_deref() {
+            full *= *transform;
+        }
+        let r = full.transform_rect_bbox(local);
+        (
+            (r.x0 / scale) as f32,
+            (r.y0 / scale) as f32,
+            (r.x1 / scale) as f32,
+            (r.y1 / scale) as f32,
+        )
+    }
+
     // Live union of re-homed paint-child boxes in this node's own
     // coordinate space. rehomed_paint_translate reads scroll offsets
-
     // at call time, unlike the resolve-time rehomed_reach cache, so
     // this stays correct on pure-scroll frames that skip resolve.
-    pub fn live_rehomed_reach(&self) -> Option<(f32, f32, f32, f32)> {
+    pub fn live_rehomed_reach(&self, scale: f64) -> Option<(f32, f32, f32, f32)> {
         let children = self.rehomed_paint_children.borrow();
         if children.is_empty() {
             return None;
@@ -1645,17 +1673,10 @@ impl Node {
         let mut rect: Option<(f32, f32, f32, f32)> = None;
         for &child_id in children.iter() {
             let Some(child) = tree.get(child_id) else { continue };
-            let t = child.rehomed_paint_translate(self.id);
-            let loc = child.final_layout().location;
-            let size = child.final_layout().size;
-            let overflow = child.final_layout().scrollable_overflow_rect;
-            let x0 = t.x + loc.x;
-            let y0 = t.y + loc.y;
-            let w = size.width.max(overflow.right);
-            let h = size.height.max(overflow.bottom);
+            let r = child.rehomed_paint_rect(self.id, scale);
             rect = Some(match rect {
-                None => (x0, y0, x0 + w, y0 + h),
-                Some(a) => (a.0.min(x0), a.1.min(y0), a.2.max(x0 + w), a.3.max(y0 + h)),
+                None => r,
+                Some(a) => (a.0.min(r.0), a.1.min(r.1), a.2.max(r.2), a.3.max(r.3)),
             });
         }
         rect
