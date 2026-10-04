@@ -444,6 +444,20 @@ impl BaseDocument {
             };
 
         let scale = self.viewport.scale_f64();
+        // A re-homed viewport-fixed box moves through its host's
+        // space as the page scrolls, and a pure-scroll frame skips resolve,
+        // so its reach covers every scroll position: from where it sits at
+        // scroll 0 to that plus the document's extent. Too wide only costs
+        // culling along one chain; too narrow drops the box from paint and
+        // hit-testing after a scroll.
+        let fixed_anchor = self.nodes.fixed_anchor_scroll();
+        let doc_extent = self.try_root_element().map_or((0.0, 0.0), |root| {
+            let layout = root.final_layout();
+            (
+                layout.size.width.max(layout.scrollable_overflow_rect.right),
+                layout.size.height.max(layout.scrollable_overflow_rect.bottom),
+            )
+        });
         for host_id in host_ids.iter().copied() {
             let mut rect: Option<(f32, f32, f32, f32)> = None;
             let rehomed: Vec<NodeId> = self.nodes[host_id]
@@ -454,7 +468,13 @@ impl BaseDocument {
                 .filter(|id| self.nodes.contains_key(*id))
                 .collect();
             for child_id in rehomed {
-                rect = union(rect, self.nodes[child_id].rehomed_paint_rect(host_id, scale));
+                let child = &self.nodes[child_id];
+                let mut r = child.rehomed_paint_rect(host_id, scale);
+                if child.is_viewport_fixed() {
+                    let (sx, sy) = (fixed_anchor.x as f32, fixed_anchor.y as f32);
+                    r = (r.0 - sx, r.1 - sy, r.2 - sx + doc_extent.0, r.3 - sy + doc_extent.1);
+                }
+                rect = union(rect, r);
             }
             let Some(mut rect) = rect else { continue };
 

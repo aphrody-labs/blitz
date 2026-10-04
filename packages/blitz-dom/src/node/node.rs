@@ -1616,12 +1616,37 @@ impl Node {
         // Bounded: a malformed layout-parent chain must not spin.
         for _ in 0..64 {
             if cur == containing_block {
+                // A viewport-fixed box does not scroll with the
+                // page, so cancel the viewport scroll its containing block
+                // (the root element) applies, as paint and hit-testing do for
+                // the root's own fixed children.
+                if self.is_viewport_fixed() {
+                    let scroll = *tree[containing_block].scroll_offset();
+                    let anchor = tree.fixed_anchor_scroll();
+                    offset.x -= (scroll.x + anchor.x) as f32;
+                    offset.y -= (scroll.y + anchor.y) as f32;
+                }
                 return taffy::Point { x: -offset.x, y: -offset.y };
             }
             let Some(node) = tree.get(cur) else { break };
-            offset.x += node.final_layout().location.x - node.scroll_offset().x as f32;
-            offset.y += node.final_layout().location.y - node.scroll_offset().y as f32;
-            match node.layout_parent.get() {
+            offset.x += node.final_layout().location.x;
+            offset.y += node.final_layout().location.y;
+            // The paint parent draws its re-homed children unscrolled, so
+            // only the scroll of the boxes above it moves them.
+            if cur != paint_parent {
+                offset.x -= node.scroll_offset().x as f32;
+                offset.y -= node.scroll_offset().y as f32;
+            }
+            // An out-of-flow box is placed against its containing block,
+            // not its flow parent, so continue the walk from there.
+            let next = match node.taffy_position() {
+                taffy::Position::Absolute | taffy::Position::Fixed => node
+                    .oof_containing_block
+                    .get()
+                    .or(node.layout_parent.get()),
+                _ => node.layout_parent.get(),
+            };
+            match next {
                 Some(next) if next != cur => cur = next,
                 _ => break,
             }
@@ -1629,6 +1654,25 @@ impl Node {
         // Chain didn't reach the containing block: leave the box where
         // layout put it rather than shifting it somewhere arbitrary.
         taffy::Point { x: 0.0, y: 0.0 }
+    }
+
+    /// Whether this is a `position: fixed` box positioned against
+    /// the viewport: its containing block is the root element, which is a
+    /// layout child of the Document node. A fixed box contained by a
+    /// transformed ancestor scrolls with that ancestor instead.
+    pub fn is_viewport_fixed(&self) -> bool {
+        if self.taffy_position() != taffy::Position::Fixed {
+            return false;
+        }
+        let tree = self.tree();
+        self.oof_containing_block
+            .get()
+            .and_then(|cb| tree.get(cb))
+            .is_some_and(|cb| {
+                cb.containing_block()
+                    .and_then(|id| tree.get(id))
+                    .is_none_or(|parent| matches!(parent.data, NodeData::Document(_)))
+            })
     }
 
     /// This re-homed paint child's painted extent in `host`'s CSS-px space:
@@ -1846,8 +1890,18 @@ impl Node {
         // Taffy's bounds cannot cover re-homed paint children (they are
         // not layout children of their flow parent); widen the prune by
         // the post-layout union of any re-homed boxes reachable below.
+        // This node's own re-homed boxes paint unscrolled, while reach
+        // propagated up from descendants is in its scrolled content space,
+        // so try the point in both: a false match only costs a descent.
         let matches_rehomed = match self.rehomed_reach.get() {
-            Some((x0, y0, x1, y1)) => x >= x0 && x <= x1 && y >= y0 && y <= y1,
+            Some((x0, y0, x1, y1)) => {
+                let inside = |px: f32, py: f32| px >= x0 && px <= x1 && py >= y0 && py <= y1;
+                inside(x, y)
+                    || inside(
+                        x - self.scroll_offset().x as f32,
+                        y - self.scroll_offset().y as f32,
+                    )
+            }
             None => false,
         };
 
@@ -1915,11 +1969,12 @@ impl Node {
                 }
             }
             // A re-homed abspos keeps its containing block's layout
-            // origin, so undo the difference before descending.
+            // origin, so undo the difference before descending. It paints
+            // unscrolled, so leave this node's scrolled content space too.
             if child.paint_parent_override.get() == Some(self.id) {
                 let t = child.rehomed_paint_translate(self.id);
-                child_x -= t.x;
-                child_y -= t.y;
+                child_x -= t.x + self.scroll_offset().x as f32;
+                child_y -= t.y + self.scroll_offset().y as f32;
             }
             if let Some(hit) = child.hit_inner(child_x, child_y, scale, scrollbar) {
                 return Some(hit);

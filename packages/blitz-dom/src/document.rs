@@ -1123,6 +1123,25 @@ impl BaseDocument {
             .is_some_and(|body| body.id == node_id)
     }
 
+    /// Whether `node_id` clips the boxes it paints: non-`visible` overflow
+    /// (minus the root and a body whose overflow went to the viewport) or
+    /// `contain: paint`. Mirrors blitz-paint's clip decision for elements.
+    pub fn clips_descendants(&self, node_id: NodeId) -> bool {
+        use style::values::computed::{Contain, Overflow};
+        if self.try_root_element().is_some_and(|root| root.id == node_id)
+            || self.propagates_overflow_to_viewport(node_id)
+        {
+            return false;
+        }
+        let Some(styles) = self.nodes.get(node_id).and_then(|n| n.primary_styles()) else {
+            return false;
+        };
+        let b = styles.get_box();
+        !matches!(b.overflow_x, Overflow::Visible)
+            || !matches!(b.overflow_y, Overflow::Visible)
+            || b.clone_contain().contains(Contain::PAINT)
+    }
+
     pub fn create_node(&mut self, node_data: NodeData) -> NodeId {
         let tree_ptr = self.nodes.as_mut() as *mut NodeTree;
         let guard = self.guard.clone();

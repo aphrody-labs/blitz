@@ -261,6 +261,8 @@ impl BaseDocument {
             return;
         };
 
+        self.damage_stale_rehome_hosts(node_id);
+
         // Entries hoisted out of this subtree are collected directly into the
         // storage that will hold them afterwards: the node's own stacking
         // context for a root, otherwise its contribution cache (from which
@@ -317,7 +319,7 @@ impl BaseDocument {
                 .copied()
                 .filter(|&id| {
                     self.nodes.get(id).is_some_and(|n| {
-                        n.layout_parent.get() != Some(node_id) && !Self::paints_rehomed(n)
+                        n.layout_parent.get() != Some(node_id) && !self.paints_rehomed(id)
                     })
                 })
                 .map(|id| {
@@ -340,7 +342,7 @@ impl BaseDocument {
             paint_children.reserve(children.len() + hoisted_past_parent.len());
 
             for (index, &child_id) in children.iter().enumerate() {
-                if !owned_here(self, child_id) && Self::paints_rehomed(&self.nodes[child_id]) {
+                if !owned_here(self, child_id) && self.paints_rehomed(child_id) {
                     // An abspos box laid out by an ancestor containing
                     // block still paints here, in tree order among this node's
                     // children (CSS 2.1 Appendix E step 8); see
@@ -412,21 +414,99 @@ impl BaseDocument {
         }
     }
 
-    /// Whether `node` (an out-of-flow box hoisted past its flow
+    /// Whether `node_id` (an out-of-flow box hoisted past its flow
     /// parent) paints under its flow parent rather than its containing block.
-    /// Only `position: absolute` boxes with `z-index: auto`/`0`: their paint
-    /// order is tree order (CSS 2.1 Appendix E step 8), which painting under
-    /// the containing block destroys (todomvc's abspos `.filters` covered the
-    /// later `.clear-completed` button and swallowed its clicks). A z-indexed
-    /// box is ordered by its stacking context; fixed boxes keep upstream's
-    /// placement.
-    fn paints_rehomed(node: &Node) -> bool {
-        node.taffy_position() == taffy::Position::Absolute
-            && node.z_index() == 0
-            && node
-                .oof_containing_block
-                .get()
-                .is_some_and(|cb| node.layout_parent.get() != Some(cb))
+    /// Only boxes with `z-index: auto`/`0`: their paint order is tree order
+    /// (CSS 2.1 Appendix E step 8), which painting under the containing block
+    /// destroys (todomvc's abspos `.filters` covered the later
+    /// `.clear-completed` button and swallowed its clicks; Base UI's
+    /// transparent fixed menu backdrop, painted from the root, sat above the
+    /// popup rendered after it and took every hit meant for it). A z-indexed
+    /// box is ordered by its stacking context.
+    ///
+    /// Paint only escapes the flow parent's own clip, though, and a fixed box
+    /// escapes every clip below its containing block, so a fixed box with a
+    /// clipping box further up keeps upstream's placement.
+    fn paints_rehomed(&self, node_id: NodeId) -> bool {
+        let Some(node) = self.nodes.get(node_id) else {
+            return false;
+        };
+        let Some(cb) = node.oof_containing_block.get() else {
+            return false;
+        };
+        let Some(flow_parent) = node.layout_parent.get() else {
+            return false;
+        };
+        if flow_parent == cb || node.z_index() != 0 {
+            return false;
+        }
+        match node.taffy_position() {
+            taffy::Position::Absolute => true,
+            taffy::Position::Fixed => !self.clipped_below(flow_parent, cb),
+            _ => false,
+        }
+    }
+
+    /// Whether a box strictly between `flow_parent` and its
+    /// ancestor `cb` clips. Starts at the flow parent's parent: the painter
+    /// draws re-homed boxes outside the flow parent's own clip. An anonymous
+    /// flow parent's parent is the element that owns it, whose clip applies.
+    fn clipped_below(&self, flow_parent: NodeId, cb: NodeId) -> bool {
+        let next = |id: NodeId| {
+            let node = self.nodes.get(id)?;
+            node.parent
+                .or_else(|| node.shadow_root_data().map(|data| data.host))
+        };
+        let mut cur = next(flow_parent);
+        // Bounded: a malformed parent chain must not spin.
+        for _ in 0..512 {
+            let Some(id) = cur else { break };
+            if id == cb {
+                return false;
+            }
+            if self.clips_descendants(id) {
+                return true;
+            }
+            cur = next(id);
+        }
+        // Never reached the containing block: keep upstream's placement.
+        true
+    }
+
+    /// Whether a re-home decision depends on more than the box
+    /// itself (a fixed box checks every clip between its flow parent and its
+    /// containing block), so a clip that starts or stops above a clean flow
+    /// parent leaves that parent's cached lists stale. Every such clip lies
+    /// below the containing block, whose subtree damage therefore makes it
+    /// rebuild: re-check its hoisted boxes here and damage the layout chain
+    /// down to each flow parent whose decision flipped, so the walk below
+    /// rebuilds it.
+    fn damage_stale_rehome_hosts(&mut self, node_id: NodeId) {
+        let hoisted: ThinVec<NodeId> = self.nodes[node_id]
+            .hoisted_children
+            .borrow()
+            .iter()
+            .copied()
+            .collect();
+        for id in hoisted {
+            let Some(child) = self.nodes.get(id) else { continue };
+            let Some(flow_parent) = child.layout_parent.get() else { continue };
+            if flow_parent == node_id {
+                continue;
+            }
+            let rehomed = child.paint_parent_override.get() == Some(flow_parent);
+            if self.paints_rehomed(id) == rehomed {
+                continue;
+            }
+            let mut cur = Some(flow_parent);
+            // Bounded: a malformed layout-parent chain must not spin.
+            for _ in 0..512 {
+                let Some(cur_id) = cur.filter(|&c| c != node_id) else { break };
+                let Some(node) = self.nodes.get_mut(cur_id) else { break };
+                node.insert_damage(RestyleDamage::REBUILD_STACKING_CONTEXT);
+                cur = node.layout_parent.get();
+            }
+        }
     }
 
     /// The layout child of `node_id` whose subtree contains `id`, following
@@ -489,6 +569,61 @@ fn float_to_order(pos: Float) -> i32 {
     }
 }
 
+/// Whether `node` contributes only positioned boxes to paint: a static box
+/// with no paint of its own (no background, border, shadow, outline, text,
+/// clip or stacking context) whose paint children are all positioned boxes
+/// or more such wrappers. Everything it paints then belongs to the
+/// positioned layer (CSS 2.1 Appendix E step 8), so it sorts there at its
+/// tree position.
+///
+/// Popup libraries mount each popup into its own empty static portal
+/// `<div>`. Base UI nests a submenu's portal inside the menu's, after the
+/// menu's fixed backdrop: sorted with in-flow content, the submenu painted
+/// - and hit-tested - under that backdrop, so the pointer "left" the
+/// submenu the moment it entered and Base UI closed it.
+fn is_positioned_only_wrapper(node: &Node, depth: u8) -> bool {
+    use style::values::computed::{BorderStyle, OutlineStyle, Overflow};
+    use style::values::generics::color::GenericColor;
+    use style::values::generics::image::Image as StyloImage;
+    // Portals are shallow; the bound keeps a deep tree of empty static
+    // divs from turning every sort into a subtree walk.
+    if depth > 8 || node.flags.is_inline_root() {
+        return false;
+    }
+    let Some(style) = node.primary_styles() else {
+        return false;
+    };
+    let b = style.get_box();
+    let paints_itself = style.clone_position() != Position::Static
+        || style.clone_float() != Float::None
+        || !matches!(b.overflow_x, Overflow::Visible)
+        || !matches!(b.overflow_y, Overflow::Visible)
+        || node.is_stacking_context_root(false)
+        || style.clone_background_color() != GenericColor::TRANSPARENT_BLACK
+        || style.get_background().background_image.0.iter().any(|i| !matches!(i, StyloImage::None))
+        || !style.get_effects().box_shadow.0.is_empty()
+        || !matches!(
+            style.get_outline().outline_style,
+            OutlineStyle::Auto | OutlineStyle::BorderStyle(BorderStyle::None | BorderStyle::Hidden)
+        );
+    drop(style);
+    let border = node.final_layout().border;
+    if paints_itself || border.left > 0.0 || border.right > 0.0 || border.top > 0.0 || border.bottom > 0.0 {
+        return false;
+    }
+    let children = node.paint_children.borrow();
+    let Some(children) = children.as_ref().filter(|c| !c.is_empty()) else {
+        return false;
+    };
+    children.iter().all(|&id| {
+        let child = node.with(id);
+        child
+            .primary_styles()
+            .is_some_and(|s| s.clone_position() != Position::Static)
+            || is_positioned_only_wrapper(child, depth + 1)
+    })
+}
+
 /// Paint sort key: (paint level, order-modified position). Positioned
 /// (z-index: auto) descendants paint above in-flow content (CSS 2.1
 /// Appendix E step 8); within a level the stable sort preserves
@@ -499,6 +634,15 @@ fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> (i32, i32) {
         return (0, 0);
     };
     let position = style.clone_position();
+    drop(style);
+    // Out of flex/grid `order` too: only its out-of-flow boxes paint, and
+    // those follow tree order.
+    if position == Position::Static && is_positioned_only_wrapper(node, 0) {
+        return (position_to_order(Position::Absolute), 0);
+    }
+    let Some(style) = node.primary_styles() else {
+        return (0, 0);
+    };
     if is_flex_or_grid {
         match position {
             Position::Static => (0, style.clone_order()),
