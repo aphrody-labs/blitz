@@ -1073,6 +1073,56 @@ impl BaseDocument {
             .unwrap()
     }
 
+    /// Whether `node_id`'s overflow belongs to the viewport rather than its
+    /// own box. CSS Overflow 3 §3.3: when the root `html` element is
+    /// `overflow: visible` in both axes, the first `<body>` child that is not
+    /// `display: none` hands its overflow to the viewport and itself uses
+    /// `visible`. Scroll locks (Base UI, Radix, MUI) set `overflow: hidden`
+    /// on body while a modal popup is open, and clipping body to its own box
+    /// cut every portalled popup off at the body's height.
+    pub fn propagates_overflow_to_viewport(&self, node_id: NodeId) -> bool {
+        use style::values::computed::Overflow;
+        // Paint asks this of every element, so turn away non-body first.
+        let Some(node) = self.nodes.get(node_id) else {
+            return false;
+        };
+        if !node
+            .element_data()
+            .is_some_and(|el| el.name.local == local_name!("body"))
+        {
+            return false;
+        }
+        let Some(root) = node.parent.and_then(|id| self.nodes.get(id)) else {
+            return false;
+        };
+        if !root
+            .element_data()
+            .is_some_and(|el| el.name.local == local_name!("html"))
+            || self.try_root_element().is_none_or(|el| el.id != root.id)
+        {
+            return false;
+        }
+        let root_visible = root.primary_styles().is_some_and(|styles| {
+            let b = styles.get_box();
+            matches!(b.overflow_x, Overflow::Visible) && matches!(b.overflow_y, Overflow::Visible)
+        });
+        if !root_visible {
+            return false;
+        }
+        root.children
+            .iter()
+            .filter_map(|&id| self.nodes.get(id))
+            .find(|child| {
+                child
+                    .element_data()
+                    .is_some_and(|el| el.name.local == local_name!("body"))
+                    && child
+                        .primary_styles()
+                        .is_some_and(|styles| !styles.clone_display().is_none())
+            })
+            .is_some_and(|body| body.id == node_id)
+    }
+
     pub fn create_node(&mut self, node_data: NodeData) -> NodeId {
         let tree_ptr = self.nodes.as_mut() as *mut NodeTree;
         let guard = self.guard.clone();
