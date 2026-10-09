@@ -333,7 +333,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         }
         let has_opacity = opacity < 1.0;
 
-        // TODO: account for overflow_x vs overflow_y
         let overflow_x = styles.get_box().overflow_x;
         let overflow_y = styles.get_box().overflow_y;
         // `contain: paint` (and stronger values like `strict`/`content`) clips the element's
@@ -370,6 +369,14 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 || contain_paint
                 || !matches!(overflow_x, Overflow::Visible)
                 || !matches!(overflow_y, Overflow::Visible));
+        // `overflow: clip` is the one value that leaves the other axis
+        // `visible` (hidden/scroll/auto force it to `auto`), so a box with
+        // `overflow-x: clip` clips sideways only. Anything that clips for
+        // another reason (replaced content, inputs, paint containment)
+        // clips both axes.
+        let clip_only_axis = !(is_image || is_sub_doc || is_text_input || contain_paint);
+        let unclipped_x = clip_only_axis && matches!(overflow_x, Overflow::Visible);
+        let unclipped_y = clip_only_axis && matches!(overflow_y, Overflow::Visible);
 
         // Apply padding/border offset to inline root
         let taffy::Layout {
@@ -476,7 +483,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             let clip_box = if is_text_input {
                 cx.frame.content_box
             } else {
-                cx.frame.padding_box
+                open_unclipped_axes(cx.frame.padding_box, unclipped_x, unclipped_y)
             };
             clip_rect.intersect(screen_transform.transform_rect_bbox(clip_box))
         } else {
@@ -626,6 +633,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                         let clip = &if should_clip {
                             if is_text_input {
                                 cx.frame.content_box_path()
+                            } else if unclipped_x || unclipped_y {
+                                open_unclipped_axes(cx.frame.padding_box, unclipped_x, unclipped_y)
+                                    .to_path(0.1)
                             } else {
                                 cx.frame.padding_box_path()
                             }
@@ -835,6 +845,25 @@ fn is_empty_clip_region(shape: Option<&BezPath>) -> bool {
         let bounds = shape.bounding_box();
         bounds.width() <= 0.0 || bounds.height() <= 0.0
     })
+}
+
+/// Far enough past any viewport that an axis left `visible` never clips,
+/// small enough that f32 path coordinates keep the clipped edges exact.
+const UNCLIPPED_REACH: f64 = 1.0e6;
+
+/// The overflow clip box with the `visible` axes opened out, so an element
+/// with `overflow-x: clip` keeps painting what overflows it vertically.
+fn open_unclipped_axes(clip_box: Rect, unclipped_x: bool, unclipped_y: bool) -> Rect {
+    let mut rect = clip_box;
+    if unclipped_x {
+        rect.x0 -= UNCLIPPED_REACH;
+        rect.x1 += UNCLIPPED_REACH;
+    }
+    if unclipped_y {
+        rect.y0 -= UNCLIPPED_REACH;
+        rect.y1 += UNCLIPPED_REACH;
+    }
+    rect
 }
 
 impl ElementCx<'_, '_> {
