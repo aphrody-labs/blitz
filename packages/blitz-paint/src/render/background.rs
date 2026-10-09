@@ -623,12 +623,24 @@ impl ElementCx<'_, '_> {
             bg_size.height,
         );
 
+        let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
+
+        // Gradients have no 2D repeat brush, so every tile is its own fill.
+        // Draw only the tiles that reach the viewport: a dot pattern (8px
+        // radial-gradient tiles) over a tall box is thousands of tiles, nearly
+        // all off screen. The cap still bounds a near-zero tile size.
         // FIXME: https://wpt.live/css/css-backgrounds/background-size/background-size-near-zero-gradient.html
-        if x.count as u64 * y.count as u64 > 500 {
+        let first_tile = (Affine::translate((-self.context.initial_x, -self.context.initial_y))
+            * base_transform)
+            .transform_rect_bbox(tile_rect);
+        let (x_tiles, y_tiles) = (
+            visible_tiles(&x, first_tile.x0, first_tile.x1, self.context.width as f64),
+            visible_tiles(&y, first_tile.y0, first_tile.y1, self.context.height as f64),
+        );
+        if x_tiles.len() as u64 * y_tiles.len() as u64 > MAX_GRADIENT_TILES {
             return;
         }
 
-        let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
         let bounding_box = self.frame.border_box.bounding_box();
         let current_color = self.style.clone_color();
 
@@ -646,8 +658,8 @@ impl ElementCx<'_, '_> {
             y: y.translate,
         });
 
-        for hc in 0..y.count {
-            for wc in 0..x.count {
+        for hc in y_tiles {
+            for wc in x_tiles.clone() {
                 let transform = transform.then_translate(Vec2 {
                     x: wc as f64 * x.stride,
                     y: hc as f64 * y.stride,
@@ -913,6 +925,35 @@ fn raster_axis_tiling(
             stride: 0.0,
         },
     }
+}
+
+/// The most gradient tiles one layer draws. Tiles are culled to the viewport
+/// first, so this holds 8px dots across a 1440x900 viewport (~20.7k tiles).
+/// It is fixed, not scaled to the viewport, because the first frame's cost
+/// grows faster than the tile count: 20k tiles took ~1 s, 36k ~3.4 s and
+/// 52k ~6.5 s. A smaller tile across a bigger viewport is dropped instead.
+const MAX_GRADIENT_TILES: u64 = 24_000;
+
+/// The tile indices along one axis whose box reaches the viewport span
+/// `0..viewport_len`, given the screen extent of tile 0 before tiling moves it.
+fn visible_tiles(
+    tiling: &AxisTiling,
+    first_start: f64,
+    first_end: f64,
+    viewport_len: f64,
+) -> std::ops::Range<u32> {
+    if tiling.stride <= 0.0 {
+        return 0..tiling.count;
+    }
+    let start = first_start + tiling.translate;
+    let end = first_end + tiling.translate;
+    let first = ((-end) / tiling.stride).floor().max(0.0);
+    let last = ((viewport_len - start) / tiling.stride).floor() + 1.0;
+    let last = last.min(tiling.count as f64);
+    if !(first < last) {
+        return 0..0;
+    }
+    first as u32..last as u32
 }
 
 /// Per-axis placement and tiling for a gradient layer. Unlike raster images,
