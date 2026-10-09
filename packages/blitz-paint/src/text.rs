@@ -594,7 +594,7 @@ pub(crate) fn stroke_text<'a>(
     scale: f64,
     inline_root_id: NodeId,
     context: &mut DrawTextContext,
-    alpha: f32,
+    fill_override: Option<Color>,
 ) {
     let DrawTextContext {
         stack,
@@ -700,9 +700,15 @@ pub(crate) fn stroke_text<'a>(
                     continue;
                 }
 
+                // `fill_override` stands in for `color` (the ::placeholder
+                // colour of a text control); inline opacity still applies.
                 let text_fill_color = stack
                     .last()
-                    .map(|entry| entry.text_fill_color.multiply_alpha(entry.opacity))
+                    .map(|entry| {
+                        fill_override
+                            .unwrap_or(entry.text_fill_color)
+                            .multiply_alpha(entry.opacity)
+                    })
                     .unwrap_or(Color::BLACK);
 
                 let embolden = if FONT_EMBOLDEN_ENABLED {
@@ -721,7 +727,7 @@ pub(crate) fn stroke_text<'a>(
                     embolden,
                     Fill::NonZero,
                     &anyrender::Paint::from(text_fill_color),
-                    alpha,
+                    1.0,
                     transform,
                     glyph_xform,
                     glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {

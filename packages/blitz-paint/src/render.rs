@@ -1037,7 +1037,7 @@ impl ElementCx<'_, '_> {
                 self.scale,
                 self.node.id,
                 &mut draw_text_context,
-                1.0,
+                None,
             );
 
             crate::text_box_decorations::paint_span_fragment_borders(
@@ -1102,11 +1102,10 @@ impl ElementCx<'_, '_> {
                 };
             }
 
-            let alpha = if input_data.is_showing_placeholder {
-                0.4
-            } else {
-                1.0
-            };
+            let fill_override = input_data
+                .placeholder_color
+                .filter(|_| input_data.is_showing_placeholder)
+                .map(|color| color.as_srgb_color());
             let mut draw_text_context = self.context.draw_text_context.borrow_mut();
             crate::text::stroke_text(
                 scene,
@@ -1116,7 +1115,7 @@ impl ElementCx<'_, '_> {
                 self.scale,
                 self.node.id,
                 &mut draw_text_context,
-                alpha,
+                fill_override,
             );
         }
     }
@@ -1172,7 +1171,7 @@ impl ElementCx<'_, '_> {
                 self.scale,
                 self.node.id,
                 &mut draw_text_context,
-                1.0,
+                None,
             );
         }
     }
