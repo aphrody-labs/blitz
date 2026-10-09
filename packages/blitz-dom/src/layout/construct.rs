@@ -1464,7 +1464,38 @@ fn collect_complex_layout_children(
     out.anonymous_table_id = None;
 }
 
+/// The `::placeholder` style of a text control that has a non-empty
+/// `placeholder` attribute. It is a lazy pseudo, so nothing in the style
+/// traversal computes it; resolve it against the control's own style here.
+fn placeholder_pseudo_style(
+    doc: &BaseDocument,
+    input_element_id: NodeId,
+) -> Option<style::servo_arc::Arc<style::properties::ComputedValues>> {
+    use style::selector_parser::PseudoElement;
+    use style::stylist::RuleInclusion;
+    let node = doc.get_node(input_element_id)?;
+    if node
+        .attr(local_name!("placeholder"))
+        .is_none_or(|p| p.is_empty())
+    {
+        return None;
+    }
+    let primary = node.primary_styles()?;
+    let guard = doc.guard().read();
+    let guards = StylesheetGuards::same(&guard);
+    doc.stylist.lazily_compute_pseudo_element_style(
+        &guards,
+        node,
+        &PseudoElement::Placeholder,
+        RuleInclusion::All,
+        &primary,
+        false,
+        None,
+    )
+}
+
 fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multiline: bool) {
+    let placeholder_style = placeholder_pseudo_style(doc, input_element_id);
     let node = &mut doc.nodes[input_element_id];
     let parley_style = node
         .primary_styles()
@@ -1535,11 +1566,24 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         _ => (" ".to_string(), false),
     };
 
+    // The ::placeholder cascade (UA `color: #757575`, plus any author
+    // rules) supplies the colour and font style while the placeholder
+    // shows. Without it the text keeps the input's own style.
+    let placeholder_style = placeholder_style.filter(|_| is_placeholder);
+    let placeholder_color = placeholder_style.as_ref().map(|s| {
+        s.clone_color()
+            .with_alpha(s.clone_color().alpha * s.get_effects().opacity)
+    });
+    let placeholder_font_style = placeholder_style
+        .as_ref()
+        .map(|s| stylo_to_parley::font_style(s.clone_font_style()));
+
     if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
         let mut text_input_data = TextInputData::new(is_multiline);
         let editor = &mut text_input_data.editor;
         editor.set_text(&display_text);
         text_input_data.is_showing_placeholder = is_placeholder;
+        text_input_data.placeholder_color = placeholder_color;
         element.special_data = SpecialElementData::TextInput(text_input_data);
     } else if let SpecialElementData::TextInput(data) = &mut element.special_data {
         // Update the editor's text on subsequent layouts so an
@@ -1552,6 +1596,7 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
             editor.set_text(&display_text);
         }
         data.is_showing_placeholder = is_placeholder;
+        data.placeholder_color = placeholder_color;
     }
 
     let SpecialElementData::TextInput(text_input_data) = &mut element.special_data else {
@@ -1567,7 +1612,9 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
     styles.insert(StyleProperty::FontFamily(parley_style.font_family));
     styles.insert(StyleProperty::FontSize(parley_style.font_size));
     styles.insert(StyleProperty::FontWidth(parley_style.font_width));
-    styles.insert(StyleProperty::FontStyle(parley_style.font_style));
+    styles.insert(StyleProperty::FontStyle(
+        placeholder_font_style.unwrap_or(parley_style.font_style),
+    ));
     styles.insert(StyleProperty::FontWeight(parley_style.font_weight));
     styles.insert(StyleProperty::FontVariations(parley_style.font_variations));
     styles.insert(StyleProperty::FontFeatures(parley_style.font_features));
@@ -1580,11 +1627,9 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
     styles.insert(StyleProperty::WhiteSpaceCollapse(
         parley_style.white_space_collapse,
     ));
+    // The brush stays the input's node: paint swaps in
+    // `placeholder_color` while the placeholder shows.
     styles.insert(StyleProperty::Brush(parley_style.brush));
-    // Italic-by-default placeholder mirrors most user agents.
-    if is_placeholder {
-        styles.insert(StyleProperty::FontStyle(parley::FontStyle::Italic));
-    }
     editor.set_alignment(alignment);
     editor.set_base_direction(base_direction);
 

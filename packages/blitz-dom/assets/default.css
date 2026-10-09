@@ -102,6 +102,12 @@ input[type="range"] {
     height: 1.3em;
 }
 
+/* Chromium's placeholder colour. Paint reads the ::placeholder
+   cascade while a text control shows its placeholder. */
+::placeholder {
+    color: #757575;
+}
+
 input:focus,
 textarea:focus {
     outline: 2px solid #4D90FE;

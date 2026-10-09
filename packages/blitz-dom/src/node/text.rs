@@ -100,9 +100,12 @@ pub struct TextInputData {
     pub scroll_offset: f32,
     /// True when the editor currently holds the
     /// element's `placeholder` attribute text (because `value`
-    /// was empty). The paint layer reads this to dim the text
-    /// at 0.4 alpha, mimicking `:placeholder-shown`.
+    /// was empty).
     pub is_showing_placeholder: bool,
+    /// The `::placeholder` colour (opacity folded into its alpha)
+    /// while the placeholder shows. Paint draws the placeholder
+    /// text in it instead of the input's own `color`.
+    pub placeholder_color: Option<style::color::AbsoluteColor>,
     /// Authoritative IDL `.value` override. When Some,
     /// layout construction displays this instead of the `value`
     /// content attribute: HTML decouples the IDL value (live,
@@ -127,6 +130,7 @@ impl TextInputData {
             is_multiline,
             scroll_offset: 0.0,
             is_showing_placeholder: false,
+            placeholder_color: None,
             value_override: None,
         }
     }
