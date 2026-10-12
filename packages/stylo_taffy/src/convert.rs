@@ -332,7 +332,7 @@ pub fn position(input: stylo::Position) -> taffy::Position {
 /// <https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_positioned_layout/Containing_block#identifying_the_containing_block>
 pub fn establishes_fixed_containing_block(style: &stylo::ComputedValues) -> bool {
     use style::values::computed::{Perspective, Rotate, Scale, Translate};
-    use style::values::specified::box_::{Contain, ContainerType, WillChangeBits};
+    use style::values::specified::box_::{Contain, WillChangeBits};
 
     let box_style = style.get_box();
     if !box_style.transform.0.is_empty()
@@ -357,12 +357,9 @@ pub fn establishes_fixed_containing_block(style: &stylo::ComputedValues) -> bool
     {
         return true;
     }
-    if box_style
-        .container_type
-        .intersects(ContainerType::SIZE | ContainerType::INLINE_SIZE)
-    {
-        return true;
-    }
+    // Not `container-type`: a size container gets style and size
+    // containment but not layout containment, so out-of-flow boxes
+    // propagate past it (csswg-drafts#10544, css-contain-3 "container-type").
 
     let effects = style.get_effects();
     !effects.filter.0.is_empty() || !effects.backdrop_filter.0.is_empty()
