@@ -471,9 +471,13 @@ impl<'m, 'doc> TreeSink for DocumentHtmlParser<'m, 'doc> {
     }
 
     fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
-        // Parse a template element's children into its (detached, inert)
-        // "template contents" fragment node rather than into the element itself
-        self.mutr().template_contents(*target)
+        // Parse a template's children inline, under the element,
+        // as blitz 0.3.0-beta.2 did. Kitesurf's DOM shim owns template
+        // semantics: it moves these children into the JS `.content` fragment
+        // on first access. Upstream's detached contents node is invisible to
+        // the shim, and would leave every parsed template (markup, innerHTML,
+        // declarative shadow roots) with an empty `.content`.
+        *target
     }
 
     fn same_node(&self, x: &Self::Handle, y: &Self::Handle) -> bool {
