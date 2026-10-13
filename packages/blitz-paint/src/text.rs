@@ -9,6 +9,8 @@ use style::values::computed::{
     Length, LengthPercentage, TextDecorationLength, TextDecorationLine, TextUnderlinePosition,
 };
 use style::values::generics::text::{GenericTextDecorationInset, GenericTextDecorationLength};
+use style::computed_values::position::T as Position;
+use style::values::specified::box_::{DisplayInside, DisplayOutside};
 
 use crate::color::Color;
 use crate::{FONT_EMBOLDEN_ENABLED, SELECTION_COLOR};
@@ -604,6 +606,27 @@ pub(crate) fn stroke_text<'a>(
     path_scratch.clear();
     deco_boxes.clear();
 
+    // In-flow block children inherit decorations from their containing box even
+    // though each owns a separate inline layout (Wikipedia's linked <strong>
+    // labels are one example). Atomic inline boxes and out-of-flow boxes stop
+    // that propagation. Include their own decorations, but not their ancestors'.
+    let mut ancestors = Vec::new();
+    let mut walk_id = inline_root_id;
+    while let Some(node) = doc.get_node(walk_id) {
+        if let Some(styles) = node.primary_styles() {
+            let display = styles.clone_display();
+            if (display.outside() == DisplayOutside::Inline && display.inside() != DisplayInside::Flow)
+                || styles.clone_float().is_floating()
+                || matches!(styles.get_box().position, Position::Absolute | Position::Fixed)
+            {
+                break;
+            }
+        }
+        let Some(parent) = node.parent else { break };
+        ancestors.push(parent);
+        walk_id = parent;
+    }
+
     // Persistent stack mirroring the ancestor path (inline root -> current run's
     // node) as we walk the runs. The `text-decoration-*` properties are *not*
     // inherited; instead a decoration set on an ancestor is propagated to the
@@ -646,6 +669,7 @@ pub(crate) fn stroke_text<'a>(
                     }
                     walk_id = doc.get_node(node_id).and_then(|node| node.parent);
                 }
+                path_scratch.extend(ancestors.iter().copied());
                 path_scratch.reverse();
 
                 let shared = stack
@@ -657,7 +681,8 @@ pub(crate) fn stroke_text<'a>(
                 for &node_id in &path_scratch[shared..] {
                     let mut entry = resolve_decoration_entry(doc, node_id);
                     entry.opacity = match stack.last() {
-                        _ if node_id == inline_root_id => 1.0,
+                        // Ancestor and root opacity are already applied by their paint layers.
+                        _ if stack.len() < ancestors.len() || node_id == inline_root_id => 1.0,
                         Some(parent) => parent.opacity * entry.opacity,
                         None => entry.opacity,
                     };
