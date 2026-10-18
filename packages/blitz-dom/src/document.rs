@@ -1989,16 +1989,16 @@ impl BaseDocument {
     }
 
     pub fn handle_messages(&mut self) {
-        // Remove event Reciever from the Document so that we can process events
-        // without holding a borrow to the Document
-        let rx = self.rx.take().unwrap();
-
-        while let Ok(msg) = rx.try_recv() {
+        // Borrow the receiver for one try_recv at a time instead of
+        // taking it out of the document for the whole drain. Under panic=unwind
+        // the embedder catches a panic in handle_message and keeps the document
+        // and keeps the document. A taken receiver would never be put back, so
+        // every later call would panic on the unwrap here and no resource
+        // message would be handled again. A panic costs only the message that
+        // raised it.
+        while let Some(msg) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.handle_message(msg);
         }
-
-        // Put Reciever back
-        self.rx = Some(rx);
     }
 
     pub fn handle_message(&mut self, msg: DocumentEvent) {
@@ -4831,6 +4831,57 @@ mod font_face_override_tests {
             "registered family should report the CSS-declared name, \
              not the font file's internal `name` table entry",
         );
+    }
+}
+
+#[cfg(test)]
+mod handle_messages_tests {
+    use super::*;
+    use crate::net::{Resource, ResourceLoadResponse};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn send(doc: &BaseDocument, request_id: usize, result: Result<Resource, String>) {
+        let response = ResourceLoadResponse {
+            request_id,
+            node_id: None,
+            resolved_url: None,
+            result,
+        };
+        doc.tx.send(DocumentEvent::ResourceLoad(response)).unwrap();
+    }
+
+    /// The embedder builds with panic=unwind and keeps the document after a
+    /// caught panic, so a panic in one message must not stop the document
+    /// from handling the messages after it.
+    #[test]
+    fn a_panicking_message_keeps_the_receiver() {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+
+        // Any panic in handle_message will do. A poisoned font context makes
+        // a font delivery panic on its lock().unwrap().
+        let font_ctx = doc.font_ctx.clone();
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _held = font_ctx.lock().unwrap();
+            panic!("poison the font context");
+        }));
+        send(
+            &doc,
+            1,
+            Ok(Resource::Font(Default::default(), Default::default())),
+        );
+        let caught = catch_unwind(AssertUnwindSafe(|| doc.handle_messages()));
+        assert!(caught.is_err(), "the font delivery must panic");
+        assert!(
+            doc.rx.is_some(),
+            "the panic must leave the receiver in place"
+        );
+
+        // load_resource settles a critical request first thing, so a failed
+        // load is enough to show that the next message is handled.
+        doc.pending_critical_resources.insert(2);
+        send(&doc, 2, Err(String::from("network error")));
+        doc.handle_messages();
+        assert!(!doc.has_pending_critical_resources());
     }
 }
 

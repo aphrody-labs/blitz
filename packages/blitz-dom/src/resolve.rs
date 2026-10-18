@@ -61,6 +61,21 @@ fn container_sizes(doc: &BaseDocument) -> Vec<(NodeId, taffy::Size<f32>)> {
 const CONTAINER_QUERY_SETTLE_PASSES: usize = 8;
 
 impl BaseDocument {
+    /// Restore construction damage after a panic strands an inline root
+    /// without the layout data that `compute_inline_layout_inner` took.
+    pub fn recover_from_layout_panic(&mut self) {
+        for (_, node) in self.nodes.iter_mut() {
+            let missing_inline_layout = node.flags.is_inline_root()
+                && node
+                    .data
+                    .downcast_element()
+                    .is_some_and(|element| element.inline_layout_data.is_none());
+            if missing_inline_layout {
+                node.insert_damage(ALL_DAMAGE);
+            }
+        }
+    }
+
     /// Restyle the tree and then relayout it
     pub fn resolve(&mut self, current_time_for_animations: f64) {
         if TDocument::as_node(&self.root_node())
