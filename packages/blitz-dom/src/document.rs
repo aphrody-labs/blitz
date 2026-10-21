@@ -5216,7 +5216,7 @@ pub(crate) fn note_connected_text_codepoints(
 }
 
 /// Set the bit for every codepoint in `text`.
-fn set_codepoint_bits(bits: &mut [u64], text: &str) {
+pub(crate) fn set_codepoint_bits(bits: &mut [u64], text: &str) {
     for ch in text.chars() {
         let cp = ch as usize;
         bits[cp >> 6] |= 1u64 << (cp & 63);
