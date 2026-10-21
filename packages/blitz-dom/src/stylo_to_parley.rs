@@ -449,52 +449,21 @@ pub(crate) fn vertical_align(style: &stylo::ComputedValues) -> parley::VerticalA
 ///   convert cleanly via `to_f64_px`.
 /// - Border-radius percentages also need fragment dimensions;
 ///   they fall back to `0.0`.
-/// - Brushes (background_brush, border_*_brush) are not
-///   populated; the painter looks up colors directly from the
-///   styled node via `TextBrush::id`. The fields are reserved
-///   for a future change that decouples the painter from the
-///   live DOM at render time (e.g. for off-thread painting).
+/// - The background brush carries the node id only when a
+///   background color needs a fragment; painting resolves the actual
+///   color from that styled node. Border brushes remain unset.
 fn extract_box_decorations(
+    span_id: NodeId,
     style: &stylo::ComputedValues,
 ) -> parley::BoxDecorations<TextBrush> {
     use ::style::values::computed::Au;
     use ::style::values::specified::BorderStyle;
     use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
 
-    // Inline-span box decorations are only applicable to elements
-    // that are themselves laid out inline AS part OF the parent's
-    // inline-formatting-context; i.e., `display: inline` proper
-    // (outside=Inline, inside=Flow). Atomic inline boxes
-    // (inline-block, inline-flex, inline-grid, inline-table) also
-    // satisfy outside=Inline, but they get their own independent
-    // taffy layout pass with their own block-level draw_border
-    // call: extracting decorations for them paints the border
-    // twice: once at the block-level border-box and once again
-    // by the inline-span pass around the inner text fragment.
-    //
-    // Symptom when this gate was too loose: every
-    // display:inline-block `<a>` or button rendered
-    // with four horizontal dark strokes (top-outer, top-inner,
-    // bottom-inner, bottom-outer) instead of two. The inner
-    // strokes were the inline-span pass painting over the inner
-    // text fragment's rect; the outer strokes were the regular
-    // block-level paint. See
-    // packages/core/src/paint/tests/inline_block_border.rs for the
-    // pixel-level pin.
-    //
-    // For block / list-item / flex / table containers, taffy
-    // already applies the element's padding + border when
-    // computing the block's content rect: double-applying here
-    // would also push inline content twice as far (e.g. todomvc's
-    // <label class=label-with-toggle> has 60px padding-left to
-    // leave room for an absolutely-positioned checkbox; if we
-    // extract that padding into the inline-span BoxDecorations,
-    // the line breaker pushes the first cluster by another 60px
-    // and "milk" lands at x≈120 instead of x=60).
-    //
-    // The display here is the computed display, which already
-    // reflects blockification rules (e.g. position:absolute makes
-    // a display:inline element compute to display:block).
+    // Only `display: inline` proper takes inline-span decorations. Atomic inline boxes already
+    // paint their own border, and block-level containers already have padding and border applied
+    // by taffy, so extracting either here would apply them twice. The computed display already
+    // reflects blockification.
     let display = style.clone_display();
     if !matches!(display.outside(), DisplayOutside::Inline) {
         return parley::BoxDecorations::default();
@@ -555,6 +524,14 @@ fn extract_box_decorations(
     let (bottom_right_x, bottom_right_y) =
         resolve_radius(&border.border_bottom_right_radius);
     let (bottom_left_x, bottom_left_y) = resolve_radius(&border.border_bottom_left_radius);
+    let current_color = style.clone_color();
+    let has_background_color = style
+        .get_background()
+        .background_color
+        .resolve_to_absolute(&current_color)
+        .to_color_space(::style::color::ColorSpace::Srgb)
+        .raw_components()[3]
+        > 0.0;
 
     parley::BoxDecorations {
         padding_inline_start,
@@ -569,7 +546,7 @@ fn extract_box_decorations(
         border_inline_end_brush: None,
         border_block_start_brush: None,
         border_block_end_brush: None,
-        background_brush: None,
+        background_brush: has_background_color.then(|| TextBrush::from_id(span_id)),
         border_radius: parley::BorderRadius {
             top_left_x,
             top_left_y,
@@ -743,7 +720,7 @@ pub(crate) fn style(
         // parley's per-line span_fragments() to draw filled
         // backgrounds, edge borders, and rounded corners on
         // styled inline elements like <a class="pill">.
-        box_decorations: extract_box_decorations(style),
+        box_decorations: extract_box_decorations(span_id, style),
     }
 }
 
