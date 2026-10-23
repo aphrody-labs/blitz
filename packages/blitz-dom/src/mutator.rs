@@ -356,6 +356,23 @@ impl DocumentMutator<'_> {
         }
     }
 
+    /// `:dir()` and `:lang()` can depend on this element's inherited state.
+    /// Restyle from its parent to include descendants and later `+`/`~` siblings.
+    fn restyle_inherited_attr_write(&mut self, node_id: NodeId, name: &QualName) {
+        if name.ns != ns!()
+            || (name.local != local_name!("dir") && name.local != local_name!("lang"))
+            || !self.doc.nodes[node_id].is_element()
+        {
+            return;
+        }
+
+        let scope_id = self.doc.nodes[node_id]
+            .parent
+            .filter(|&parent_id| self.doc.nodes[parent_id].is_element())
+            .unwrap_or(node_id);
+        self.doc.nodes[scope_id].set_restyle_hint(RestyleHint::restyle_subtree());
+    }
+
     pub fn set_attribute(&mut self, node_id: NodeId, name: QualName, value: &str) {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
@@ -386,6 +403,7 @@ impl DocumentMutator<'_> {
                 // (mark_ancestors_dirty below drives the traversal).
             }
             node.mark_damaged();
+            self.restyle_inherited_attr_write(node_id, &name);
 
             // No blanket restyle_subtree() on the parent here: it would
             // recascade every sibling on every attribute write. `:has()`
@@ -596,6 +614,7 @@ impl DocumentMutator<'_> {
             // Mark ancestors dirty so the style traversal visits this subtree.
             // Without this, the traversal may skip nodes with pending RestyleHint/damage.
             node.mark_ancestors_dirty();
+            self.restyle_inherited_attr_write(node_id, &name);
         }
 
         if name.local == local_name!("id") && node_is_in_document {
@@ -2465,7 +2484,9 @@ mod test {
     use blitz_traits::node_id::NodeId;
     use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 
-    use crate::{Attribute, BaseDocument, DocumentConfig, ElementData, NodeData, qual_name};
+    use crate::{
+        Attribute, BaseDocument, DocumentConfig, ElementData, NodeData, UserAgentStylesheet, qual_name,
+    };
 
     #[test]
     fn srcset_single_url_no_descriptor() {
@@ -3157,6 +3178,81 @@ mod test {
                 .x,
             120.0
         );
+    }
+
+    fn dir_test_tree(css: &str) -> (BaseDocument, NodeId, NodeId, NodeId) {
+        let mut document = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
+            ua_stylesheets: vec![UserAgentStylesheet::parse(css)],
+            ..Default::default()
+        });
+        let root_id = document.root_node().id;
+        let (outer, x, span) = {
+            let mut mutator = document.mutate();
+            let outer = mutator.create_element(qual_name!("div"), vec![]);
+            let x = mutator.create_element(
+                qual_name!("div"),
+                vec![Attribute {
+                    name: qual_name!("id"),
+                    value: "x".into(),
+                }],
+            );
+            let span = mutator.create_element(qual_name!("span"), vec![]);
+            mutator.append_children(outer, &[x, span]);
+            mutator.append_children(root_id, &[outer]);
+            (outer, x, span)
+        };
+        document.resolve(0.0);
+        (document, outer, x, span)
+    }
+
+    fn opacity(document: &BaseDocument, node_id: NodeId) -> f32 {
+        document
+            .get_node(node_id)
+            .unwrap()
+            .primary_styles()
+            .unwrap()
+            .get_effects()
+            .opacity
+    }
+
+    #[test]
+    fn ancestor_dir_and_lang_writes_reach_sibling_selectors() {
+        let (mut document, outer, _, span) = dir_test_tree(
+            "#x:dir(rtl) + span, #x:lang(fr) + span { opacity: 0.5 }",
+        );
+        assert_eq!(opacity(&document, span), 1.0);
+
+        document
+            .mutate()
+            .set_attribute(outer, qual_name!("dir"), "rtl");
+        document.resolve(0.0);
+        assert_eq!(opacity(&document, span), 0.5);
+
+        document.mutate().clear_attribute(outer, qual_name!("dir"));
+        document.resolve(0.0);
+        assert_eq!(opacity(&document, span), 1.0);
+
+        document
+            .mutate()
+            .set_attribute(outer, qual_name!("lang"), "fr");
+        document.resolve(0.0);
+        assert_eq!(opacity(&document, span), 0.5);
+
+        document.mutate().clear_attribute(outer, qual_name!("lang"));
+        document.resolve(0.0);
+        assert_eq!(opacity(&document, span), 1.0);
+    }
+
+    #[test]
+    fn own_dir_write_reaches_sibling_dir_selectors() {
+        let (mut document, _, x, span) =
+            dir_test_tree("#x:dir(rtl) + span { opacity: 0.5 }");
+        assert_eq!(opacity(&document, span), 1.0);
+
+        document.mutate().set_attribute(x, qual_name!("dir"), "rtl");
+        document.resolve(0.0);
+        assert_eq!(opacity(&document, span), 0.5);
     }
 
     #[test]
