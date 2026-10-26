@@ -524,15 +524,6 @@ fn extract_box_decorations(
     let (bottom_right_x, bottom_right_y) =
         resolve_radius(&border.border_bottom_right_radius);
     let (bottom_left_x, bottom_left_y) = resolve_radius(&border.border_bottom_left_radius);
-    let current_color = style.clone_color();
-    let has_background_color = style
-        .get_background()
-        .background_color
-        .resolve_to_absolute(&current_color)
-        .to_color_space(::style::color::ColorSpace::Srgb)
-        .raw_components()[3]
-        > 0.0;
-
     parley::BoxDecorations {
         padding_inline_start,
         padding_inline_end,
@@ -546,7 +537,7 @@ fn extract_box_decorations(
         border_inline_end_brush: None,
         border_block_start_brush: None,
         border_block_end_brush: None,
-        background_brush: has_background_color.then(|| TextBrush::from_id(span_id)),
+        background_brush: has_inline_background(style).then(|| TextBrush::from_id(span_id)),
         border_radius: parley::BorderRadius {
             top_left_x,
             top_left_y,
@@ -558,6 +549,21 @@ fn extract_box_decorations(
             bottom_left_y,
         },
     }
+}
+
+pub(crate) fn has_inline_background(style: &stylo::ComputedValues) -> bool {
+    use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
+
+    let display = style.clone_display();
+    display.outside() == DisplayOutside::Inline
+        && display.inside() == DisplayInside::Flow
+        && style
+            .get_background()
+            .background_color
+            .resolve_to_absolute(&style.clone_color())
+            .to_color_space(::style::color::ColorSpace::Srgb)
+            .raw_components()[3]
+            > 0.0
 }
 
 pub(crate) fn style(

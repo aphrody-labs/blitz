@@ -8,9 +8,10 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use crate::StyleThreading;
-use crate::layout::damage::compute_layout_damage;
+use crate::layout::damage::{CONSTRUCT_BOX, compute_layout_damage};
 use crate::node::Node;
 use crate::node::NodeData;
+use crate::stylo_to_parley::has_inline_background;
 use markup5ever::{LocalName, LocalNameStaticSet, Namespace, NamespaceStaticSet, local_name, ns};
 use selectors::bloom::BLOOM_HASH_MASK;
 use selectors::{
@@ -1738,7 +1739,21 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
         if let Some(el) = node.as_element() {
             // let mut data = el.mutate_data().unwrap();
             let mut data = unsafe { el.ensure_data() };
+            let had_inline_background = data
+                .styles
+                .get_primary()
+                .map(|style| has_inline_background(style));
             recalc_style_at(self, context, el, &mut data, note_child);
+
+            // Parley captures background-fragment presence at box construction. Stylo's repaint
+            // damage does not call compute_layout_damage, so handle transparency changes here.
+            if let (Some(had_background), Some(style)) =
+                (had_inline_background, data.styles.get_primary())
+            {
+                if had_background != has_inline_background(style) {
+                    data.damage.insert(CONSTRUCT_BOX);
+                }
+            }
 
             sync_pseudo_element_styles(el, &data, &self.nodes_needing_style_image_flush);
 
@@ -1843,7 +1858,10 @@ fn sync_pseudo_element_styles(
             continue;
         }
 
-        let diff = RestyleDamage::compute_style_difference::<&Node>(&old_style, &pe_style);
+        let mut diff = RestyleDamage::compute_style_difference::<&Node>(&old_style, &pe_style);
+        if has_inline_background(&old_style) != has_inline_background(&pe_style) {
+            diff.damage.insert(CONSTRUCT_BOX);
+        }
         if !diff.damage.is_empty() {
             pe_data.damage.insert(diff.damage);
             pe_node.mark_damaged();
