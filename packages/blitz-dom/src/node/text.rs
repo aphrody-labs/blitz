@@ -106,6 +106,9 @@ pub struct TextInputData {
     /// while the placeholder shows. Paint draws the placeholder
     /// text in it instead of the input's own `color`.
     pub placeholder_color: Option<style::color::AbsoluteColor>,
+    /// The `::placeholder` font style while the placeholder shows. Kept
+    /// so a restyle can tell whether the editor's style is stale.
+    pub placeholder_font_style: Option<parley::FontStyle>,
     /// Authoritative IDL `.value` override. When Some,
     /// layout construction displays this instead of the `value`
     /// content attribute: HTML decouples the IDL value (live,
@@ -131,6 +134,7 @@ impl TextInputData {
             scroll_offset: 0.0,
             is_showing_placeholder: false,
             placeholder_color: None,
+            placeholder_font_style: None,
             value_override: None,
         }
     }

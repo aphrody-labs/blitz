@@ -26,7 +26,7 @@ use style::animation::AnimationState;
 use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::bloom::each_relevant_element_hash;
 use style::color::AbsoluteColor;
-use style::data::{ElementDataMut, ElementDataRef};
+use style::data::{ElementDataFlags, ElementDataMut, ElementDataRef};
 use style::global_style_data::STYLE_THREAD_POOL;
 use style::invalidation::element::element_wrapper::ElementSnapshot;
 use style::invalidation::element::invalidator::SiblingTraversalMap;
@@ -1755,6 +1755,13 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
                 }
             }
 
+            // Box construction copies a shown placeholder's look onto its text input, and stylo's
+            // damage covers only the control's own style.
+            let styled = !data.flags.contains(ElementDataFlags::TRAVERSED_WITHOUT_STYLING);
+            if styled && placeholder_look_is_stale(&self.context, el, &data) {
+                data.damage.insert(CONSTRUCT_BOX);
+            }
+
             sync_pseudo_element_styles(el, &data, &self.nodes_needing_style_image_flush);
 
             if !data.damage.is_empty() {
@@ -1796,6 +1803,29 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
     fn shared_context(&self) -> &SharedStyleContext<'_> {
         &self.context
     }
+}
+
+/// Whether a text control showing its placeholder holds a `::placeholder`
+/// colour or font style that its fresh style no longer gives: a class or an
+/// attr() that only the pseudo reads changes nothing stylo diffs.
+fn placeholder_look_is_stale(
+    context: &SharedStyleContext,
+    el: &Node,
+    data: &style::data::ElementData,
+) -> bool {
+    use crate::layout::construct::{placeholder_look, placeholder_pseudo_style};
+    let Some(input) = el.element_data().and_then(|e| e.text_input_data()) else {
+        return false;
+    };
+    if !input.is_showing_placeholder {
+        return false;
+    }
+    let Some(primary) = data.styles.get_primary() else {
+        return false;
+    };
+    let fresh = placeholder_pseudo_style(context.stylist, &context.guards, el, primary)
+        .map(|style| placeholder_look(&style));
+    fresh != input.placeholder_color.zip(input.placeholder_font_style)
 }
 
 /// Flush updated pseudo-element (`::before`/`::after`) styles from the owning

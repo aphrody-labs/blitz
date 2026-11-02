@@ -1466,36 +1466,57 @@ fn collect_complex_layout_children(
 
 /// The `::placeholder` style of a text control that has a non-empty
 /// `placeholder` attribute. It is a lazy pseudo, so nothing in the style
-/// traversal computes it; resolve it against the control's own style here.
-fn placeholder_pseudo_style(
-    doc: &BaseDocument,
-    input_element_id: NodeId,
+/// traversal computes it; resolve it against the control's own style.
+pub(crate) fn placeholder_pseudo_style(
+    stylist: &style::stylist::Stylist,
+    guards: &StylesheetGuards,
+    node: &Node,
+    primary: &style::properties::ComputedValues,
 ) -> Option<style::servo_arc::Arc<style::properties::ComputedValues>> {
     use style::selector_parser::PseudoElement;
     use style::stylist::RuleInclusion;
-    let node = doc.get_node(input_element_id)?;
     if node
         .attr(local_name!("placeholder"))
         .is_none_or(|p| p.is_empty())
     {
         return None;
     }
-    let primary = node.primary_styles()?;
-    let guard = doc.guard().read();
-    let guards = StylesheetGuards::same(&guard);
-    doc.stylist.lazily_compute_pseudo_element_style(
-        &guards,
+    stylist.lazily_compute_pseudo_element_style(
+        guards,
         node,
         &PseudoElement::Placeholder,
         RuleInclusion::All,
-        &primary,
+        primary,
         false,
         None,
     )
 }
 
+/// What a shown placeholder takes from its `::placeholder` style: the colour,
+/// with opacity folded into its alpha, and the font style.
+pub(crate) fn placeholder_look(
+    style: &style::properties::ComputedValues,
+) -> (style::color::AbsoluteColor, parley::FontStyle) {
+    let color = style.clone_color();
+    (
+        color.with_alpha(color.alpha * style.get_effects().opacity),
+        stylo_to_parley::font_style(style.clone_font_style()),
+    )
+}
+
+fn document_placeholder_style(
+    doc: &BaseDocument,
+    input_element_id: NodeId,
+) -> Option<style::servo_arc::Arc<style::properties::ComputedValues>> {
+    let node = doc.get_node(input_element_id)?;
+    let primary = node.primary_styles()?;
+    let guard = doc.guard().read();
+    let guards = StylesheetGuards::same(&guard);
+    placeholder_pseudo_style(&doc.stylist, &guards, node, &primary)
+}
+
 fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multiline: bool) {
-    let placeholder_style = placeholder_pseudo_style(doc, input_element_id);
+    let placeholder_style = document_placeholder_style(doc, input_element_id);
     let node = &mut doc.nodes[input_element_id];
     let parley_style = node
         .primary_styles()
@@ -1569,14 +1590,11 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
     // The ::placeholder cascade (UA `color: #757575`, plus any author
     // rules) supplies the colour and font style while the placeholder
     // shows. Without it the text keeps the input's own style.
-    let placeholder_style = placeholder_style.filter(|_| is_placeholder);
-    let placeholder_color = placeholder_style.as_ref().map(|s| {
-        s.clone_color()
-            .with_alpha(s.clone_color().alpha * s.get_effects().opacity)
-    });
-    let placeholder_font_style = placeholder_style
-        .as_ref()
-        .map(|s| stylo_to_parley::font_style(s.clone_font_style()));
+    let placeholder_look = placeholder_style
+        .filter(|_| is_placeholder)
+        .map(|s| placeholder_look(&s));
+    let placeholder_color = placeholder_look.map(|(color, _)| color);
+    let placeholder_font_style = placeholder_look.map(|(_, font_style)| font_style);
 
     if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
         let mut text_input_data = TextInputData::new(is_multiline);
@@ -1584,6 +1602,7 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         editor.set_text(&display_text);
         text_input_data.is_showing_placeholder = is_placeholder;
         text_input_data.placeholder_color = placeholder_color;
+        text_input_data.placeholder_font_style = placeholder_font_style;
         element.special_data = SpecialElementData::TextInput(text_input_data);
     } else if let SpecialElementData::TextInput(data) = &mut element.special_data {
         // Update the editor's text on subsequent layouts so an
@@ -1597,6 +1616,7 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         }
         data.is_showing_placeholder = is_placeholder;
         data.placeholder_color = placeholder_color;
+        data.placeholder_font_style = placeholder_font_style;
     }
 
     let SpecialElementData::TextInput(text_input_data) = &mut element.special_data else {
