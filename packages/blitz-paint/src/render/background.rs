@@ -477,6 +477,32 @@ impl ElementCx<'_, '_> {
             return;
         }
 
+        // The per-layer 4096-tile cap above bounds `tiles`, so the product below
+        // fits and PAINT_WORK_BUDGET's tile term matches it. Zero tiles draws
+        // nothing, and the per-tile division below needs a non-zero divisor.
+        let tiles = x.count as u64 * y.count as u64;
+        if tiles == 0 {
+            return;
+        }
+
+        // Every tile renders the whole vector tree, so the layer costs one visit
+        // per node per tile. Measuring the tree is work too: the count stops at
+        // the nodes the budget could still afford, and a layer that does not fit
+        // pays for the visits it made before it is skipped, so a page cannot
+        // repeat an unaffordable layer to make the measuring free.
+        let affordable = self
+            .context
+            .remaining_work()
+            .map_or(u64::MAX, |left| left / tiles);
+        let nodes = svg_node_count(&svg.tree, affordable);
+        if nodes > affordable {
+            self.context.spend_work(nodes);
+            return;
+        }
+        if !self.context.try_charge_work(tiles.saturating_mul(nodes)) {
+            return;
+        }
+
         let transform = (base_transform * viewport).then_translate(Vec2 {
             x: x.translate,
             y: y.translate,
@@ -933,6 +959,56 @@ fn raster_axis_tiling(
 /// grows faster than the tile count: 20k tiles took ~1 s, 36k ~3.4 s and
 /// 52k ~6.5 s. A smaller tile across a bigger viewport is dropped instead.
 const MAX_GRADIENT_TILES: u64 = 24_000;
+
+/// The nodes rendering one tile of a usvg tree walks, the root group included,
+/// counted only up to `limit + 1`: a tree past `limit` cannot be afforded, so
+/// it is never walked whole. The walk is iterative because the tree nests as
+/// deep as the page's markup allows, and it keeps one frame per open group
+/// rather than one per node, so its stack is bounded by the tree's depth.
+#[cfg(feature = "svg")]
+fn svg_node_count(tree: &usvg::Tree, limit: u64) -> u64 {
+    let mut count = 1;
+    let mut open: Vec<(&[usvg::Node], usize)> = vec![(tree.root().children(), 0)];
+    loop {
+        let Some(frame) = open.last_mut() else {
+            break;
+        };
+        let children: &[usvg::Node] = frame.0;
+        let index = frame.1;
+        frame.1 += 1;
+        let Some(node) = children.get(index) else {
+            open.pop();
+            continue;
+        };
+        let mut next: &[usvg::Node] = &[];
+        count += 1;
+        match node {
+            usvg::Node::Group(group) => next = group.children(),
+            // A text node renders its flattened glyph group, so charge that
+            // group and one unit per glyph: consecutive glyphs share a single
+            // path, so a path count would miss the outline work a long run
+            // still costs on every tile.
+            usvg::Node::Text(text) => {
+                count += 1 + text.chunks().iter().map(text_glyph_cost).sum::<u64>();
+                next = text.flattened().children();
+            }
+            _ => {}
+        }
+        if count > limit {
+            return count;
+        }
+        if !next.is_empty() {
+            open.push((next, 0));
+        }
+    }
+    count
+}
+
+/// The glyph outlines one text chunk costs to render, as its character count.
+#[cfg(feature = "svg")]
+fn text_glyph_cost(chunk: &usvg::TextChunk) -> u64 {
+    chunk.text().chars().count() as u64
+}
 
 /// The tile indices along one axis whose box reaches the viewport span
 /// `0..viewport_len`, given the screen extent of tile 0 before tiling moves it.

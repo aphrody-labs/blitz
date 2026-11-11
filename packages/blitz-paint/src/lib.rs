@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use anyrender::{PaintScene, Scene};
 use blitz_dom::{BaseDocument, NodeId, util::Color};
-use render::BlitzDomPainter;
+use render::{BlitzDomPainter, PAINT_WORK_BUDGET};
 
 const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
     feature = "font-embolden",
@@ -41,6 +41,41 @@ type CustomWidgetSceneMap = HashMap<(usize, NodeId), Scene>;
 /// The implementation of [`PaintScene`] is responsible for handling the commands that are pushed into it.
 /// Generally this will involve executing them to draw a rasterized image/texture. But in some cases it may choose to
 /// transform them to a vector format (e.g. SVG/PDF) or serialize them in raw form for later use.
+///
+/// Repeated SVG background work is metered here: a layer whose tiles would
+/// exceed the remaining budget is skipped, and the rest of the page still
+/// paints, so a screenshot always produces a frame. Use [`paint_scene`] to
+/// leave the work unmetered.
+pub fn paint_scene_bounded(
+    scene: &mut impl PaintScene,
+    doc: &mut BaseDocument,
+    scale: f64,
+    width: u32,
+    height: u32,
+    x_offset: u32,
+    y_offset: u32,
+) {
+    paint_document(
+        scene,
+        doc,
+        scale,
+        width,
+        height,
+        x_offset,
+        y_offset,
+        Some(PAINT_WORK_BUDGET),
+    );
+}
+
+/// Paint a [`blitz_dom::BaseDocument`] by pushing drawing commands into
+/// an impl [`anyrender::PaintScene`].
+///
+/// This function assumes that the styles and layout in the [`BaseDocument`] are already
+/// resolved. Please ensure that this is the case before trying to paint.
+///
+/// The implementation of [`PaintScene`] is responsible for handling the commands that are pushed into it.
+/// Generally this will involve executing them to draw a rasterized image/texture. But in some cases it may choose to
+/// transform them to a vector format (e.g. SVG/PDF) or serialize them in raw form for later use.
 pub fn paint_scene(
     scene: &mut impl PaintScene,
     doc: &mut BaseDocument,
@@ -49,6 +84,19 @@ pub fn paint_scene(
     height: u32,
     x_offset: u32,
     y_offset: u32,
+) {
+    paint_document(scene, doc, scale, width, height, x_offset, y_offset, None);
+}
+
+fn paint_document(
+    scene: &mut impl PaintScene,
+    doc: &mut BaseDocument,
+    scale: f64,
+    width: u32,
+    height: u32,
+    x_offset: u32,
+    y_offset: u32,
+    work_budget: Option<u64>,
 ) {
     // Run `.paint()` on every custom widget in the document (and all subdocuments) ahead of time.
     // This helps us avoid borrow-checker issues as we recurse down the tree (`.paint()` require `&mut self`).
@@ -68,6 +116,10 @@ pub fn paint_scene(
         y_offset as f64,
         &custom_widget_scenes,
     );
+    let generator = match work_budget {
+        Some(budget) => generator.with_work_budget(budget),
+        None => generator,
+    };
     generator.paint_scene(scene);
 
     // println!(

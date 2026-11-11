@@ -5,7 +5,7 @@ mod clip_path;
 mod form_controls;
 mod mask;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -101,6 +101,22 @@ impl<'a> PhysicalTracks<'a> {
     }
 }
 
+/// Paint-work units one metered scene may spend on repeated SVG background
+/// tiles: each tile costs the tree's node count.
+///
+/// A layer is capped at 4096 tiles before it is charged
+/// (`draw_svg_image_layer`), so 4096 * 128 units always affords one such layer
+/// with up to 128 usvg nodes, and still leaves room for several ordinary
+/// patterns: two full-viewport 24px tiles of a 100-node tree (465k), or ~68
+/// 496px 8px dot layers (7.7k each). The pathological input that motivated the
+/// meter is 33M units, so the budget bounds a screenshot to 1/64 of it:
+/// measured end-to-end on the debug host test harness, a page at the budget
+/// takes 5.1 s with 34-node tiles and 9.8 s with 132-node tiles, while the
+/// 6.6M-unit pathological page takes 0.49 s because every layer is skipped.
+/// Measuring a tree is charged too, so a page cannot repeat an unaffordable
+/// layer to make the count free.
+pub(crate) const PAINT_WORK_BUDGET: u64 = 4096 * 128;
+
 /// A short-lived struct which holds a bunch of parameters for rendering a scene so
 /// that we don't have to pass them down as parameters
 pub struct BlitzDomPainter<'dom, 'a> {
@@ -119,6 +135,9 @@ pub struct BlitzDomPainter<'dom, 'a> {
     #[cfg(feature = "scrollbars")]
     pub(crate) scrollbar_drag_target: Option<blitz_dom::node::ScrollbarRef>,
     pub(crate) layer_manager: LayerManager,
+    /// Paint-work units this scene may still spend on repeated SVG background
+    /// tiles; `None` leaves the work unmetered.
+    pub(crate) work_budget: Cell<Option<u64>>,
     /// Reusable scratch allocations shared by all text layouts painted for this document.
     pub(crate) draw_text_context: RefCell<DrawTextContext>,
     /// Cached selection ranges for O(1) lookup: node_id -> (start_offset, end_offset)
@@ -161,10 +180,53 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             #[cfg(feature = "scrollbars")]
             scrollbar_drag_target: dom.scrollbar_drag_target(),
             layer_manager,
+            work_budget: Cell::new(None),
             draw_text_context: RefCell::new(DrawTextContext::default()),
             selection_ranges,
             custom_widget_scenes,
         }
+    }
+
+    /// Meter this scene's paint work so `try_charge_work` can refuse work that
+    /// does not fit. Scenes are unmetered unless a caller asks, because
+    /// recording and PDF output must paint everything.
+    pub fn with_work_budget(self, work_budget: u64) -> Self {
+        self.work_budget.set(Some(work_budget));
+        self
+    }
+
+    /// Spend `amount` paint-work units. Returns false when fewer than `amount`
+    /// remain, leaving the budget untouched, so the caller can skip that piece
+    /// of work and keep painting the rest of the scene. Unmetered scenes always
+    /// pay.
+    pub(crate) fn try_charge_work(&self, amount: u64) -> bool {
+        let Some(left) = self.work_budget.get() else {
+            return true;
+        };
+        if amount <= left {
+            self.work_budget.set(Some(left - amount));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Paint-work units this scene may still spend, or `None` when unmetered.
+    /// A caller that must measure work before it can charge it uses this to
+    /// stop measuring once the measurement alone exceeds what could be paid.
+    pub(crate) fn remaining_work(&self) -> Option<u64> {
+        self.work_budget.get()
+    }
+
+    /// Spend up to `amount` paint-work units, leaving the budget at zero rather
+    /// than refusing: for work already done that cannot be skipped, like
+    /// measuring a tree for a layer that turned out not to afford it. Charging
+    /// it keeps a repeated measurement from being free.
+    pub(crate) fn spend_work(&self, amount: u64) {
+        let Some(left) = self.work_budget.get() else {
+            return;
+        };
+        self.work_budget.set(Some(left.saturating_sub(amount)));
     }
 
     /// Draw the current tree to current render surface
@@ -1584,7 +1646,12 @@ impl ElementCx<'_, '_> {
                 initial_y,
                 self.custom_widget_scenes,
             );
+            // A subdocument spends the same paint-work budget: a fresh painter
+            // with its own meter would let every iframe paint an unaffordable
+            // repeated SVG background again. Carry the remainder in and back out.
+            painter.work_budget.set(self.work_budget.get());
             painter.paint_scene(scene);
+            self.work_budget.set(painter.work_budget.get());
         }
     }
 
