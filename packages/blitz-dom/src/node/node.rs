@@ -579,11 +579,11 @@ impl Node {
         }
         let display = self.display_style().unwrap_or(StyloDisplay::inline());
         match display.outside() {
-            DisplayOutside::None => false,
+            DisplayOutside::None if display.inside() != DisplayInside::Contents => false,
             DisplayOutside::Block => true,
             _ => {
-                if display.inside() == DisplayInside::Flow {
-                    self.children
+                if matches!(display.inside(), DisplayInside::Flow | DisplayInside::Contents) {
+                    self.flat_children()
                         .iter()
                         .copied()
                         .any(|child_id| self.tree()[child_id].is_or_contains_block())
