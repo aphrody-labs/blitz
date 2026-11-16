@@ -331,3 +331,10 @@ wgpu_context = { workspace = true }
 # [patch."https://github.com/linebender/parley"]
 # parley = { path = "../parley/parley" }
 # fontique = { path = "../parley/fontique" }
+
+# --- Rose Griffon optimisations (kept on top of upstream by .github/workflows/rg-sync.yml) ---
+# `production` already has lto and codegen-units = 1; add a WASM/WebGPU size profile on top of `tiny`.
+[profile.rg-wasm]
+inherits = "tiny"
+lto = "fat"
+codegen-units = 1
